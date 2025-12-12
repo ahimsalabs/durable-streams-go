@@ -5,7 +5,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/ahimsalabs/durable-streams-go/durablestream/internal/transport"
+	"github.com/ahimsalabs/durable-streams-go/durablestream/transport"
 )
 
 // RecordingTransport wraps a Transport and records all method calls.

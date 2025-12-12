@@ -5,7 +5,7 @@ import (
 	"errors"
 	"io"
 
-	"github.com/ahimsalabs/durable-streams-go/durablestream/internal/transport"
+	"github.com/ahimsalabs/durable-streams-go/durablestream/transport"
 )
 
 // EventStreamStub is a test double for transport.EventStream.

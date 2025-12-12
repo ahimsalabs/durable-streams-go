@@ -6,7 +6,7 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/ahimsalabs/durable-streams-go/durablestream/internal/transport"
+	"github.com/ahimsalabs/durable-streams-go/durablestream/transport"
 )
 
 // Re-export transport types for convenience.
@@ -32,45 +32,30 @@ const (
 	ReadModeSSE = transport.ReadModeSSE
 )
 
-// ClientConfig configures a Client.
+// ClientConfig configures a Client created via NewClient.
 //
-// # Field Precedence
-//
-// Transport takes precedence over all HTTP-specific fields:
-//   - If Transport is set (non-nil), HTTPClient, Headers, and LongPollTimeout are IGNORED.
-//   - If Transport is nil, an HTTPTransport is created using HTTPClient, Headers, and LongPollTimeout.
+// For custom transports (testing, middleware), use NewClientWithTransport instead.
 //
 // # Zero Values
 //
 // Zero values are replaced with defaults:
 //   - Timeout: 30s (if zero or negative)
 //   - ReadMode: ReadModeAuto (if zero)
-//   - HTTPClient: http.DefaultClient (if nil and Transport is nil)
-//   - LongPollTimeout: 60s (if zero and Transport is nil)
+//   - HTTPClient: http.DefaultClient (if nil)
 //   - Headers: none (if nil)
 type ClientConfig struct {
-	// Transport is the underlying transport for all operations.
-	// If non-nil, HTTPClient, Headers, and LongPollTimeout are IGNORED.
-	// If nil, an HTTPTransport is created using the HTTP-specific fields below.
-	Transport transport.Transport
-
-	// HTTPClient is the underlying HTTP client used by the default HTTPTransport.
-	// Only used when Transport is nil. Default: http.DefaultClient.
+	// HTTPClient is the underlying HTTP client.
+	// Default: http.DefaultClient.
 	HTTPClient *http.Client
 
-	// Headers provides headers to include in all requests made by the default HTTPTransport.
+	// Headers provides headers to include in all requests.
 	// Called per-request to allow dynamic values (e.g., auth tokens).
-	// Only used when Transport is nil. Default: no additional headers.
-	Headers transport.HeaderProvider
+	// This is the primary customization point for authentication.
+	Headers HeaderProvider
 
 	// Timeout is the default timeout for all operations (Create, Head, Delete, etc).
 	// Zero or negative values default to 30s.
 	Timeout time.Duration
-
-	// LongPollTimeout is the timeout for long-poll read operations (Section 5.6).
-	// Only used when Transport is nil (for the default HTTPTransport).
-	// Zero values default to 60s.
-	LongPollTimeout time.Duration
 
 	// ReadMode specifies how live reads are handled after catch-up (Section 5.6-5.7).
 	// Zero value defaults to ReadModeAuto (catch-up then long-poll).
@@ -87,10 +72,48 @@ type Client struct {
 
 // NewClient creates a new stream client for the given base URL.
 // Pass nil for cfg to use defaults.
+//
+// For custom transports (testing, middleware composition), use NewClientWithTransport.
 func NewClient(baseURL string, cfg *ClientConfig) *Client {
 	c := &Client{
 		timeout:  30 * time.Second,
 		readMode: ReadModeAuto,
+	}
+
+	var httpCfg *transport.HTTPConfig
+	if cfg != nil {
+		if cfg.Timeout > 0 {
+			c.timeout = cfg.Timeout
+		}
+		c.readMode = cfg.ReadMode
+
+		httpCfg = &transport.HTTPConfig{
+			Client:  cfg.HTTPClient,
+			Headers: cfg.Headers,
+		}
+	}
+	c.transport = transport.NewHTTPTransport(baseURL, httpCfg)
+
+	return c
+}
+
+// NewClientWithTransport creates a client with a custom transport.
+//
+// Use this for:
+//   - Testing with mock transports
+//   - Middleware composition (logging, retry)
+//   - Custom transport implementations
+//
+// Example with middleware:
+//
+//	t := transport.NewHTTPTransport(url, &transport.HTTPConfig{Headers: myHeaders})
+//	t = transport.WithRetry(transport.DefaultRetryOptions())(t)
+//	client := durablestream.NewClientWithTransport(t, nil)
+func NewClientWithTransport(t transport.Transport, cfg *TransportClientConfig) *Client {
+	c := &Client{
+		transport: t,
+		timeout:   30 * time.Second,
+		readMode:  ReadModeAuto,
 	}
 
 	if cfg != nil {
@@ -98,23 +121,20 @@ func NewClient(baseURL string, cfg *ClientConfig) *Client {
 			c.timeout = cfg.Timeout
 		}
 		c.readMode = cfg.ReadMode
-
-		if cfg.Transport != nil {
-			c.transport = cfg.Transport
-		} else {
-			// Create HTTP transport from config
-			httpCfg := &transport.HTTPConfig{
-				Client:          cfg.HTTPClient,
-				LongPollTimeout: cfg.LongPollTimeout,
-				Headers:         cfg.Headers,
-			}
-			c.transport = transport.NewHTTPTransport(baseURL, httpCfg)
-		}
-	} else {
-		c.transport = transport.NewHTTPTransport(baseURL, nil)
 	}
 
 	return c
+}
+
+// TransportClientConfig configures a Client created via NewClientWithTransport.
+type TransportClientConfig struct {
+	// Timeout is the default timeout for all operations.
+	// Zero or negative values default to 30s.
+	Timeout time.Duration
+
+	// ReadMode specifies how live reads are handled after catch-up.
+	// Zero value defaults to ReadModeAuto.
+	ReadMode ReadMode
 }
 
 // Transport returns the underlying transport for advanced use cases.

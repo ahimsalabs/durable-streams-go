@@ -156,7 +156,7 @@ func TestReader_CatchUpAndLive(t *testing.T) {
 	server := httptest.NewServer(handler)
 	defer server.Close()
 
-	client := NewClient(server.URL, &ClientConfig{LongPollTimeout: 300 * time.Millisecond})
+	client := NewClient(server.URL, nil)
 
 	ctx := context.Background()
 
@@ -253,7 +253,7 @@ func TestReader_MessagesIterator(t *testing.T) {
 	server := httptest.NewServer(handler)
 	defer server.Close()
 
-	client := NewClient(server.URL, &ClientConfig{LongPollTimeout: 200 * time.Millisecond})
+	client := NewClient(server.URL, nil)
 
 	ctx := context.Background()
 
@@ -615,7 +615,7 @@ func TestReader_Messages_NonJSONData(t *testing.T) {
 	server := httptest.NewServer(handler)
 	defer server.Close()
 
-	client := NewClient(server.URL, &ClientConfig{LongPollTimeout: 200 * time.Millisecond})
+	client := NewClient(server.URL, nil)
 	ctx := context.Background()
 
 	// Create text/plain stream with non-JSON data
@@ -655,7 +655,7 @@ func TestReader_Messages_ReadError(t *testing.T) {
 	server := httptest.NewServer(handler)
 	defer server.Close()
 
-	client := NewClient(server.URL, &ClientConfig{LongPollTimeout: 200 * time.Millisecond})
+	client := NewClient(server.URL, nil)
 	ctx := context.Background()
 
 	// Reader for non-existent stream
@@ -685,7 +685,7 @@ func TestReader_Read_DefaultModeCase(t *testing.T) {
 	defer server.Close()
 
 	// Create client with an invalid/unknown ReadMode value
-	client := NewClient(server.URL, &ClientConfig{LongPollTimeout: 200 * time.Millisecond})
+	client := NewClient(server.URL, nil)
 	// Force an unknown mode (default case in switch)
 	client.readMode = ReadMode(99) // Unknown mode
 

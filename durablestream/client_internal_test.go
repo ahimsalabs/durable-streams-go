@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/ahimsalabs/durable-streams-go/durablestream/internal/transport"
+	"github.com/ahimsalabs/durable-streams-go/durablestream/transport"
 )
 
 func TestClient_Config(t *testing.T) {
@@ -38,14 +38,27 @@ func TestClient_Config(t *testing.T) {
 		}
 	})
 
-	t.Run("custom transport", func(t *testing.T) {
+	t.Run("custom transport via NewClientWithTransport", func(t *testing.T) {
 		customTransport := transport.NewHTTPTransport("http://custom.com", nil)
-		client := NewClient("http://example.com", &ClientConfig{
-			Transport: customTransport,
-		})
+		client := NewClientWithTransport(customTransport, nil)
 
 		if client.transport != customTransport {
 			t.Error("transport should be the custom transport")
+		}
+	})
+
+	t.Run("NewClientWithTransport with config", func(t *testing.T) {
+		customTransport := transport.NewHTTPTransport("http://custom.com", nil)
+		client := NewClientWithTransport(customTransport, &TransportClientConfig{
+			Timeout:  15 * time.Second,
+			ReadMode: ReadModeSSE,
+		})
+
+		if client.timeout != 15*time.Second {
+			t.Errorf("timeout = %v, want %v", client.timeout, 15*time.Second)
+		}
+		if client.readMode != ReadModeSSE {
+			t.Errorf("readMode = %v, want %v", client.readMode, ReadModeSSE)
 		}
 	})
 }

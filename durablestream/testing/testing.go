@@ -24,7 +24,7 @@ package testing
 import (
 	"context"
 
-	"github.com/ahimsalabs/durable-streams-go/durablestream/internal/transport"
+	"github.com/ahimsalabs/durable-streams-go/durablestream/transport"
 )
 
 // TransportStub is a test double for transport.Transport.

@@ -214,6 +214,6 @@ func setupInternalTestServer() (*httptest.Server, *testStorage, *Client) {
 		LongPollTimeout: 100 * time.Millisecond,
 	})
 	server := httptest.NewServer(handler)
-	client := NewClient(server.URL, &ClientConfig{LongPollTimeout: 100 * time.Millisecond})
+	client := NewClient(server.URL, nil)
 	return server, storage, client
 }

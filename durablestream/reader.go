@@ -7,7 +7,7 @@ import (
 	"fmt"
 	"iter"
 
-	"github.com/ahimsalabs/durable-streams-go/durablestream/internal/transport"
+	"github.com/ahimsalabs/durable-streams-go/durablestream/transport"
 )
 
 // Reader provides continuous stream reading with automatic mode transitions.
