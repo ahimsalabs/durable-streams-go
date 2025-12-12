@@ -57,37 +57,32 @@ func (c *Client) LongPollTimeout(d time.Duration) *Client {
 }
 
 // StreamData contains the result of a stream read operation.
-// Use Bytes() or JSON() accessors for safe access to content.
 type StreamData struct {
-	Data       []byte            // Raw bytes (non-JSON mode) - prefer Bytes()
-	Messages   []json.RawMessage // Individual messages (JSON mode) - prefer JSON()
-	NextOffset Offset            // Next offset to read from
-	Cursor     string            // Opaque cursor for long-poll
-	UpToDate   bool              // True if caught up to tail
+	Data       []byte // Raw response bytes (always populated)
+	NextOffset Offset // Next offset to read from
+	Cursor     string // Opaque cursor for long-poll
+	UpToDate   bool   // True if caught up to tail
 }
 
-// Bytes returns raw data if available.
-// Returns (nil, false) if no data or if stream is in JSON mode.
-func (s *StreamData) Bytes() ([]byte, bool) {
-	if len(s.Data) > 0 {
-		return s.Data, true
-	}
-	return nil, false
+// Message represents a single message from a stream.
+// Use Decode() to unmarshal JSON, Bytes() for raw access, or String() for text.
+type Message struct {
+	data []byte
 }
 
-// JSON unmarshals into v. Works whether data came as Messages or as JSON-shaped Data bytes.
-// If Messages has one element, unmarshals that. If Data is set, unmarshals that.
-// Pass a slice pointer to unmarshal arrays. Returns false if no data or unmarshal fails.
-func (s *StreamData) JSON(v any) bool {
-	// Try Messages first (proper JSON mode)
-	if len(s.Messages) > 0 {
-		return json.Unmarshal(s.Messages[0], v) == nil
-	}
-	// Fall back to Data (might be JSON-shaped bytes)
-	if len(s.Data) > 0 {
-		return json.Unmarshal(s.Data, v) == nil
-	}
-	return false
+// Bytes returns the raw message bytes.
+func (m Message) Bytes() []byte {
+	return m.data
+}
+
+// Decode unmarshals the message as JSON into v.
+func (m Message) Decode(v any) error {
+	return json.Unmarshal(m.data, v)
+}
+
+// String returns the message as a string.
+func (m Message) String() string {
+	return string(m.data)
 }
 
 // CreateOptions specifies options for creating a stream.

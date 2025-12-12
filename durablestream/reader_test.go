@@ -3,7 +3,6 @@ package durablestream
 import (
 	"bufio"
 	"context"
-	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -391,8 +390,13 @@ func TestReader_LongPoll_JSON(t *testing.T) {
 		t.Fatalf("read failed: %v", err)
 	}
 
-	if len(result.Messages) == 0 {
-		t.Error("expected JSON messages in result")
+	// Data should contain JSON array
+	if len(result.Data) == 0 {
+		t.Error("expected data in result")
+	}
+	// Should be a JSON array like [{"event":"test"}]
+	if result.Data[0] != '[' {
+		t.Errorf("expected JSON array, got: %s", result.Data)
 	}
 }
 
@@ -426,8 +430,8 @@ func TestReader_SSE(t *testing.T) {
 			t.Fatalf("SSE read failed: %v", err)
 		}
 
-		if len(result.Messages) == 0 {
-			t.Error("expected messages in SSE result")
+		if len(result.Data) == 0 {
+			t.Error("expected data in SSE result")
 		}
 	})
 
@@ -449,8 +453,8 @@ func TestReader_SSE(t *testing.T) {
 			t.Fatalf("SSE read failed: %v", err)
 		}
 
-		if len(result.Messages) == 0 {
-			t.Error("expected JSON messages in SSE result")
+		if len(result.Data) == 0 {
+			t.Error("expected data in SSE result")
 		}
 	})
 
@@ -591,7 +595,7 @@ func TestReader_MessagesIterator(t *testing.T) {
 			}
 
 			var data map[string]int
-			if err := json.Unmarshal(msg, &data); err == nil {
+			if err := msg.Decode(&data); err == nil {
 				count++
 			}
 
@@ -1069,8 +1073,8 @@ func TestReader_SSE_ControlEventUpdatesState(t *testing.T) {
 	}
 
 	// Check we got the data event
-	if len(result.Messages) == 0 {
-		t.Error("expected messages in result")
+	if len(result.Data) == 0 {
+		t.Error("expected data in result")
 	}
 }
 
@@ -1177,8 +1181,11 @@ func TestReader_SSE_DataAsNonArray(t *testing.T) {
 		t.Fatalf("read failed: %v", err)
 	}
 
-	// Should treat as single message
-	if len(result.Messages) != 1 {
-		t.Errorf("messages count = %d, want 1", len(result.Messages))
+	// Should have data (single JSON object, not array)
+	if len(result.Data) == 0 {
+		t.Error("expected data in result")
+	}
+	if string(result.Data) != `{"key":"value"}` {
+		t.Errorf("data = %q, want %q", result.Data, `{"key":"value"}`)
 	}
 }

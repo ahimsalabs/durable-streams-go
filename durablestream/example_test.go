@@ -2,11 +2,11 @@ package durablestream_test
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"log"
 	"net/http"
 	"net/http/httptest"
+	"time"
 
 	"github.com/ahimsalabs/durable-streams-go/durablestream"
 	"github.com/ahimsalabs/durable-streams-go/durablestream/memorystorage"
@@ -45,7 +45,7 @@ func ExampleClient() {
 		log.Fatal(err)
 	}
 
-	msg := json.RawMessage(`{"type":"user.created","id":123}`)
+	msg := []byte(`{"type":"user.created","id":123}`)
 	if err := writer.Send(msg); err != nil {
 		log.Fatal(err)
 	}
@@ -60,7 +60,7 @@ func ExampleClient() {
 		log.Fatal(err)
 	}
 
-	fmt.Println("Messages:", len(result.Messages))
+	fmt.Println("Got data:", len(result.Data) > 0)
 	fmt.Println("Next offset:", result.NextOffset)
 }
 
@@ -80,7 +80,9 @@ func ExampleReader() {
 		if err != nil {
 			log.Fatal(err)
 		}
-		fmt.Println("Received:", string(msg))
+		// Use msg.String() for text, msg.Bytes() for raw bytes,
+		// or msg.Decode(&v) for JSON
+		fmt.Println("Received:", msg.String())
 	}
 }
 
@@ -94,22 +96,30 @@ func Example_fullDemo() {
 	server := httptest.NewServer(handler)
 	defer server.Close()
 
-	ctx := context.Background()
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+
 	client := durablestream.NewClient().BaseURL(server.URL)
 
-	client.Create(ctx, "/mystream", &durablestream.CreateOptions{
+	_, _ = client.Create(ctx, "/mystream", &durablestream.CreateOptions{
 		ContentType: "application/json",
 	})
 
 	// Write using Writer
 	writer, _ := client.Writer(ctx, "/mystream")
-	writer.Send([]byte(`{"hello":"world"}`))
+	_ = writer.Send([]byte(`{"hello":"world"}`))
 
-	// Read using Reader
+	// Read using Reader with Messages iterator
 	reader := client.Reader("/mystream", durablestream.ZeroOffset)
 	defer reader.Close()
-	result, _ := reader.Read(ctx)
-	fmt.Println(string(result.Messages[0]))
+
+	for msg, err := range reader.Messages(ctx) {
+		if err != nil {
+			break
+		}
+		fmt.Println(msg.String())
+		break // Just read first message for demo
+	}
 	// [/snippet:demo]
 
 	// Output: {"hello":"world"}

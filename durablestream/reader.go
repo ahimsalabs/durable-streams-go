@@ -1,6 +1,7 @@
 package durablestream
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -128,26 +129,12 @@ func (r *Reader) doRead(ctx context.Context, offset Offset) (*StreamData, error)
 		return nil, fmt.Errorf("read response body: %w", err)
 	}
 
-	result := &StreamData{
+	return &StreamData{
+		Data:       body,
 		NextOffset: Offset(resp.Header.Get(protocol.HeaderStreamNextOffset)),
 		Cursor:     resp.Header.Get(protocol.HeaderStreamCursor),
 		UpToDate:   resp.Header.Get(protocol.HeaderStreamUpToDate) == "true",
-	}
-
-	contentType := resp.Header.Get("Content-Type")
-	if protocol.IsJSONContentType(contentType) {
-		var messages []json.RawMessage
-		if len(body) > 0 {
-			if err := json.Unmarshal(body, &messages); err != nil {
-				return nil, fmt.Errorf("parse JSON response: %w", err)
-			}
-		}
-		result.Messages = messages
-	} else {
-		result.Data = body
-	}
-
-	return result, nil
+	}, nil
 }
 
 // readLongPoll performs a long-poll read, waiting for new data.
@@ -209,23 +196,10 @@ func (r *Reader) readLongPoll(ctx context.Context) (*StreamData, error) {
 
 	// Parse response
 	result := &StreamData{
+		Data:       body,
 		NextOffset: Offset(resp.Header.Get(protocol.HeaderStreamNextOffset)),
 		Cursor:     resp.Header.Get(protocol.HeaderStreamCursor),
 		UpToDate:   resp.Header.Get(protocol.HeaderStreamUpToDate) == "true",
-	}
-
-	// Check if JSON mode
-	contentType := resp.Header.Get("Content-Type")
-	if protocol.IsJSONContentType(contentType) {
-		var messages []json.RawMessage
-		if len(body) > 0 {
-			if err := json.Unmarshal(body, &messages); err != nil {
-				return nil, fmt.Errorf("parse JSON response: %w", err)
-			}
-		}
-		result.Messages = messages
-	} else {
-		result.Data = body
 	}
 
 	// Update state
@@ -275,22 +249,12 @@ func (r *Reader) readSSE(ctx context.Context) (*StreamData, error) {
 
 	// Handle data events
 	if event.Type == "data" {
-		result := &StreamData{
+		return &StreamData{
+			Data:       event.Data,
 			NextOffset: r.offset,
 			Cursor:     r.cursor,
 			UpToDate:   true,
-		}
-
-		// Try to parse as JSON message(s)
-		var messages []json.RawMessage
-		if err := json.Unmarshal(event.Data, &messages); err == nil {
-			result.Messages = messages
-		} else {
-			// Not a JSON array, treat as single message
-			result.Messages = []json.RawMessage{event.Data}
-		}
-
-		return result, nil
+		}, nil
 	}
 
 	// Unknown event type
@@ -389,37 +353,53 @@ func (r *Reader) Close() error {
 	return nil
 }
 
-// Messages returns an iterator for reading JSON messages from the stream.
+// Messages returns an iterator for reading messages from the stream.
+// For JSON streams, it parses the JSON array and yields individual messages.
+// Each Message can be decoded via msg.Decode(&v) or accessed as raw bytes via msg.Bytes().
+//
 // This enables use with Go 1.22+ range-over-func:
 //
 //	for msg, err := range reader.Messages(ctx) {
 //	    if err != nil {
 //	        log.Fatal(err)
 //	    }
-//	    // Process msg
+//	    var event MyEvent
+//	    if err := msg.Decode(&event); err != nil {
+//	        log.Fatal(err)
+//	    }
 //	}
-func (r *Reader) Messages(ctx context.Context) iter.Seq2[json.RawMessage, error] {
-	return func(yield func(json.RawMessage, error) bool) {
+func (r *Reader) Messages(ctx context.Context) iter.Seq2[Message, error] {
+	return func(yield func(Message, error) bool) {
 		for {
 			select {
 			case <-ctx.Done():
-				yield(nil, ctx.Err())
+				yield(Message{}, ctx.Err())
 				return
 			default:
 			}
 
 			result, err := r.Read(ctx)
 			if err != nil {
-				if !yield(nil, err) {
+				if !yield(Message{}, err) {
 					return
 				}
 				continue
 			}
 
-			// Yield each message
-			for _, msg := range result.Messages {
-				if !yield(msg, nil) {
-					return
+			// Parse JSON array and yield individual messages
+			messages, err := parseJSONMessages(result.Data)
+			if err != nil {
+				// Not valid JSON array - yield as single message
+				if len(result.Data) > 0 {
+					if !yield(Message{data: result.Data}, nil) {
+						return
+					}
+				}
+			} else {
+				for _, msg := range messages {
+					if !yield(Message{data: msg}, nil) {
+						return
+					}
 				}
 			}
 
@@ -429,6 +409,32 @@ func (r *Reader) Messages(ctx context.Context) iter.Seq2[json.RawMessage, error]
 			}
 		}
 	}
+}
+
+// parseJSONMessages parses a JSON array and returns individual message bytes.
+// Returns error if data is not a valid JSON array.
+func parseJSONMessages(data []byte) ([][]byte, error) {
+	data = bytes.TrimSpace(data)
+	if len(data) == 0 {
+		return nil, nil
+	}
+
+	// Quick check: must start with [ and end with ]
+	if data[0] != '[' || data[len(data)-1] != ']' {
+		return nil, fmt.Errorf("not a JSON array")
+	}
+
+	// Parse as array of raw messages
+	var raw []json.RawMessage
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return nil, err
+	}
+
+	messages := make([][]byte, len(raw))
+	for i, r := range raw {
+		messages[i] = r
+	}
+	return messages, nil
 }
 
 // Bytes returns an iterator for reading raw bytes from the stream.
