@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"io"
 	"net/http/httptest"
-	"strings"
 	"sync"
 	"time"
 )
@@ -19,9 +18,7 @@ type testStorage struct {
 
 type testStream struct {
 	config      StreamConfig
-	data        []byte
-	messages    [][]byte // Individual messages for JSON mode
-	offsets     []int
+	messages    []StoredMessage
 	subscribers []chan Offset
 }
 
@@ -40,25 +37,12 @@ func (s *testStorage) Create(ctx context.Context, streamID string, cfg StreamCon
 	}
 
 	stream := &testStream{
-		config:  cfg,
-		data:    make([]byte, 0),
-		offsets: []int{0},
-	}
-
-	// Initialize messages slice for JSON mode
-	if isJSONContentType(cfg.ContentType) {
-		stream.messages = make([][]byte, 0)
+		config:   cfg,
+		messages: make([]StoredMessage, 0),
 	}
 
 	s.streams[streamID] = stream
 	return true, nil
-}
-
-// isJSONContentType returns true if the content type is application/json.
-func isJSONContentType(contentType string) bool {
-	parts := strings.Split(contentType, ";")
-	mediaType := strings.TrimSpace(parts[0])
-	return strings.EqualFold(mediaType, "application/json")
 }
 
 func (s *testStorage) Append(ctx context.Context, streamID string, data []byte, seq string) (Offset, error) {
@@ -70,16 +54,12 @@ func (s *testStorage) Append(ctx context.Context, streamID string, data []byte, 
 		return "", ErrNotFound
 	}
 
-	stream.data = append(stream.data, data...)
-
-	// Track message for JSON mode
-	if stream.messages != nil {
-		stream.messages = append(stream.messages, data)
+	offset := Offset(fmt.Sprintf("%010d", len(stream.messages)+1))
+	msg := StoredMessage{
+		Data:   data,
+		Offset: offset,
 	}
-
-	newOffset := len(stream.offsets)
-	stream.offsets = append(stream.offsets, len(stream.data))
-	offset := Offset(fmt.Sprintf("%010d", newOffset))
+	stream.messages = append(stream.messages, msg)
 
 	// Notify subscribers
 	for _, ch := range stream.subscribers {
@@ -92,7 +72,7 @@ func (s *testStorage) Append(ctx context.Context, streamID string, data []byte, 
 	return offset, nil
 }
 
-func (s *testStorage) AppendReader(ctx context.Context, streamID string, r io.Reader, seq string) (Offset, error) {
+func (s *testStorage) AppendFrom(ctx context.Context, streamID string, r io.Reader, seq string) (Offset, error) {
 	data, err := io.ReadAll(r)
 	if err != nil {
 		return "", err
@@ -114,47 +94,46 @@ func (s *testStorage) Read(ctx context.Context, streamID string, offset Offset, 
 		_, _ = fmt.Sscanf(string(offset), "%d", &offsetIdx)
 	}
 
-	if offsetIdx >= len(stream.offsets) {
+	if offsetIdx > len(stream.messages) {
 		return nil, ErrGone
 	}
 
-	startPos := stream.offsets[offsetIdx]
-	endPos := len(stream.data)
-	if limit > 0 && endPos-startPos > limit {
-		endPos = startPos + limit
-	}
-
-	nextOffsetIdx := len(stream.offsets) - 1
-	for i := offsetIdx + 1; i < len(stream.offsets); i++ {
-		if stream.offsets[i] >= endPos {
-			nextOffsetIdx = i
+	// Collect messages starting from offsetIdx, respecting byte limit
+	var messages []StoredMessage
+	totalBytes := 0
+	for i := offsetIdx; i < len(stream.messages); i++ {
+		msg := stream.messages[i]
+		if limit > 0 && totalBytes+len(msg.Data) > limit && len(messages) > 0 {
 			break
 		}
+		messages = append(messages, msg)
+		totalBytes += len(msg.Data)
 	}
 
-	data := make([]byte, endPos-startPos)
-	copy(data, stream.data[startPos:endPos])
-
-	result := &ReadResult{
-		Data:       data,
-		NextOffset: Offset(fmt.Sprintf("%010d", nextOffsetIdx)),
-		TailOffset: Offset(fmt.Sprintf("%010d", len(stream.offsets)-1)),
-	}
-
-	// For JSON mode, return individual messages
-	if stream.messages != nil && offsetIdx < len(stream.messages) {
-		endMsgIdx := nextOffsetIdx
-		if endMsgIdx > len(stream.messages) {
-			endMsgIdx = len(stream.messages)
-		}
-
-		result.Messages = make([][]byte, 0, endMsgIdx-offsetIdx)
-		for i := offsetIdx; i < endMsgIdx && i < len(stream.messages); i++ {
-			result.Messages = append(result.Messages, stream.messages[i])
+	// Calculate next offset
+	var nextOffset Offset
+	if len(messages) > 0 {
+		nextOffset = messages[len(messages)-1].Offset
+	} else {
+		nextOffset = offset
+		if nextOffset == "" || nextOffset == "-1" {
+			nextOffset = Offset(fmt.Sprintf("%010d", 0))
 		}
 	}
 
-	return result, nil
+	// Tail offset
+	var tailOffset Offset
+	if len(stream.messages) > 0 {
+		tailOffset = stream.messages[len(stream.messages)-1].Offset
+	} else {
+		tailOffset = Offset(fmt.Sprintf("%010d", 0))
+	}
+
+	return &ReadResult{
+		Messages:   messages,
+		NextOffset: nextOffset,
+		TailOffset: tailOffset,
+	}, nil
 }
 
 func (s *testStorage) Head(ctx context.Context, streamID string) (*StreamInfo, error) {
@@ -166,9 +145,16 @@ func (s *testStorage) Head(ctx context.Context, streamID string) (*StreamInfo, e
 		return nil, ErrNotFound
 	}
 
+	var nextOffset Offset
+	if len(stream.messages) > 0 {
+		nextOffset = stream.messages[len(stream.messages)-1].Offset
+	} else {
+		nextOffset = Offset(fmt.Sprintf("%010d", 0))
+	}
+
 	return &StreamInfo{
 		ContentType: stream.config.ContentType,
-		NextOffset:  Offset(fmt.Sprintf("%010d", len(stream.offsets)-1)),
+		NextOffset:  nextOffset,
 		TTL:         stream.config.TTL,
 		ExpiresAt:   stream.config.ExpiresAt,
 	}, nil

@@ -11,6 +11,25 @@ import (
 	"github.com/ahimsalabs/durable-streams-go/durablestream"
 )
 
+// concatMessages concatenates all message data from a ReadResult.
+func concatMessages(result *durablestream.ReadResult) []byte {
+	if len(result.Messages) == 0 {
+		return nil
+	}
+	if len(result.Messages) == 1 {
+		return result.Messages[0].Data
+	}
+	var total int
+	for _, m := range result.Messages {
+		total += len(m.Data)
+	}
+	data := make([]byte, 0, total)
+	for _, m := range result.Messages {
+		data = append(data, m.Data...)
+	}
+	return data
+}
+
 func TestNew(t *testing.T) {
 	s := New()
 	if s == nil {
@@ -273,13 +292,13 @@ func TestAppend(t *testing.T) {
 	})
 }
 
-func TestAppendReader(t *testing.T) {
+func TestAppendFrom(t *testing.T) {
 	t.Run("appends from reader", func(t *testing.T) {
 		s := New()
 		_, _ = s.Create(context.Background(), "test", durablestream.StreamConfig{ContentType: "text/plain"})
 
 		r := strings.NewReader("hello from reader")
-		offset, err := s.AppendReader(context.Background(), "test", r, "")
+		offset, err := s.AppendFrom(context.Background(), "test", r, "")
 		if err != nil {
 			t.Fatalf("append reader: %v", err)
 		}
@@ -288,8 +307,8 @@ func TestAppendReader(t *testing.T) {
 		}
 
 		result, _ := s.Read(context.Background(), "test", "0000000000", 0)
-		if string(result.Data) != "hello from reader" {
-			t.Errorf("unexpected data: %s", result.Data)
+		if string(concatMessages(result)) != "hello from reader" {
+			t.Errorf("unexpected data: %s", concatMessages(result))
 		}
 	})
 
@@ -298,7 +317,7 @@ func TestAppendReader(t *testing.T) {
 		_, _ = s.Create(context.Background(), "test", durablestream.StreamConfig{ContentType: "text/plain"})
 
 		r := &errorReader{err: errors.New("read failed")}
-		_, err := s.AppendReader(context.Background(), "test", r, "")
+		_, err := s.AppendFrom(context.Background(), "test", r, "")
 		if !errors.Is(err, durablestream.ErrBadRequest) {
 			t.Errorf("expected ErrBadRequest, got: %v", err)
 		}
@@ -324,8 +343,8 @@ func TestRead(t *testing.T) {
 		if err != nil {
 			t.Fatalf("read: %v", err)
 		}
-		if string(result.Data) != "hello world" {
-			t.Errorf("unexpected data: %s", result.Data)
+		if string(concatMessages(result)) != "hello world" {
+			t.Errorf("unexpected data: %s", concatMessages(result))
 		}
 	})
 
@@ -338,8 +357,8 @@ func TestRead(t *testing.T) {
 		if err != nil {
 			t.Fatalf("read: %v", err)
 		}
-		if string(result.Data) != "data" {
-			t.Errorf("unexpected data: %s", result.Data)
+		if string(concatMessages(result)) != "data" {
+			t.Errorf("unexpected data: %s", concatMessages(result))
 		}
 	})
 
@@ -390,17 +409,26 @@ func TestRead(t *testing.T) {
 	t.Run("respects limit", func(t *testing.T) {
 		s := New()
 		_, _ = s.Create(context.Background(), "test", durablestream.StreamConfig{ContentType: "text/plain"})
-		_, _ = s.Append(context.Background(), "test", []byte("hello world this is a lot of data"), "")
+		// With message-based storage, limit applies to total bytes but we always return whole messages
+		// So a single large message will be returned in full even if it exceeds limit
+		_, _ = s.Append(context.Background(), "test", []byte("hello"), "")
+		_, _ = s.Append(context.Background(), "test", []byte("world"), "")
+		_, _ = s.Append(context.Background(), "test", []byte("extra"), "")
 
-		result, err := s.Read(context.Background(), "test", "0000000000", 5)
+		// Limit of 8 should return first two messages (10 bytes total, but we return whole messages)
+		result, err := s.Read(context.Background(), "test", "0000000000", 8)
 		if err != nil {
 			t.Fatalf("read: %v", err)
 		}
-		if len(result.Data) != 5 {
-			t.Errorf("expected 5 bytes, got %d", len(result.Data))
+		// First message (5 bytes) fits, second message (5 bytes) would exceed but we include at least one
+		// With 8 byte limit: first msg (5) fits, second msg would make 10 > 8, but we have at least one
+		// Actually the logic is: if adding msg exceeds limit AND we have at least one, stop
+		// So: msg1 (5) fits (5 <= 8), msg2 (5+5=10 > 8) but we have 1, stop
+		if len(result.Messages) != 1 {
+			t.Errorf("expected 1 message with limit 8, got %d", len(result.Messages))
 		}
-		if string(result.Data) != "hello" {
-			t.Errorf("unexpected data: %s", result.Data)
+		if string(concatMessages(result)) != "hello" {
+			t.Errorf("unexpected data: %s", concatMessages(result))
 		}
 	})
 
@@ -443,8 +471,8 @@ func TestRead(t *testing.T) {
 		if err != nil {
 			t.Fatalf("read: %v", err)
 		}
-		if string(result.Data) != "second" {
-			t.Errorf("expected 'second', got '%s'", result.Data)
+		if string(concatMessages(result)) != "second" {
+			t.Errorf("expected 'second', got '%s'", concatMessages(result))
 		}
 	})
 
@@ -742,28 +770,6 @@ func TestParseOffset(t *testing.T) {
 	}
 }
 
-func TestIsJSONContentType(t *testing.T) {
-	tests := []struct {
-		contentType string
-		want        bool
-	}{
-		{"application/json", true},
-		{"APPLICATION/JSON", true},
-		{"Application/Json", true},
-		{"application/json; charset=utf-8", true},
-		{"text/plain", false},
-		{"application/octet-stream", false},
-		{"text/json", false}, // Not standard
-	}
-
-	for _, tt := range tests {
-		got := isJSONContentType(tt.contentType)
-		if got != tt.want {
-			t.Errorf("isJSONContentType(%q) = %v, want %v", tt.contentType, got, tt.want)
-		}
-	}
-}
-
 func TestContentTypesMatch(t *testing.T) {
 	tests := []struct {
 		a, b string
@@ -916,17 +922,22 @@ func TestReadWithPartialLimit(t *testing.T) {
 	_, _ = s.Create(context.Background(), "test", durablestream.StreamConfig{ContentType: "text/plain"})
 
 	// Append multiple messages
-	_, _ = s.Append(context.Background(), "test", []byte("aaaa"), "") // offset 1, bytes 0-4
-	_, _ = s.Append(context.Background(), "test", []byte("bbbb"), "") // offset 2, bytes 4-8
-	_, _ = s.Append(context.Background(), "test", []byte("cccc"), "") // offset 3, bytes 8-12
+	_, _ = s.Append(context.Background(), "test", []byte("aaaa"), "") // offset 1
+	_, _ = s.Append(context.Background(), "test", []byte("bbbb"), "") // offset 2
+	_, _ = s.Append(context.Background(), "test", []byte("cccc"), "") // offset 3
 
-	// Read from start with limit that cuts into second message
+	// Read from start with limit of 6 bytes
+	// With message-based storage, we return whole messages until limit exceeded
+	// First msg (4 bytes) fits, second msg (4+4=8 > 6) exceeds but we have one, stop
 	result, err := s.Read(context.Background(), "test", "0000000000", 6)
 	if err != nil {
 		t.Fatalf("read: %v", err)
 	}
-	if string(result.Data) != "aaaabb" {
-		t.Errorf("expected 'aaaabb', got '%s'", result.Data)
+	if len(result.Messages) != 1 {
+		t.Errorf("expected 1 message with limit 6, got %d", len(result.Messages))
+	}
+	if string(concatMessages(result)) != "aaaa" {
+		t.Errorf("expected 'aaaa', got '%s'", concatMessages(result))
 	}
 }
 
@@ -950,7 +961,7 @@ func TestReadJSONWithMultipleMessages(t *testing.T) {
 	if len(result.Messages) != 3 {
 		t.Errorf("expected 3 messages from offset 2, got %d", len(result.Messages))
 	}
-	if !bytes.Equal(result.Messages[0], []byte(`{"n":3}`)) {
-		t.Errorf("first message should be {\"n\":3}, got %s", result.Messages[0])
+	if !bytes.Equal(result.Messages[0].Data, []byte(`{"n":3}`)) {
+		t.Errorf("first message should be {\"n\":3}, got %s", result.Messages[0].Data)
 	}
 }

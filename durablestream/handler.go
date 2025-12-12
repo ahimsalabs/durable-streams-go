@@ -297,7 +297,7 @@ func (h *Handler) handleAppend(w http.ResponseWriter, r *http.Request, streamID 
 			limit: h.maxAppendSize,
 		}
 
-		nextOffset, err = h.storage.AppendReader(r.Context(), streamID, limitedReader, seq)
+		nextOffset, err = h.storage.AppendFrom(r.Context(), streamID, limitedReader, seq)
 		if err != nil {
 			writeStorageError(w, err)
 			return
@@ -398,22 +398,8 @@ func (h *Handler) handleCatchupRead(w http.ResponseWriter, r *http.Request, stre
 		w.Header().Set(protocol.HeaderStreamUpToDate, "true")
 	}
 
-	// For JSON mode, format response as array
-	var responseBody []byte
-	if protocol.IsJSONContentType(info.ContentType) {
-		// If we have messages in result, use them; otherwise parse from data
-		if len(result.Messages) > 0 {
-			responseBody = protocol.FormatJSONResponse(result.Messages)
-		} else if len(result.Data) > 0 {
-			// Try to split data into messages (this is a simplification)
-			// In a real implementation, storage should track message boundaries
-			responseBody = []byte("[" + string(result.Data) + "]")
-		} else {
-			responseBody = []byte("[]")
-		}
-	} else {
-		responseBody = result.Data
-	}
+	// Format response based on content type
+	responseBody := formatResponseBody(result.Messages, info.ContentType)
 
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write(responseBody)
@@ -434,8 +420,8 @@ func (h *Handler) handleLongPoll(w http.ResponseWriter, r *http.Request, streamI
 		return
 	}
 
-	// If data available, return immediately
-	if len(result.Data) > 0 {
+	// If messages available, return immediately
+	if len(result.Messages) > 0 {
 		info, err := h.storage.Head(r.Context(), streamID)
 		if err != nil {
 			writeStorageError(w, err)
@@ -446,16 +432,7 @@ func (h *Handler) handleLongPoll(w http.ResponseWriter, r *http.Request, streamI
 		w.Header().Set(protocol.HeaderStreamNextOffset, result.NextOffset.String())
 		w.Header().Set("Cache-Control", "public, max-age=60, stale-while-revalidate=300")
 
-		var responseBody []byte
-		if protocol.IsJSONContentType(info.ContentType) {
-			if len(result.Messages) > 0 {
-				responseBody = protocol.FormatJSONResponse(result.Messages)
-			} else {
-				responseBody = []byte("[" + string(result.Data) + "]")
-			}
-		} else {
-			responseBody = result.Data
-		}
+		responseBody := formatResponseBody(result.Messages, info.ContentType)
 
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write(responseBody)
@@ -513,18 +490,7 @@ func (h *Handler) handleLongPoll(w http.ResponseWriter, r *http.Request, streamI
 		w.Header().Set(protocol.HeaderStreamNextOffset, result.NextOffset.String())
 		w.Header().Set("Cache-Control", "public, max-age=60, stale-while-revalidate=300")
 
-		var responseBody []byte
-		if protocol.IsJSONContentType(info.ContentType) {
-			if len(result.Messages) > 0 {
-				responseBody = protocol.FormatJSONResponse(result.Messages)
-			} else if len(result.Data) > 0 {
-				responseBody = []byte("[" + string(result.Data) + "]")
-			} else {
-				responseBody = []byte("[]")
-			}
-		} else {
-			responseBody = result.Data
-		}
+		responseBody := formatResponseBody(result.Messages, info.ContentType)
 
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write(responseBody)
@@ -593,25 +559,20 @@ func (h *Handler) handleSSE(w http.ResponseWriter, r *http.Request, streamID str
 			return
 		}
 
-		// If data available, send it
-		if len(result.Data) > 0 {
+		// If messages available, send them
+		if len(result.Messages) > 0 {
 			// Send data event
 			fmt.Fprintf(w, "event: data\n")
 
 			if protocol.IsJSONContentType(info.ContentType) {
 				// For JSON, format as single-line array
 				// (SSE joins data: lines with \n which would create invalid JSON)
-				var messages [][]byte
-				if len(result.Messages) > 0 {
-					messages = result.Messages
-				} else if len(result.Data) > 0 {
-					messages = [][]byte{result.Data}
-				}
-				jsonArray := protocol.FormatJSONResponse(messages)
+				jsonArray := formatResponseBody(result.Messages, info.ContentType)
 				fmt.Fprintf(w, "data: %s\n", string(jsonArray))
 			} else {
-				// For text/*, send as-is (split by lines)
-				lines := strings.Split(string(result.Data), "\n")
+				// For text/*, send concatenated data split by lines
+				data := concatenateMessages(result.Messages)
+				lines := strings.Split(string(data), "\n")
 				for _, line := range lines {
 					fmt.Fprintf(w, "data: %s\n", line)
 				}
@@ -641,7 +602,7 @@ func (h *Handler) handleSSE(w http.ResponseWriter, r *http.Request, streamID str
 			return
 		default:
 			// Continue, but wait for new data
-			if len(result.Data) == 0 {
+			if len(result.Messages) == 0 {
 				// Subscribe and wait for new data
 				ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
 				notifyCh, err := h.storage.Subscribe(ctx, streamID, currentOffset)
@@ -703,6 +664,52 @@ func (h *Handler) handleDelete(w http.ResponseWriter, r *http.Request, streamID 
 	}
 
 	w.WriteHeader(http.StatusNoContent)
+}
+
+// formatResponseBody formats messages for HTTP response based on content type.
+// For JSON, wraps messages in a JSON array. For other types, concatenates raw bytes.
+func formatResponseBody(messages []StoredMessage, contentType string) []byte {
+	if len(messages) == 0 {
+		if protocol.IsJSONContentType(contentType) {
+			return []byte("[]")
+		}
+		return nil
+	}
+
+	if protocol.IsJSONContentType(contentType) {
+		// Extract raw message data for JSON formatting
+		rawMessages := make([][]byte, len(messages))
+		for i, msg := range messages {
+			rawMessages[i] = msg.Data
+		}
+		return protocol.FormatJSONResponse(rawMessages)
+	}
+
+	// Non-JSON: concatenate all message data
+	return concatenateMessages(messages)
+}
+
+// concatenateMessages concatenates all message data into a single byte slice.
+func concatenateMessages(messages []StoredMessage) []byte {
+	if len(messages) == 0 {
+		return nil
+	}
+	if len(messages) == 1 {
+		return messages[0].Data
+	}
+
+	// Calculate total size
+	total := 0
+	for _, msg := range messages {
+		total += len(msg.Data)
+	}
+
+	// Concatenate
+	result := make([]byte, 0, total)
+	for _, msg := range messages {
+		result = append(result, msg.Data...)
+	}
+	return result
 }
 
 // writeError writes a JSON error response.

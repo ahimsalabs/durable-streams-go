@@ -21,12 +21,18 @@ type StreamInfo struct {
 	ExpiresAt   time.Time     // Zero means no expiry
 }
 
-// ReadResult contains data from a storage read.
+// StoredMessage represents a single message in a stream.
+// Each append operation creates one StoredMessage (or multiple if JSON array is flattened).
+type StoredMessage struct {
+	Data   []byte // Raw bytes of this message
+	Offset Offset // Offset after this message
+}
+
+// ReadResult contains messages from a storage read.
 type ReadResult struct {
-	Data       []byte   // Raw bytes or JSON messages concatenated
-	Messages   [][]byte // Individual messages (JSON mode)
-	NextOffset Offset
-	TailOffset Offset // For up-to-date detection
+	Messages   []StoredMessage // Individual messages in offset order
+	NextOffset Offset          // Offset to use for next read
+	TailOffset Offset          // Current tail (for up-to-date detection)
 }
 
 // Storage defines the interface for stream persistence.
@@ -41,15 +47,15 @@ type Storage interface {
 	// seq is optional sequence number for coordination (Section 5.2).
 	Append(ctx context.Context, streamID string, data []byte, seq string) (Offset, error)
 
-	// AppendReader streams data from an io.Reader to a stream.
+	// AppendFrom streams data from an io.Reader to a stream.
 	// This avoids buffering the entire request body in memory.
 	// The reader is read until EOF or error. Returns the new tail offset.
 	// Implementations MUST ensure atomic writes - either all data is persisted
 	// or none (per protocol atomicity requirements).
-	AppendReader(ctx context.Context, streamID string, r io.Reader, seq string) (Offset, error)
+	AppendFrom(ctx context.Context, streamID string, r io.Reader, seq string) (Offset, error)
 
-	// Read returns data from offset. limit is max bytes to return.
-	// Returns data and the next offset to read from (Section 5.5).
+	// Read returns messages from offset. limit is max total bytes to return.
+	// Returns messages and the next offset to read from (Section 5.5).
 	Read(ctx context.Context, streamID string, offset Offset, limit int) (*ReadResult, error)
 
 	// Head returns stream metadata without reading data (Section 5.4).

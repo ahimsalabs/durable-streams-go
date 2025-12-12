@@ -70,12 +70,12 @@ func (m *mockStorage) Append(_ context.Context, _ string, _ []byte, _ string) (O
 	return "", nil
 }
 
-func (m *mockStorage) AppendReader(_ context.Context, _ string, _ io.Reader, _ string) (Offset, error) {
+func (m *mockStorage) AppendFrom(_ context.Context, _ string, _ io.Reader, _ string) (Offset, error) {
 	return "", nil
 }
 
 func (m *mockStorage) Read(_ context.Context, _ string, _ Offset, _ int) (*ReadResult, error) {
-	return nil, nil
+	return &ReadResult{Messages: nil}, nil
 }
 
 func (m *mockStorage) Head(_ context.Context, _ string) (*StreamInfo, error) {
