@@ -1,0 +1,77 @@
+version: '3'
+
+tasks:
+  default:
+    desc: Run all checks
+    deps: [check]
+
+  test:
+    desc: Run tests with race detection and coverage
+    cmds:
+      - go test -race -cover ./...
+
+  lint:
+    desc: Run golangci-lint
+    cmds:
+      - golangci-lint run
+
+  fmt:
+    desc: Format code with gofumpt
+    cmds:
+      - gofumpt -w .
+
+  fmt:check:
+    desc: Check code formatting
+    cmds:
+      - gofumpt -d . | grep . && exit 1 || exit 0
+
+  staticcheck:
+    desc: Run staticcheck
+    cmds:
+      - staticcheck ./...
+
+  vet:
+    desc: Run go vet
+    cmds:
+      - go vet ./...
+
+  check:
+    desc: Run all checks (fmt, vet, lint, staticcheck, test)
+    cmds:
+      - task: fmt:check
+      - task: vet
+      - task: staticcheck
+      - task: lint
+      - task: test
+
+  tidy:
+    desc: Run go mod tidy
+    cmds:
+      - go mod tidy
+
+  build:
+    desc: Build the package
+    cmds:
+      - go build ./...
+
+  server:
+    desc: Run test server for conformance testing
+    cmds:
+      - go run ./cmd/testserver -port {{.PORT | default "8788"}}
+
+  conformance:go:
+    desc: Run TS conformance tests against Go server
+    deps: [conformance:go:server]
+    cmds:
+      - cd durable-streams-ts && pnpm --filter @durable-streams/conformance-tests test:go
+    env:
+      CONFORMANCE_URL: http://localhost:8788
+
+  conformance:go:server:
+    desc: Start Go server in background for conformance tests
+    cmds:
+      - |
+        go build -o /tmp/ds-testserver ./cmd/testserver
+        /tmp/ds-testserver -port 8788 &
+        sleep 1
+        echo "Go server started on port 8788"
