@@ -315,41 +315,18 @@ func configsMatch(a, b durablestream.StreamConfig) bool {
 	if !contentTypesMatch(a.ContentType, b.ContentType) {
 		return false
 	}
-	if !durationEqual(a.TTL, b.TTL) {
+	if a.TTL != b.TTL {
 		return false
 	}
-	if !timeEqual(a.ExpiresAt, b.ExpiresAt) {
+	if !a.ExpiresAt.Equal(b.ExpiresAt) {
 		return false
 	}
 	return true
 }
 
-// durationEqual compares two *time.Duration for equality.
-func durationEqual(a, b *time.Duration) bool {
-	if a == nil && b == nil {
-		return true
-	}
-	if a == nil || b == nil {
-		return false
-	}
-	return *a == *b
-}
-
-// timeEqual compares two *time.Time for equality.
-func timeEqual(a, b *time.Time) bool {
-	if a == nil && b == nil {
-		return true
-	}
-	if a == nil || b == nil {
-		return false
-	}
-	return a.Equal(*b)
-}
-
 // isExpired checks if a stream has expired based on its config.
 func isExpired(cfg durablestream.StreamConfig) bool {
-	now := time.Now()
-	if cfg.ExpiresAt != nil && now.After(*cfg.ExpiresAt) {
+	if !cfg.ExpiresAt.IsZero() && time.Now().After(cfg.ExpiresAt) {
 		return true
 	}
 	// TTL is checked at creation time, not on every access in this simple implementation

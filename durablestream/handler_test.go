@@ -600,12 +600,10 @@ func TestHandler_HEAD_Metadata(t *testing.T) {
 	handler := durablestream.NewHandler(storage)
 
 	// Create stream with metadata
-	ttl := 3600 * time.Second
-	expiresAt := time.Now().Add(1 * time.Hour)
 	storage.Create(context.Background(), "/stream", durablestream.StreamConfig{
 		ContentType: "application/json",
-		TTL:         &ttl,
-		ExpiresAt:   &expiresAt,
+		TTL:         3600 * time.Second,
+		ExpiresAt:   time.Now().Add(1 * time.Hour),
 	})
 	storage.Append(context.Background(), "/stream", []byte(`{"test":1}`), "")
 

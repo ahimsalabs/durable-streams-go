@@ -20,8 +20,6 @@ func setupTestServer() (*httptest.Server, *memorystorage.Storage, *durablestream
 	return server, storage, client
 }
 
-func ptrTo[T any](v T) *T { return &v }
-
 func TestClient_Create(t *testing.T) {
 	tests := []struct {
 		name    string
@@ -39,7 +37,7 @@ func TestClient_Create(t *testing.T) {
 			path: "/stream2",
 			opts: &durablestream.CreateOptions{
 				ContentType: "text/plain",
-				TTL:         ptrTo(1 * time.Hour),
+				TTL:         1 * time.Hour,
 			},
 		},
 		{
@@ -47,7 +45,7 @@ func TestClient_Create(t *testing.T) {
 			path: "/stream3",
 			opts: &durablestream.CreateOptions{
 				ContentType: "application/octet-stream",
-				ExpiresAt:   ptrTo(time.Now().Add(1 * time.Hour)),
+				ExpiresAt:   time.Now().Add(1 * time.Hour),
 			},
 		},
 		{
@@ -112,10 +110,9 @@ func TestClient_Head(t *testing.T) {
 	ctx := context.Background()
 
 	// Create stream
-	ttl := 1 * time.Hour
 	_, err := client.Create(ctx, "/stream1", &durablestream.CreateOptions{
 		ContentType: "application/json",
-		TTL:         &ttl,
+		TTL:         time.Hour,
 	})
 	if err != nil {
 		t.Fatalf("create failed: %v", err)
@@ -131,7 +128,7 @@ func TestClient_Head(t *testing.T) {
 		t.Errorf("ContentType = %q, want %q", info.ContentType, "application/json")
 	}
 
-	if info.TTL == nil {
+	if info.TTL == 0 {
 		t.Error("expected TTL to be set")
 	}
 }

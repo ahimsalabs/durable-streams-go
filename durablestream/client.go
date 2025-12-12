@@ -97,12 +97,12 @@ type CreateOptions struct {
 	ContentType string
 
 	// TTL sets a relative time-to-live for the stream.
-	// Mutually exclusive with ExpiresAt.
-	TTL *time.Duration
+	// Zero means no TTL. Mutually exclusive with ExpiresAt.
+	TTL time.Duration
 
 	// ExpiresAt sets an absolute expiry time for the stream.
-	// Mutually exclusive with TTL.
-	ExpiresAt *time.Time
+	// Zero means no expiry. Mutually exclusive with TTL.
+	ExpiresAt time.Time
 
 	// InitialData sets the initial stream data.
 	InitialData []byte
@@ -128,10 +128,10 @@ func (c *Client) Create(ctx context.Context, path string, opts *CreateOptions) (
 		if opts.ContentType != "" {
 			req.Header.Set("Content-Type", opts.ContentType)
 		}
-		if opts.TTL != nil {
+		if opts.TTL > 0 {
 			req.Header.Set(protocol.HeaderStreamTTL, strconv.FormatInt(int64(opts.TTL.Seconds()), 10))
 		}
-		if opts.ExpiresAt != nil {
+		if !opts.ExpiresAt.IsZero() {
 			req.Header.Set(protocol.HeaderStreamExpiresAt, opts.ExpiresAt.Format(time.RFC3339))
 		}
 	}
@@ -307,15 +307,14 @@ func (c *Client) parseStreamInfo(headers http.Header) (*StreamInfo, error) {
 	if ttlStr := headers.Get(protocol.HeaderStreamTTL); ttlStr != "" {
 		ttlSecs, err := strconv.ParseInt(ttlStr, 10, 64)
 		if err == nil {
-			ttl := time.Duration(ttlSecs) * time.Second
-			info.TTL = &ttl
+			info.TTL = time.Duration(ttlSecs) * time.Second
 		}
 	}
 
 	if expiresStr := headers.Get(protocol.HeaderStreamExpiresAt); expiresStr != "" {
 		expiresAt, err := time.Parse(time.RFC3339, expiresStr)
 		if err == nil {
-			info.ExpiresAt = &expiresAt
+			info.ExpiresAt = expiresAt
 		}
 	}
 

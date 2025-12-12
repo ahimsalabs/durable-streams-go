@@ -9,16 +9,16 @@ import (
 // StreamConfig contains creation-time configuration.
 type StreamConfig struct {
 	ContentType string
-	TTL         *time.Duration
-	ExpiresAt   *time.Time
+	TTL         time.Duration // Zero means no TTL
+	ExpiresAt   time.Time     // Zero means no expiry
 }
 
 // StreamInfo contains metadata about a stream.
 type StreamInfo struct {
 	ContentType string
 	NextOffset  Offset
-	TTL         *time.Duration
-	ExpiresAt   *time.Time
+	TTL         time.Duration // Zero means no TTL
+	ExpiresAt   time.Time     // Zero means no expiry
 }
 
 // ReadResult contains data from a storage read.

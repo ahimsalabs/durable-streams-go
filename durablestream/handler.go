@@ -137,8 +137,7 @@ func (h *Handler) handleCreate(w http.ResponseWriter, r *http.Request, streamID 
 			writeError(w, newError(codeBadRequest, "invalid Stream-TTL header"))
 			return
 		}
-		ttl := time.Duration(ttlSec) * time.Second
-		cfg.TTL = &ttl
+		cfg.TTL = time.Duration(ttlSec) * time.Second
 	}
 
 	if hasExpiresAt {
@@ -147,7 +146,7 @@ func (h *Handler) handleCreate(w http.ResponseWriter, r *http.Request, streamID 
 			writeError(w, newError(codeBadRequest, "invalid Stream-Expires-At header (must be RFC3339)"))
 			return
 		}
-		cfg.ExpiresAt = &expiresAt
+		cfg.ExpiresAt = expiresAt
 	}
 
 	// Create stream
@@ -679,10 +678,10 @@ func (h *Handler) handleHead(w http.ResponseWriter, r *http.Request, streamID st
 	w.Header().Set(protocol.HeaderStreamNextOffset, info.NextOffset.String())
 
 	// Set TTL/Expires-At if present
-	if info.TTL != nil {
+	if info.TTL > 0 {
 		w.Header().Set(protocol.HeaderStreamTTL, strconv.FormatInt(int64(info.TTL.Seconds()), 10))
 	}
-	if info.ExpiresAt != nil {
+	if !info.ExpiresAt.IsZero() {
 		w.Header().Set(protocol.HeaderStreamExpiresAt, info.ExpiresAt.Format(time.RFC3339))
 	}
 
