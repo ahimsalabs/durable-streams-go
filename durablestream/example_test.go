@@ -15,7 +15,7 @@ import (
 // [snippet:server]
 func ExampleHandler() {
 	storage := memorystorage.New()
-	handler := durablestream.NewHandler(storage)
+	handler := durablestream.NewHandler(storage, nil)
 
 	mux := http.NewServeMux()
 	mux.Handle("/v1/stream/", http.StripPrefix("/v1/stream/", handler))
@@ -30,7 +30,7 @@ func ExampleHandler() {
 func ExampleClient() {
 	ctx := context.Background()
 
-	client := durablestream.NewClient().BaseURL("http://localhost:8080/streams")
+	client := durablestream.NewClient("http://localhost:8080/streams", nil)
 
 	_, err := client.Create(ctx, "events", &durablestream.CreateOptions{
 		ContentType: "application/json",
@@ -70,7 +70,7 @@ func ExampleClient() {
 func ExampleReader() {
 	ctx := context.Background()
 
-	client := durablestream.NewClient().BaseURL("http://localhost:8080/streams")
+	client := durablestream.NewClient("http://localhost:8080/streams", nil)
 
 	// Create a reader starting from offset 0
 	reader := client.Reader("events", durablestream.ZeroOffset)
@@ -92,14 +92,14 @@ func Example_fullDemo() {
 	// [snippet:demo]
 	// Start test server
 	storage := memorystorage.New()
-	handler := durablestream.NewHandler(storage)
+	handler := durablestream.NewHandler(storage, nil)
 	server := httptest.NewServer(handler)
 	defer server.Close()
 
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
 
-	client := durablestream.NewClient().BaseURL(server.URL)
+	client := durablestream.NewClient(server.URL, nil)
 
 	_, _ = client.Create(ctx, "/mystream", &durablestream.CreateOptions{
 		ContentType: "application/json",

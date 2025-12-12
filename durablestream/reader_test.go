@@ -200,11 +200,11 @@ func TestReader_SeekTail(t *testing.T) {
 
 func TestReader_Seek_ClearsSSE(t *testing.T) {
 	storage := newTestStorage()
-	handler := NewHandler(storage).SSECloseAfter(500 * time.Millisecond)
+	handler := NewHandler(storage, &HandlerConfig{SSECloseAfter: 500 * time.Millisecond})
 	server := httptest.NewServer(handler)
 	defer server.Close()
 
-	client := NewClient().BaseURL(server.URL)
+	client := NewClient(server.URL, nil)
 	ctx := context.Background()
 
 	storage.Create(ctx, "/stream", StreamConfig{ContentType: "text/plain"})
@@ -236,13 +236,11 @@ func TestReader_Seek_ClearsSSE(t *testing.T) {
 
 func TestReader_LongPoll(t *testing.T) {
 	storage := newTestStorage()
-	handler := NewHandler(storage).LongPollTimeout(200 * time.Millisecond)
+	handler := NewHandler(storage, &HandlerConfig{LongPollTimeout: 200 * time.Millisecond})
 	server := httptest.NewServer(handler)
 	defer server.Close()
 
-	client := NewClient().
-		BaseURL(server.URL).
-		LongPollTimeout(300 * time.Millisecond)
+	client := NewClient(server.URL, &ClientConfig{LongPollTimeout: 300 * time.Millisecond})
 
 	ctx := context.Background()
 
@@ -365,13 +363,11 @@ func TestReader_LongPoll(t *testing.T) {
 
 func TestReader_LongPoll_JSON(t *testing.T) {
 	storage := newTestStorage()
-	handler := NewHandler(storage).LongPollTimeout(200 * time.Millisecond)
+	handler := NewHandler(storage, &HandlerConfig{LongPollTimeout: 200 * time.Millisecond})
 	server := httptest.NewServer(handler)
 	defer server.Close()
 
-	client := NewClient().
-		BaseURL(server.URL).
-		LongPollTimeout(300 * time.Millisecond)
+	client := NewClient(server.URL, &ClientConfig{LongPollTimeout: 300 * time.Millisecond})
 
 	ctx := context.Background()
 
@@ -402,11 +398,11 @@ func TestReader_LongPoll_JSON(t *testing.T) {
 
 func TestReader_SSE(t *testing.T) {
 	storage := newTestStorage()
-	handler := NewHandler(storage).SSECloseAfter(500 * time.Millisecond)
+	handler := NewHandler(storage, &HandlerConfig{SSECloseAfter: 500 * time.Millisecond})
 	server := httptest.NewServer(handler)
 	defer server.Close()
 
-	client := NewClient().BaseURL(server.URL)
+	client := NewClient(server.URL, nil)
 
 	ctx := context.Background()
 
@@ -520,11 +516,11 @@ func TestReader_SSE(t *testing.T) {
 
 func TestReader_SSE_ErrorHandling(t *testing.T) {
 	storage := newTestStorage()
-	handler := NewHandler(storage)
+	handler := NewHandler(storage, nil)
 	server := httptest.NewServer(handler)
 	defer server.Close()
 
-	client := NewClient().BaseURL(server.URL)
+	client := NewClient(server.URL, nil)
 
 	ctx := context.Background()
 
@@ -545,7 +541,7 @@ func TestReader_SSE_ErrorHandling(t *testing.T) {
 
 	t.Run("SSE handles connection errors", func(t *testing.T) {
 		// Create client with invalid URL
-		badClient := NewClient().BaseURL("http://localhost:1") // Invalid port
+		badClient := NewClient("http://localhost:1", nil) // Invalid port
 
 		// Use non-empty offset for SSE
 		reader := badClient.Reader("/stream", Offset("0000000000"))
@@ -562,13 +558,11 @@ func TestReader_SSE_ErrorHandling(t *testing.T) {
 
 func TestReader_MessagesIterator(t *testing.T) {
 	storage := newTestStorage()
-	handler := NewHandler(storage).LongPollTimeout(100 * time.Millisecond)
+	handler := NewHandler(storage, &HandlerConfig{LongPollTimeout: 100 * time.Millisecond})
 	server := httptest.NewServer(handler)
 	defer server.Close()
 
-	client := NewClient().
-		BaseURL(server.URL).
-		LongPollTimeout(200 * time.Millisecond)
+	client := NewClient(server.URL, &ClientConfig{LongPollTimeout: 200 * time.Millisecond})
 
 	ctx := context.Background()
 
@@ -656,13 +650,11 @@ func TestReader_MessagesIterator(t *testing.T) {
 
 func TestReader_Bytes_ContextCancel(t *testing.T) {
 	storage := newTestStorage()
-	handler := NewHandler(storage).LongPollTimeout(100 * time.Millisecond)
+	handler := NewHandler(storage, &HandlerConfig{LongPollTimeout: 100 * time.Millisecond})
 	server := httptest.NewServer(handler)
 	defer server.Close()
 
-	client := NewClient().
-		BaseURL(server.URL).
-		LongPollTimeout(200 * time.Millisecond)
+	client := NewClient(server.URL, &ClientConfig{LongPollTimeout: 200 * time.Millisecond})
 
 	ctx := context.Background()
 
@@ -710,11 +702,11 @@ func TestReader_Bytes_ContextCancel(t *testing.T) {
 
 func TestReader_Close_WithSSE(t *testing.T) {
 	storage := newTestStorage()
-	handler := NewHandler(storage).SSECloseAfter(500 * time.Millisecond)
+	handler := NewHandler(storage, &HandlerConfig{SSECloseAfter: 500 * time.Millisecond})
 	server := httptest.NewServer(handler)
 	defer server.Close()
 
-	client := NewClient().BaseURL(server.URL)
+	client := NewClient(server.URL, nil)
 
 	ctx := context.Background()
 
@@ -927,11 +919,11 @@ func TestNewSSEConnection(t *testing.T) {
 
 func TestReader_SSE_CleanupOnModeSwitch(t *testing.T) {
 	storage := newTestStorage()
-	handler := NewHandler(storage).SSECloseAfter(500 * time.Millisecond)
+	handler := NewHandler(storage, &HandlerConfig{SSECloseAfter: 500 * time.Millisecond})
 	server := httptest.NewServer(handler)
 	defer server.Close()
 
-	client := NewClient().BaseURL(server.URL)
+	client := NewClient(server.URL, nil)
 
 	ctx := context.Background()
 
@@ -978,7 +970,7 @@ func TestReader_SSE_UnknownEventType(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client := NewClient().BaseURL(server.URL)
+	client := NewClient(server.URL, nil)
 	reader := client.Reader("/stream", Offset("0000000000"))
 	defer reader.Close()
 
@@ -1012,7 +1004,7 @@ func TestReader_SSE_InvalidControlEvent(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client := NewClient().BaseURL(server.URL)
+	client := NewClient(server.URL, nil)
 	reader := client.Reader("/stream", Offset("0000000000"))
 	defer reader.Close()
 
@@ -1050,7 +1042,7 @@ func TestReader_SSE_ControlEventUpdatesState(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client := NewClient().BaseURL(server.URL)
+	client := NewClient(server.URL, nil)
 	reader := client.Reader("/stream", Offset("0000000000"))
 	defer reader.Close()
 
@@ -1087,7 +1079,7 @@ func TestReader_SSE_WrongContentType(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client := NewClient().BaseURL(server.URL)
+	client := NewClient(server.URL, nil)
 	reader := client.Reader("/stream", Offset("0000000000"))
 	defer reader.Close()
 
@@ -1124,7 +1116,7 @@ func TestReader_SSE_ReadError(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client := NewClient().BaseURL(server.URL)
+	client := NewClient(server.URL, nil)
 	reader := client.Reader("/stream", Offset("0000000000"))
 	defer reader.Close()
 
@@ -1167,7 +1159,7 @@ func TestReader_SSE_DataAsNonArray(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client := NewClient().BaseURL(server.URL)
+	client := NewClient(server.URL, nil)
 	reader := client.Reader("/stream", Offset("0000000000"))
 	defer reader.Close()
 

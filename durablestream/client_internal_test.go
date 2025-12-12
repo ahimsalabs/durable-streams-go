@@ -8,31 +8,53 @@ import (
 	"time"
 )
 
-func TestClient_BuilderPattern(t *testing.T) {
-	// Test client builder pattern
-	customHTTPClient := &http.Client{Timeout: 5 * time.Second}
+func TestClient_Config(t *testing.T) {
+	t.Run("nil config uses defaults", func(t *testing.T) {
+		client := NewClient("http://example.com", nil)
 
-	client := NewClient().
-		BaseURL("http://example.com").
-		HTTPClient(customHTTPClient).
-		Timeout(10 * time.Second).
-		LongPollTimeout(30 * time.Second)
+		if client.baseURL != "http://example.com" {
+			t.Errorf("baseURL = %q, want %q", client.baseURL, "http://example.com")
+		}
+		if client.httpClient != http.DefaultClient {
+			t.Error("httpClient should be http.DefaultClient")
+		}
+		if client.timeout != 30*time.Second {
+			t.Errorf("timeout = %v, want %v", client.timeout, 30*time.Second)
+		}
+		if client.longPollTimeout != 60*time.Second {
+			t.Errorf("longPollTimeout = %v, want %v", client.longPollTimeout, 60*time.Second)
+		}
+	})
 
-	if client.baseURL != "http://example.com" {
-		t.Errorf("baseURL = %q, want %q", client.baseURL, "http://example.com")
-	}
+	t.Run("custom config", func(t *testing.T) {
+		customHTTPClient := &http.Client{Timeout: 5 * time.Second}
 
-	if client.httpClient != customHTTPClient {
-		t.Error("httpClient not set correctly")
-	}
+		client := NewClient("http://example.com", &ClientConfig{
+			HTTPClient:      customHTTPClient,
+			Timeout:         10 * time.Second,
+			LongPollTimeout: 30 * time.Second,
+		})
 
-	if client.timeout != 10*time.Second {
-		t.Errorf("timeout = %v, want %v", client.timeout, 10*time.Second)
-	}
+		if client.baseURL != "http://example.com" {
+			t.Errorf("baseURL = %q, want %q", client.baseURL, "http://example.com")
+		}
+		if client.httpClient != customHTTPClient {
+			t.Error("httpClient not set correctly")
+		}
+		if client.timeout != 10*time.Second {
+			t.Errorf("timeout = %v, want %v", client.timeout, 10*time.Second)
+		}
+		if client.longPollTimeout != 30*time.Second {
+			t.Errorf("longPollTimeout = %v, want %v", client.longPollTimeout, 30*time.Second)
+		}
+	})
 
-	if client.longPollTimeout != 30*time.Second {
-		t.Errorf("longPollTimeout = %v, want %v", client.longPollTimeout, 30*time.Second)
-	}
+	t.Run("trailing slash stripped from baseURL", func(t *testing.T) {
+		client := NewClient("http://example.com/", nil)
+		if client.baseURL != "http://example.com" {
+			t.Errorf("baseURL = %q, want %q", client.baseURL, "http://example.com")
+		}
+	})
 }
 
 func TestClient_buildURL(t *testing.T) {
@@ -70,7 +92,7 @@ func TestClient_buildURL(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			client := NewClient().BaseURL(tt.baseURL)
+			client := NewClient(tt.baseURL, nil)
 			got := client.buildURL(tt.path)
 			if got != tt.want {
 				t.Errorf("buildURL() = %q, want %q", got, tt.want)
@@ -110,12 +132,45 @@ func (m *mockStorage) Subscribe(_ context.Context, _ string, _ Offset) (<-chan O
 	return nil, nil
 }
 
-func TestHandler_ChunkSize(t *testing.T) {
-	handler := NewHandler(&mockStorage{}).ChunkSize(1024)
+func TestHandler_Config(t *testing.T) {
+	t.Run("nil config uses defaults", func(t *testing.T) {
+		handler := NewHandler(&mockStorage{}, nil)
 
-	if handler.chunkSize != 1024 {
-		t.Errorf("chunkSize = %d, want 1024", handler.chunkSize)
-	}
+		if handler.chunkSize != defaultChunkSize {
+			t.Errorf("chunkSize = %d, want %d", handler.chunkSize, defaultChunkSize)
+		}
+		if handler.maxAppendSize != defaultMaxAppendSize {
+			t.Errorf("maxAppendSize = %d, want %d", handler.maxAppendSize, defaultMaxAppendSize)
+		}
+		if handler.longPollTimeout != defaultLongPollTimeout {
+			t.Errorf("longPollTimeout = %v, want %v", handler.longPollTimeout, defaultLongPollTimeout)
+		}
+		if handler.sseCloseAfter != defaultSSECloseAfter {
+			t.Errorf("sseCloseAfter = %v, want %v", handler.sseCloseAfter, defaultSSECloseAfter)
+		}
+	})
+
+	t.Run("custom config", func(t *testing.T) {
+		handler := NewHandler(&mockStorage{}, &HandlerConfig{
+			ChunkSize:       1024,
+			MaxAppendSize:   2048,
+			LongPollTimeout: 5 * time.Second,
+			SSECloseAfter:   10 * time.Second,
+		})
+
+		if handler.chunkSize != 1024 {
+			t.Errorf("chunkSize = %d, want 1024", handler.chunkSize)
+		}
+		if handler.maxAppendSize != 2048 {
+			t.Errorf("maxAppendSize = %d, want 2048", handler.maxAppendSize)
+		}
+		if handler.longPollTimeout != 5*time.Second {
+			t.Errorf("longPollTimeout = %v, want %v", handler.longPollTimeout, 5*time.Second)
+		}
+		if handler.sseCloseAfter != 10*time.Second {
+			t.Errorf("sseCloseAfter = %v, want %v", handler.sseCloseAfter, 10*time.Second)
+		}
+	})
 }
 
 func TestMessage_Bytes(t *testing.T) {

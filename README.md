@@ -14,7 +14,7 @@ Passes the durable-streams conformance suite.
 ```go title="example_test.go"
 func ExampleHandler() {
 	storage := memorystorage.New()
-	handler := durablestream.NewHandler(storage)
+	handler := durablestream.NewHandler(storage, nil)
 
 	mux := http.NewServeMux()
 	mux.Handle("/v1/stream/", http.StripPrefix("/v1/stream/", handler))
@@ -33,7 +33,7 @@ func ExampleHandler() {
 func ExampleClient() {
 	ctx := context.Background()
 
-	client := durablestream.NewClient().BaseURL("http://localhost:8080/streams")
+	client := durablestream.NewClient("http://localhost:8080/streams", nil)
 
 	_, err := client.Create(ctx, "events", &durablestream.CreateOptions{
 		ContentType: "application/json",
@@ -48,7 +48,7 @@ func ExampleClient() {
 		log.Fatal(err)
 	}
 
-	msg := json.RawMessage(`{"type":"user.created","id":123}`)
+	msg := []byte(`{"type":"user.created","id":123}`)
 	if err := writer.Send(msg); err != nil {
 		log.Fatal(err)
 	}
@@ -63,7 +63,7 @@ func ExampleClient() {
 		log.Fatal(err)
 	}
 
-	fmt.Println("Messages:", len(result.Messages))
+	fmt.Println("Got data:", len(result.Data) > 0)
 	fmt.Println("Next offset:", result.NextOffset)
 }
 
@@ -77,7 +77,7 @@ func ExampleClient() {
 func ExampleReader() {
 	ctx := context.Background()
 
-	client := durablestream.NewClient().BaseURL("http://localhost:8080/streams")
+	client := durablestream.NewClient("http://localhost:8080/streams", nil)
 
 	// Create a reader starting from offset 0
 	reader := client.Reader("events", durablestream.ZeroOffset)
@@ -87,7 +87,9 @@ func ExampleReader() {
 		if err != nil {
 			log.Fatal(err)
 		}
-		fmt.Println("Received:", string(msg))
+		// Use msg.String() for text, msg.Bytes() for raw bytes,
+		// or msg.Decode(&v) for JSON
+		fmt.Println("Received:", msg.String())
 	}
 }
 

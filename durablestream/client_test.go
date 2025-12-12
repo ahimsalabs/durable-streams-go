@@ -14,9 +14,9 @@ import (
 // setupTestServer creates a test server with a handler and storage.
 func setupTestServer() (*httptest.Server, *memorystorage.Storage, *durablestream.Client) {
 	storage := memorystorage.New()
-	handler := durablestream.NewHandler(storage)
+	handler := durablestream.NewHandler(storage, nil)
 	server := httptest.NewServer(handler)
-	client := durablestream.NewClient().BaseURL(server.URL)
+	client := durablestream.NewClient(server.URL, nil)
 	return server, storage, client
 }
 

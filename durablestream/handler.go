@@ -21,6 +21,27 @@ const (
 	defaultSSECloseAfter   = 60 * time.Second
 )
 
+// HandlerConfig configures a Handler.
+type HandlerConfig struct {
+	// PathExtractor extracts the stream ID from the request.
+	// Default: uses r.URL.Path.
+	PathExtractor func(*http.Request) string
+
+	// LongPollTimeout is the maximum wait time for long-poll requests. Default: 30s.
+	LongPollTimeout time.Duration
+
+	// SSECloseAfter is the duration after which SSE connections are closed. Default: 60s.
+	SSECloseAfter time.Duration
+
+	// MaxAppendSize is the maximum allowed size for append operations. Default: 10MB.
+	MaxAppendSize int64
+
+	// ChunkSize is the maximum response size (in bytes) for read operations.
+	// When a read would return more data than this limit, results are paginated.
+	// Default: 1MB.
+	ChunkSize int
+}
+
 // Handler implements http.Handler for serving durable streams.
 // Per spec Section 5: routes requests based on HTTP method.
 type Handler struct {
@@ -33,53 +54,35 @@ type Handler struct {
 }
 
 // NewHandler creates a new stream handler with the given storage.
-// By default, it extracts the stream ID from the full request path.
-func NewHandler(storage Storage) *Handler {
-	return &Handler{
+// Pass nil for cfg to use defaults.
+func NewHandler(storage Storage, cfg *HandlerConfig) *Handler {
+	h := &Handler{
 		storage:         storage,
-		pathExtractor:   defaultPathExtractor,
+		pathExtractor:   func(r *http.Request) string { return r.URL.Path },
 		longPollTimeout: defaultLongPollTimeout,
 		sseCloseAfter:   defaultSSECloseAfter,
 		maxAppendSize:   defaultMaxAppendSize,
 		chunkSize:       defaultChunkSize,
 	}
-}
 
-// defaultPathExtractor returns the full request path as the stream ID.
-func defaultPathExtractor(r *http.Request) string {
-	return r.URL.Path
-}
+	if cfg != nil {
+		if cfg.PathExtractor != nil {
+			h.pathExtractor = cfg.PathExtractor
+		}
+		if cfg.LongPollTimeout > 0 {
+			h.longPollTimeout = cfg.LongPollTimeout
+		}
+		if cfg.SSECloseAfter > 0 {
+			h.sseCloseAfter = cfg.SSECloseAfter
+		}
+		if cfg.MaxAppendSize > 0 {
+			h.maxAppendSize = cfg.MaxAppendSize
+		}
+		if cfg.ChunkSize > 0 {
+			h.chunkSize = cfg.ChunkSize
+		}
+	}
 
-// PathExtractor sets a custom function to extract the stream ID from the request.
-// This allows for flexible URL routing (e.g., stripping prefixes, extracting path params).
-func (h *Handler) PathExtractor(fn func(*http.Request) string) *Handler {
-	h.pathExtractor = fn
-	return h
-}
-
-// LongPollTimeout sets the maximum wait time for long-poll requests.
-func (h *Handler) LongPollTimeout(d time.Duration) *Handler {
-	h.longPollTimeout = d
-	return h
-}
-
-// SSECloseAfter sets the duration after which SSE connections are closed.
-func (h *Handler) SSECloseAfter(d time.Duration) *Handler {
-	h.sseCloseAfter = d
-	return h
-}
-
-// MaxAppendSize sets the maximum allowed size for append operations.
-func (h *Handler) MaxAppendSize(size int64) *Handler {
-	h.maxAppendSize = size
-	return h
-}
-
-// ChunkSize sets the maximum response size (in bytes) for read operations.
-// When a read would return more data than this limit, results are paginated.
-// Default: 1MB.
-func (h *Handler) ChunkSize(sizeBytes int) *Handler {
-	h.chunkSize = sizeBytes
 	return h
 }
 

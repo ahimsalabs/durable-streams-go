@@ -14,6 +14,18 @@ import (
 	"github.com/ahimsalabs/durable-streams-go/durablestream/internal/protocol"
 )
 
+// ClientConfig configures a Client.
+type ClientConfig struct {
+	// HTTPClient is the underlying HTTP client. Default: http.DefaultClient.
+	HTTPClient *http.Client
+
+	// Timeout is the default timeout for operations. Default: 30s.
+	Timeout time.Duration
+
+	// LongPollTimeout is the timeout for long-poll operations. Default: 60s.
+	LongPollTimeout time.Duration
+}
+
 // Client provides methods to interact with durable streams over HTTP.
 type Client struct {
 	httpClient      *http.Client
@@ -22,37 +34,28 @@ type Client struct {
 	longPollTimeout time.Duration
 }
 
-// NewClient creates a new stream client with default settings.
-func NewClient() *Client {
-	return &Client{
+// NewClient creates a new stream client for the given base URL.
+// Pass nil for cfg to use defaults.
+func NewClient(baseURL string, cfg *ClientConfig) *Client {
+	c := &Client{
+		baseURL:         strings.TrimRight(baseURL, "/"),
 		httpClient:      http.DefaultClient,
-		baseURL:         "",
 		timeout:         30 * time.Second,
 		longPollTimeout: 60 * time.Second,
 	}
-}
 
-// BaseURL sets the base URL for stream operations and returns the client for chaining.
-func (c *Client) BaseURL(url string) *Client {
-	c.baseURL = strings.TrimRight(url, "/")
-	return c
-}
+	if cfg != nil {
+		if cfg.HTTPClient != nil {
+			c.httpClient = cfg.HTTPClient
+		}
+		if cfg.Timeout > 0 {
+			c.timeout = cfg.Timeout
+		}
+		if cfg.LongPollTimeout > 0 {
+			c.longPollTimeout = cfg.LongPollTimeout
+		}
+	}
 
-// HTTPClient sets the underlying HTTP client and returns the client for chaining.
-func (c *Client) HTTPClient(hc *http.Client) *Client {
-	c.httpClient = hc
-	return c
-}
-
-// Timeout sets the default timeout for operations and returns the client for chaining.
-func (c *Client) Timeout(d time.Duration) *Client {
-	c.timeout = d
-	return c
-}
-
-// LongPollTimeout sets the timeout for long-poll operations and returns the client for chaining.
-func (c *Client) LongPollTimeout(d time.Duration) *Client {
-	c.longPollTimeout = d
 	return c
 }
 

@@ -222,8 +222,8 @@ func (s *testStorage) Subscribe(ctx context.Context, streamID string, offset Off
 // setupInternalTestServer creates a test HTTP server with testStorage for internal tests.
 func setupInternalTestServer() (*httptest.Server, *testStorage, *Client) {
 	storage := newTestStorage()
-	handler := NewHandler(storage)
+	handler := NewHandler(storage, nil)
 	server := httptest.NewServer(handler)
-	client := NewClient().BaseURL(server.URL)
+	client := NewClient(server.URL, nil)
 	return server, storage, client
 }

@@ -111,9 +111,7 @@ func TestHandler_PUT_CreateStream(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			storage := memorystorage.New()
-			handler := durablestream.NewHandler(storage).PathExtractor(func(r *http.Request) string {
-				return r.URL.Path
-			})
+			handler := durablestream.NewHandler(storage, nil)
 
 			req := httptest.NewRequest(http.MethodPut, "/test-stream", strings.NewReader(tt.body))
 			if tt.contentType != "" {
@@ -149,7 +147,7 @@ func TestHandler_PUT_CreateStream(t *testing.T) {
 
 func TestHandler_PUT_Idempotent(t *testing.T) {
 	storage := memorystorage.New()
-	handler := durablestream.NewHandler(storage)
+	handler := durablestream.NewHandler(storage, nil)
 
 	// Create stream first time
 	req1 := httptest.NewRequest(http.MethodPut, "/stream", nil)
@@ -249,7 +247,7 @@ func TestHandler_POST_Append(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			storage := memorystorage.New()
-			handler := durablestream.NewHandler(storage)
+			handler := durablestream.NewHandler(storage, nil)
 
 			// Create stream first
 			streamContentType := "application/json"
@@ -294,7 +292,7 @@ func TestHandler_POST_Append(t *testing.T) {
 
 func TestHandler_POST_SequenceValidation(t *testing.T) {
 	storage := memorystorage.New()
-	handler := durablestream.NewHandler(storage)
+	handler := durablestream.NewHandler(storage, nil)
 
 	// Create stream
 	storage.Create(context.Background(), "/stream", durablestream.StreamConfig{
@@ -337,7 +335,7 @@ func TestHandler_POST_SequenceValidation(t *testing.T) {
 
 func TestHandler_GET_CatchupRead(t *testing.T) {
 	storage := memorystorage.New()
-	handler := durablestream.NewHandler(storage)
+	handler := durablestream.NewHandler(storage, nil)
 
 	// Create stream and append data
 	storage.Create(context.Background(), "/stream", durablestream.StreamConfig{
@@ -403,7 +401,7 @@ func TestHandler_GET_CatchupRead(t *testing.T) {
 
 func TestHandler_GET_JSONMode(t *testing.T) {
 	storage := memorystorage.New()
-	handler := durablestream.NewHandler(storage)
+	handler := durablestream.NewHandler(storage, nil)
 
 	// Create JSON stream
 	storage.Create(context.Background(), "/stream", durablestream.StreamConfig{
@@ -435,7 +433,9 @@ func TestHandler_GET_JSONMode(t *testing.T) {
 
 func TestHandler_GET_LongPoll(t *testing.T) {
 	storage := memorystorage.New()
-	handler := durablestream.NewHandler(storage).LongPollTimeout(100 * time.Millisecond)
+	handler := durablestream.NewHandler(storage, &durablestream.HandlerConfig{
+		LongPollTimeout: 100 * time.Millisecond,
+	})
 
 	// Create stream
 	storage.Create(context.Background(), "/stream", durablestream.StreamConfig{
@@ -508,7 +508,9 @@ func TestHandler_GET_LongPoll(t *testing.T) {
 
 func TestHandler_GET_SSE(t *testing.T) {
 	storage := memorystorage.New()
-	handler := durablestream.NewHandler(storage).SSECloseAfter(200 * time.Millisecond)
+	handler := durablestream.NewHandler(storage, &durablestream.HandlerConfig{
+		SSECloseAfter: 200 * time.Millisecond,
+	})
 
 	t.Run("text content type", func(t *testing.T) {
 		// Create text stream
@@ -597,7 +599,7 @@ func TestHandler_GET_SSE(t *testing.T) {
 
 func TestHandler_HEAD_Metadata(t *testing.T) {
 	storage := memorystorage.New()
-	handler := durablestream.NewHandler(storage)
+	handler := durablestream.NewHandler(storage, nil)
 
 	// Create stream with metadata
 	storage.Create(context.Background(), "/stream", durablestream.StreamConfig{
@@ -644,7 +646,7 @@ func TestHandler_HEAD_Metadata(t *testing.T) {
 
 func TestHandler_DELETE(t *testing.T) {
 	storage := memorystorage.New()
-	handler := durablestream.NewHandler(storage)
+	handler := durablestream.NewHandler(storage, nil)
 
 	// Create stream
 	storage.Create(context.Background(), "/stream", durablestream.StreamConfig{
@@ -681,7 +683,9 @@ func TestHandler_DELETE(t *testing.T) {
 
 func TestHandler_MaxAppendSize(t *testing.T) {
 	storage := memorystorage.New()
-	handler := durablestream.NewHandler(storage).MaxAppendSize(100) // 100 bytes max
+	handler := durablestream.NewHandler(storage, &durablestream.HandlerConfig{
+		MaxAppendSize: 100, // 100 bytes max
+	})
 
 	storage.Create(context.Background(), "/stream", durablestream.StreamConfig{
 		ContentType: "text/plain",
@@ -708,8 +712,10 @@ func TestHandler_PathExtractor(t *testing.T) {
 	storage := memorystorage.New()
 
 	// Custom path extractor that strips /api/v1 prefix
-	handler := durablestream.NewHandler(storage).PathExtractor(func(r *http.Request) string {
-		return strings.TrimPrefix(r.URL.Path, "/api/v1")
+	handler := durablestream.NewHandler(storage, &durablestream.HandlerConfig{
+		PathExtractor: func(r *http.Request) string {
+			return strings.TrimPrefix(r.URL.Path, "/api/v1")
+		},
 	})
 
 	// Create stream at /api/v1/stream (which extracts to /stream)
@@ -734,7 +740,7 @@ func TestHandler_PathExtractor(t *testing.T) {
 
 func TestHandler_UnsupportedMethod(t *testing.T) {
 	storage := memorystorage.New()
-	handler := durablestream.NewHandler(storage)
+	handler := durablestream.NewHandler(storage, nil)
 
 	req := httptest.NewRequest(http.MethodPatch, "/stream", nil)
 	rec := httptest.NewRecorder()
@@ -747,7 +753,7 @@ func TestHandler_UnsupportedMethod(t *testing.T) {
 
 func TestHandler_ErrorFormat(t *testing.T) {
 	storage := memorystorage.New()
-	handler := durablestream.NewHandler(storage)
+	handler := durablestream.NewHandler(storage, nil)
 
 	// Try to read non-existent stream
 	req := httptest.NewRequest(http.MethodGet, "/nonexistent", nil)
@@ -775,7 +781,7 @@ func TestHandler_ErrorFormat(t *testing.T) {
 
 func TestHandler_GET_InvalidParameters(t *testing.T) {
 	storage := memorystorage.New()
-	handler := durablestream.NewHandler(storage)
+	handler := durablestream.NewHandler(storage, nil)
 
 	// Create stream
 	storage.Create(context.Background(), "/stream", durablestream.StreamConfig{ContentType: "text/plain"})
@@ -861,7 +867,7 @@ func TestHandler_GET_InvalidParameters(t *testing.T) {
 
 func TestHandler_GET_NonexistentStream(t *testing.T) {
 	storage := memorystorage.New()
-	handler := durablestream.NewHandler(storage)
+	handler := durablestream.NewHandler(storage, nil)
 
 	t.Run("catch-up read", func(t *testing.T) {
 		req := httptest.NewRequest(http.MethodGet, "/nonexistent", nil)
@@ -896,7 +902,9 @@ func TestHandler_GET_NonexistentStream(t *testing.T) {
 
 func TestHandler_LongPoll_ContextCancellation(t *testing.T) {
 	storage := memorystorage.New()
-	handler := durablestream.NewHandler(storage).LongPollTimeout(500 * time.Millisecond)
+	handler := durablestream.NewHandler(storage, &durablestream.HandlerConfig{
+		LongPollTimeout: 500 * time.Millisecond,
+	})
 
 	// Create stream
 	storage.Create(context.Background(), "/stream", durablestream.StreamConfig{ContentType: "text/plain"})
@@ -920,7 +928,7 @@ func TestHandler_LongPoll_ContextCancellation(t *testing.T) {
 
 func TestHandler_CacheControlHeaders(t *testing.T) {
 	storage := memorystorage.New()
-	handler := durablestream.NewHandler(storage)
+	handler := durablestream.NewHandler(storage, nil)
 
 	// Create stream with data
 	storage.Create(context.Background(), "/stream", durablestream.StreamConfig{
@@ -953,7 +961,7 @@ func TestHandler_CacheControlHeaders(t *testing.T) {
 // Benchmark tests
 func BenchmarkHandler_CreateStream(b *testing.B) {
 	storage := memorystorage.New()
-	handler := durablestream.NewHandler(storage)
+	handler := durablestream.NewHandler(storage, nil)
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
@@ -967,7 +975,7 @@ func BenchmarkHandler_CreateStream(b *testing.B) {
 
 func BenchmarkHandler_Append(b *testing.B) {
 	storage := memorystorage.New()
-	handler := durablestream.NewHandler(storage)
+	handler := durablestream.NewHandler(storage, nil)
 
 	storage.Create(context.Background(), "/stream", durablestream.StreamConfig{
 		ContentType: "text/plain",
@@ -986,7 +994,7 @@ func BenchmarkHandler_Append(b *testing.B) {
 
 func BenchmarkHandler_Read(b *testing.B) {
 	storage := memorystorage.New()
-	handler := durablestream.NewHandler(storage)
+	handler := durablestream.NewHandler(storage, nil)
 
 	storage.Create(context.Background(), "/stream", durablestream.StreamConfig{
 		ContentType: "text/plain",
