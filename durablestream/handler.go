@@ -3,6 +3,7 @@ package durablestream
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -150,22 +151,14 @@ func (h *Handler) handleCreate(w http.ResponseWriter, r *http.Request, streamID 
 	// Create stream
 	created, err := h.storage.Create(r.Context(), streamID, cfg)
 	if err != nil {
-		if protoErr, ok := err.(*protoError); ok {
-			writeError(w, protoErr)
-		} else {
-			writeError(w, newError(codeInternal, err.Error()))
-		}
+		writeStorageError(w, err)
 		return
 	}
 
 	// Get the tail offset (which will be 0 for a new empty stream)
 	info, err := h.storage.Head(r.Context(), streamID)
 	if err != nil {
-		if protoErr, ok := err.(*protoError); ok {
-			writeError(w, protoErr)
-		} else {
-			writeError(w, newError(codeInternal, err.Error()))
-		}
+		writeStorageError(w, err)
 		return
 	}
 	nextOffset := info.NextOffset
@@ -190,11 +183,7 @@ func (h *Handler) handleCreate(w http.ResponseWriter, r *http.Request, streamID 
 				for _, msg := range messages {
 					nextOffset, err = h.storage.Append(r.Context(), streamID, msg, "")
 					if err != nil {
-						if protoErr, ok := err.(*protoError); ok {
-							writeError(w, protoErr)
-						} else {
-							writeError(w, newError(codeInternal, err.Error()))
-						}
+						writeStorageError(w, err)
 						return
 					}
 				}
@@ -202,11 +191,7 @@ func (h *Handler) handleCreate(w http.ResponseWriter, r *http.Request, streamID 
 				// Non-JSON: append as-is
 				nextOffset, err = h.storage.Append(r.Context(), streamID, body, "")
 				if err != nil {
-					if protoErr, ok := err.(*protoError); ok {
-						writeError(w, protoErr)
-					} else {
-						writeError(w, newError(codeInternal, err.Error()))
-					}
+					writeStorageError(w, err)
 					return
 				}
 			}
@@ -236,11 +221,7 @@ func (h *Handler) handleAppend(w http.ResponseWriter, r *http.Request, streamID 
 	// Get stream info to validate content type
 	info, err := h.storage.Head(r.Context(), streamID)
 	if err != nil {
-		if protoErr, ok := err.(*protoError); ok {
-			writeError(w, protoErr)
-		} else {
-			writeError(w, newError(codeInternal, err.Error()))
-		}
+		writeStorageError(w, err)
 		return
 	}
 
@@ -297,11 +278,7 @@ func (h *Handler) handleAppend(w http.ResponseWriter, r *http.Request, streamID 
 		for _, msg := range messages {
 			nextOffset, err = h.storage.Append(r.Context(), streamID, msg, seq)
 			if err != nil {
-				if protoErr, ok := err.(*protoError); ok {
-					writeError(w, protoErr)
-				} else {
-					writeError(w, newError(codeInternal, err.Error()))
-				}
+				writeStorageError(w, err)
 				return
 			}
 			// Only use seq for first message to avoid multiple seq validations
@@ -318,11 +295,7 @@ func (h *Handler) handleAppend(w http.ResponseWriter, r *http.Request, streamID 
 
 		nextOffset, err = h.storage.AppendReader(r.Context(), streamID, limitedReader, seq)
 		if err != nil {
-			if protoErr, ok := err.(*protoError); ok {
-				writeError(w, protoErr)
-			} else {
-				writeError(w, newError(codeInternal, err.Error()))
-			}
+			writeStorageError(w, err)
 			return
 		}
 
@@ -394,22 +367,14 @@ func (h *Handler) handleCatchupRead(w http.ResponseWriter, r *http.Request, stre
 	// Get stream info for content type
 	info, err := h.storage.Head(r.Context(), streamID)
 	if err != nil {
-		if protoErr, ok := err.(*protoError); ok {
-			writeError(w, protoErr)
-		} else {
-			writeError(w, newError(codeInternal, err.Error()))
-		}
+		writeStorageError(w, err)
 		return
 	}
 
 	// Read data
 	result, err := h.storage.Read(r.Context(), streamID, offset, h.chunkSize)
 	if err != nil {
-		if protoErr, ok := err.(*protoError); ok {
-			writeError(w, protoErr)
-		} else {
-			writeError(w, newError(codeInternal, err.Error()))
-		}
+		writeStorageError(w, err)
 		return
 	}
 
@@ -461,11 +426,7 @@ func (h *Handler) handleLongPoll(w http.ResponseWriter, r *http.Request, streamI
 	// Try immediate read first
 	result, err := h.storage.Read(r.Context(), streamID, offset, h.chunkSize)
 	if err != nil {
-		if protoErr, ok := err.(*protoError); ok {
-			writeError(w, protoErr)
-		} else {
-			writeError(w, newError(codeInternal, err.Error()))
-		}
+		writeStorageError(w, err)
 		return
 	}
 
@@ -473,11 +434,7 @@ func (h *Handler) handleLongPoll(w http.ResponseWriter, r *http.Request, streamI
 	if len(result.Data) > 0 {
 		info, err := h.storage.Head(r.Context(), streamID)
 		if err != nil {
-			if protoErr, ok := err.(*protoError); ok {
-				writeError(w, protoErr)
-			} else {
-				writeError(w, newError(codeInternal, err.Error()))
-			}
+			writeStorageError(w, err)
 			return
 		}
 
@@ -522,11 +479,7 @@ func (h *Handler) handleLongPoll(w http.ResponseWriter, r *http.Request, streamI
 
 	notifyCh, err := h.storage.Subscribe(waitCtx, streamID, offset)
 	if err != nil {
-		if protoErr, ok := err.(*protoError); ok {
-			writeError(w, protoErr)
-		} else {
-			writeError(w, newError(codeInternal, err.Error()))
-		}
+		writeStorageError(w, err)
 		return
 	}
 
@@ -542,21 +495,13 @@ func (h *Handler) handleLongPoll(w http.ResponseWriter, r *http.Request, streamI
 		// Data arrived, read and return
 		result, err := h.storage.Read(waitCtx, streamID, offset, h.chunkSize)
 		if err != nil {
-			if protoErr, ok := err.(*protoError); ok {
-				writeError(w, protoErr)
-			} else {
-				writeError(w, newError(codeInternal, err.Error()))
-			}
+			writeStorageError(w, err)
 			return
 		}
 
 		info, err := h.storage.Head(waitCtx, streamID)
 		if err != nil {
-			if protoErr, ok := err.(*protoError); ok {
-				writeError(w, protoErr)
-			} else {
-				writeError(w, newError(codeInternal, err.Error()))
-			}
+			writeStorageError(w, err)
 			return
 		}
 
@@ -604,11 +549,7 @@ func (h *Handler) handleSSE(w http.ResponseWriter, r *http.Request, streamID str
 	// Get stream info
 	info, err := h.storage.Head(r.Context(), streamID)
 	if err != nil {
-		if protoErr, ok := err.(*protoError); ok {
-			writeError(w, protoErr)
-		} else {
-			writeError(w, newError(codeInternal, err.Error()))
-		}
+		writeStorageError(w, err)
 		return
 	}
 
@@ -727,11 +668,7 @@ func (h *Handler) handleSSE(w http.ResponseWriter, r *http.Request, streamID str
 func (h *Handler) handleHead(w http.ResponseWriter, r *http.Request, streamID string) {
 	info, err := h.storage.Head(r.Context(), streamID)
 	if err != nil {
-		if protoErr, ok := err.(*protoError); ok {
-			writeError(w, protoErr)
-		} else {
-			writeError(w, newError(codeInternal, err.Error()))
-		}
+		writeStorageError(w, err)
 		return
 	}
 
@@ -757,11 +694,7 @@ func (h *Handler) handleHead(w http.ResponseWriter, r *http.Request, streamID st
 func (h *Handler) handleDelete(w http.ResponseWriter, r *http.Request, streamID string) {
 	err := h.storage.Delete(r.Context(), streamID)
 	if err != nil {
-		if protoErr, ok := err.(*protoError); ok {
-			writeError(w, protoErr)
-		} else {
-			writeError(w, newError(codeInternal, err.Error()))
-		}
+		writeStorageError(w, err)
 		return
 	}
 
@@ -773,6 +706,29 @@ func writeError(w http.ResponseWriter, err *protoError) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(err.Code.httpStatus())
 	json.NewEncoder(w).Encode(err)
+}
+
+// writeStorageError converts a storage error to an HTTP error response.
+// Handles both protoError (from internal use) and sentinel errors (from storage).
+func writeStorageError(w http.ResponseWriter, err error) {
+	if protoErr, ok := err.(*protoError); ok {
+		writeError(w, protoErr)
+		return
+	}
+
+	// Map sentinel errors to protocol errors
+	switch {
+	case errors.Is(err, ErrNotFound):
+		writeError(w, newError(codeNotFound, err.Error()))
+	case errors.Is(err, ErrGone):
+		writeError(w, newError(codeGone, err.Error()))
+	case errors.Is(err, ErrConflict):
+		writeError(w, newError(codeConflict, err.Error()))
+	case errors.Is(err, ErrBadRequest):
+		writeError(w, newError(codeBadRequest, err.Error()))
+	default:
+		writeError(w, newError(codeInternal, err.Error()))
+	}
 }
 
 // limitedCountingReader wraps an io.Reader to count bytes read and enforce a size limit.

@@ -395,28 +395,6 @@ func (c *Client) checkErrorResponse(resp *http.Response) error {
 	return newError(code, fmt.Sprintf("HTTP %d: %s", resp.StatusCode, resp.Status))
 }
 
-// httpStatusToErrorCode maps HTTP status codes to error codes.
-func httpStatusToErrorCode(status int) errorCode {
-	switch status {
-	case 400:
-		return codeBadRequest
-	case 404:
-		return codeNotFound
-	case 409:
-		return codeConflict
-	case 410:
-		return codeGone
-	case 413:
-		return codePayloadTooLarge
-	case 429:
-		return codeTooManyRequests
-	case 501:
-		return codeNotImplemented
-	default:
-		return codeInternal
-	}
-}
-
 // parseStreamInfo extracts stream metadata from response headers.
 func (c *Client) parseStreamInfo(headers http.Header) (*StreamInfo, error) {
 	info := &StreamInfo{

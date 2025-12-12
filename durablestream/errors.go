@@ -23,6 +23,9 @@ var (
 
 	// ErrClosed indicates the stream or connection has been closed.
 	ErrClosed = errors.New("stream closed")
+
+	// ErrBadRequest indicates a malformed or invalid request.
+	ErrBadRequest = errors.New("bad request")
 )
 
 // errorCode represents an internal error code for HTTP status mapping.
@@ -64,6 +67,28 @@ func (c errorCode) httpStatus() int {
 	}
 }
 
+// httpStatusToErrorCode maps HTTP status codes to error codes.
+func httpStatusToErrorCode(status int) errorCode {
+	switch status {
+	case 400:
+		return codeBadRequest
+	case 404:
+		return codeNotFound
+	case 409:
+		return codeConflict
+	case 410:
+		return codeGone
+	case 413:
+		return codePayloadTooLarge
+	case 429:
+		return codeTooManyRequests
+	case 501:
+		return codeNotImplemented
+	default:
+		return codeInternal
+	}
+}
+
 // protoError is an internal error type for protocol errors.
 // It implements error and can be serialized to JSON for HTTP responses.
 type protoError struct {
@@ -96,12 +121,3 @@ func newError(code errorCode, message string) *protoError {
 		Message: message,
 	}
 }
-
-// errorf creates a new protocol error with formatted message.
-func errorf(code errorCode, format string, args ...any) *protoError {
-	return &protoError{
-		Code:    code,
-		Message: fmt.Sprintf(format, args...),
-	}
-}
-

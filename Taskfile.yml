@@ -1,6 +1,20 @@
+# Taskfile for durable-streams-go
+# Bootstrap: go run github.com/go-task/task/v3/cmd/task@latest
+# https://taskfile.dev/
+
 version: '3'
 
+vars:
+  GOFUMPT: go run mvdan.cc/gofumpt@latest
+  STATICCHECK: go run honnef.co/go/tools/cmd/staticcheck@latest
+  GOLANGCI_LINT: go run github.com/golangci/golangci-lint/cmd/golangci-lint@latest
+
 tasks:
+
+  # ============================================================================
+  # Development
+  # ============================================================================
+
   default:
     desc: Run all checks
     deps: [check]
@@ -13,22 +27,22 @@ tasks:
   lint:
     desc: Run golangci-lint
     cmds:
-      - golangci-lint run
+      - "{{.GOLANGCI_LINT}} run"
 
   fmt:
     desc: Format code with gofumpt
     cmds:
-      - gofumpt -w .
+      - "{{.GOFUMPT}} -w ."
 
   fmt:check:
     desc: Check code formatting
     cmds:
-      - gofumpt -d . | grep . && exit 1 || exit 0
+      - "{{.GOFUMPT}} -d . | grep . && exit 1 || exit 0"
 
   staticcheck:
     desc: Run staticcheck
     cmds:
-      - staticcheck ./...
+      - "{{.STATICCHECK}} ./..."
 
   vet:
     desc: Run go vet
@@ -75,3 +89,87 @@ tasks:
         /tmp/ds-testserver -port 8788 &
         sleep 1
         echo "Go server started on port 8788"
+
+  # ============================================================================
+  # Precommit checks (run with: task precommit)
+  # ============================================================================
+
+  precommit:
+    desc: Run all precommit checks
+    deps:
+      - fmt:check
+    cmds:
+      - task: precommit:parallel
+      - echo "All precommit checks passed."
+
+  precommit:parallel:
+    internal: true
+    deps:
+      - precommit:test
+      - precommit:lint
+      - precommit:readme
+
+  precommit:test:
+    internal: true
+    cmds:
+      - cmd: output=$(go test ./... 2>&1) || (echo "$output"; exit 1)
+        silent: true
+
+  precommit:lint:
+    internal: true
+    cmds:
+      - cmd: output=$(go vet ./... 2>&1) || (echo "$output"; exit 1)
+        silent: true
+      - cmd: output=$({{.STATICCHECK}} ./... 2>&1) || (echo "$output"; exit 1)
+        silent: true
+
+  precommit:readme:
+    internal: true
+    cmds:
+      - cmd: |
+          cp README.md README.md.bak
+          go run ./internal/snippet -inject README.md ./durablestream/example_test.go
+          if ! diff -q README.md README.md.bak > /dev/null 2>&1; then
+            mv README.md.bak README.md
+            echo "README.md snippets are out of date. Run 'task readme' to update."
+            exit 1
+          fi
+          rm README.md.bak
+        silent: true
+
+  # ============================================================================
+  # CI
+  # ============================================================================
+
+  ci:local:
+    desc: Run GitHub Actions workflow locally via Docker
+    cmds:
+      - act --container-architecture linux/amd64
+
+  # ============================================================================
+  # Documentation
+  # ============================================================================
+
+  readme:
+    desc: Update README.md code snippets from example files
+    cmds:
+      - go run ./internal/snippet -inject README.md ./durablestream/example_test.go
+
+  readme:check:
+    desc: Check if README.md snippets are up to date
+    cmds:
+      - |
+        cp README.md README.md.bak
+        go run ./internal/snippet -inject README.md ./durablestream/example_test.go
+        if ! diff -q README.md README.md.bak > /dev/null 2>&1; then
+          mv README.md.bak README.md
+          echo "README.md snippets are out of date. Run 'task readme' to update."
+          exit 1
+        fi
+        rm README.md.bak
+        echo "README.md snippets are up to date."
+
+  readme:lint:
+    desc: Check for large code blocks not covered by snippets
+    cmds:
+      - go run ./internal/snippet -lint README.md

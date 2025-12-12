@@ -12,7 +12,7 @@ import (
 )
 
 func TestReader_ModeSwitching(t *testing.T) {
-	server, _, client := setupTestServer()
+	server, _, client := setupInternalTestServer()
 	defer server.Close()
 
 	ctx := context.Background()
@@ -60,7 +60,7 @@ func TestReader_ModeSwitching(t *testing.T) {
 }
 
 func TestReader_Offset(t *testing.T) {
-	server, _, client := setupTestServer()
+	server, _, client := setupInternalTestServer()
 	defer server.Close()
 
 	ctx := context.Background()
@@ -94,7 +94,7 @@ func TestReader_Offset(t *testing.T) {
 }
 
 func TestReader_Seek(t *testing.T) {
-	server, _, client := setupTestServer()
+	server, _, client := setupInternalTestServer()
 	defer server.Close()
 
 	ctx := context.Background()
@@ -156,7 +156,7 @@ func TestReader_Seek(t *testing.T) {
 }
 
 func TestReader_SeekTail(t *testing.T) {
-	server, storage, client := setupTestServer()
+	server, storage, client := setupInternalTestServer()
 	defer server.Close()
 
 	ctx := context.Background()
@@ -200,7 +200,7 @@ func TestReader_SeekTail(t *testing.T) {
 }
 
 func TestReader_Seek_ClearsSSE(t *testing.T) {
-	storage := NewMemoryStorage()
+	storage := newTestStorage()
 	handler := NewHandler(storage).SSECloseAfter(500 * time.Millisecond)
 	server := httptest.NewServer(handler)
 	defer server.Close()
@@ -236,7 +236,7 @@ func TestReader_Seek_ClearsSSE(t *testing.T) {
 }
 
 func TestReader_LongPoll(t *testing.T) {
-	storage := NewMemoryStorage()
+	storage := newTestStorage()
 	handler := NewHandler(storage).LongPollTimeout(200 * time.Millisecond)
 	server := httptest.NewServer(handler)
 	defer server.Close()
@@ -365,7 +365,7 @@ func TestReader_LongPoll(t *testing.T) {
 }
 
 func TestReader_LongPoll_JSON(t *testing.T) {
-	storage := NewMemoryStorage()
+	storage := newTestStorage()
 	handler := NewHandler(storage).LongPollTimeout(200 * time.Millisecond)
 	server := httptest.NewServer(handler)
 	defer server.Close()
@@ -397,7 +397,7 @@ func TestReader_LongPoll_JSON(t *testing.T) {
 }
 
 func TestReader_SSE(t *testing.T) {
-	storage := NewMemoryStorage()
+	storage := newTestStorage()
 	handler := NewHandler(storage).SSECloseAfter(500 * time.Millisecond)
 	server := httptest.NewServer(handler)
 	defer server.Close()
@@ -515,7 +515,7 @@ func TestReader_SSE(t *testing.T) {
 }
 
 func TestReader_SSE_ErrorHandling(t *testing.T) {
-	storage := NewMemoryStorage()
+	storage := newTestStorage()
 	handler := NewHandler(storage)
 	server := httptest.NewServer(handler)
 	defer server.Close()
@@ -557,7 +557,7 @@ func TestReader_SSE_ErrorHandling(t *testing.T) {
 }
 
 func TestReader_MessagesIterator(t *testing.T) {
-	storage := NewMemoryStorage()
+	storage := newTestStorage()
 	handler := NewHandler(storage).LongPollTimeout(100 * time.Millisecond)
 	server := httptest.NewServer(handler)
 	defer server.Close()
@@ -651,7 +651,7 @@ func TestReader_MessagesIterator(t *testing.T) {
 }
 
 func TestReader_Bytes_ContextCancel(t *testing.T) {
-	storage := NewMemoryStorage()
+	storage := newTestStorage()
 	handler := NewHandler(storage).LongPollTimeout(100 * time.Millisecond)
 	server := httptest.NewServer(handler)
 	defer server.Close()
@@ -705,7 +705,7 @@ func TestReader_Bytes_ContextCancel(t *testing.T) {
 }
 
 func TestReader_Close_WithSSE(t *testing.T) {
-	storage := NewMemoryStorage()
+	storage := newTestStorage()
 	handler := NewHandler(storage).SSECloseAfter(500 * time.Millisecond)
 	server := httptest.NewServer(handler)
 	defer server.Close()
@@ -746,7 +746,7 @@ func TestReader_Close_WithSSE(t *testing.T) {
 }
 
 func TestReader_Read_UnknownMode(t *testing.T) {
-	server, _, client := setupTestServer()
+	server, _, client := setupInternalTestServer()
 	defer server.Close()
 
 	ctx := context.Background()
@@ -922,7 +922,7 @@ func TestNewSSEConnection(t *testing.T) {
 }
 
 func TestReader_SSE_CleanupOnModeSwitch(t *testing.T) {
-	storage := NewMemoryStorage()
+	storage := newTestStorage()
 	handler := NewHandler(storage).SSECloseAfter(500 * time.Millisecond)
 	server := httptest.NewServer(handler)
 	defer server.Close()
