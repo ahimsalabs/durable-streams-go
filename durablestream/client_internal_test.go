@@ -2,6 +2,7 @@ package durablestream
 
 import (
 	"context"
+	"encoding/json"
 	"io"
 	"net/http"
 	"testing"
@@ -115,5 +116,118 @@ func TestHandler_ChunkSize(t *testing.T) {
 
 	if handler.chunkSize != 1024 {
 		t.Errorf("chunkSize = %d, want 1024", handler.chunkSize)
+	}
+}
+
+func TestStreamData_Bytes(t *testing.T) {
+	tests := []struct {
+		name     string
+		data     *StreamData
+		wantData []byte
+		wantOK   bool
+	}{
+		{
+			name:     "with data",
+			data:     &StreamData{Data: []byte("hello")},
+			wantData: []byte("hello"),
+			wantOK:   true,
+		},
+		{
+			name:     "empty data",
+			data:     &StreamData{},
+			wantData: nil,
+			wantOK:   false,
+		},
+		{
+			name:     "json mode (no data)",
+			data:     &StreamData{Messages: []json.RawMessage{json.RawMessage(`{"a":1}`)}},
+			wantData: nil,
+			wantOK:   false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, ok := tt.data.Bytes()
+			if ok != tt.wantOK {
+				t.Errorf("Bytes() ok = %v, want %v", ok, tt.wantOK)
+			}
+			if string(got) != string(tt.wantData) {
+				t.Errorf("Bytes() = %q, want %q", got, tt.wantData)
+			}
+		})
+	}
+}
+
+func TestStreamData_JSON(t *testing.T) {
+	type msg struct {
+		Name string `json:"name"`
+	}
+
+	tests := []struct {
+		name   string
+		data   *StreamData
+		wantOK bool
+		want   msg
+	}{
+		{
+			name:   "from messages",
+			data:   &StreamData{Messages: []json.RawMessage{json.RawMessage(`{"name":"alice"}`)}},
+			wantOK: true,
+			want:   msg{Name: "alice"},
+		},
+		{
+			name:   "from json-shaped bytes",
+			data:   &StreamData{Data: []byte(`{"name":"bob"}`)},
+			wantOK: true,
+			want:   msg{Name: "bob"},
+		},
+		{
+			name:   "empty",
+			data:   &StreamData{},
+			wantOK: false,
+			want:   msg{},
+		},
+		{
+			name:   "invalid json in data",
+			data:   &StreamData{Data: []byte("not json")},
+			wantOK: false,
+			want:   msg{},
+		},
+		{
+			name:   "messages takes precedence over data",
+			data:   &StreamData{Messages: []json.RawMessage{json.RawMessage(`{"name":"from_msg"}`)}, Data: []byte(`{"name":"from_data"}`)},
+			wantOK: true,
+			want:   msg{Name: "from_msg"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var got msg
+			ok := tt.data.JSON(&got)
+			if ok != tt.wantOK {
+				t.Errorf("JSON() ok = %v, want %v", ok, tt.wantOK)
+			}
+			if got != tt.want {
+				t.Errorf("JSON() decoded = %+v, want %+v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestStreamData_JSON_Slice(t *testing.T) {
+	type msg struct {
+		ID int `json:"id"`
+	}
+
+	// JSON array in Data unmarshals to slice
+	data := &StreamData{Data: []byte(`[{"id":3},{"id":4}]`)}
+	var got []msg
+	if !data.JSON(&got) {
+		t.Fatal("JSON() returned false")
+	}
+	if len(got) != 2 || got[0].ID != 3 || got[1].ID != 4 {
+		t.Errorf("JSON() = %+v, want [{3} {4}]", got)
 	}
 }
