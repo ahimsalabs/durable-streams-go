@@ -94,7 +94,7 @@ func TestReader_Offset(t *testing.T) {
 }
 
 func TestReader_Seek(t *testing.T) {
-	server, _, client := setupInternalTestServer()
+	server, storage, client := setupInternalTestServer()
 	defer server.Close()
 
 	ctx := context.Background()
@@ -109,7 +109,7 @@ func TestReader_Seek(t *testing.T) {
 	}
 
 	// Append more data
-	_, err = client.Append(ctx, "/stream1", []byte("world"), nil)
+	_, err = storage.Append(ctx, "/stream1", []byte("world"), "")
 	if err != nil {
 		t.Fatalf("append failed: %v", err)
 	}
@@ -334,7 +334,7 @@ func TestReader_LongPoll(t *testing.T) {
 
 		// First read in catch-up mode to get cursor
 		// We use result later, so declare it here
-		var result *ClientReadResult
+		var result *StreamData
 		var err error
 		result, err = reader.Read(ctx)
 		if err != nil {

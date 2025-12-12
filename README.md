@@ -4,7 +4,7 @@
 
 Go implementation of [Durable Streams](https://github.com/durable-streams/durable-streams).
 
-Passes compliance.
+Passes the durable-streams conformance suite.
 
 ## Usage
 
@@ -42,15 +42,23 @@ func ExampleClient() {
 		log.Fatal(err)
 	}
 
-	msg := json.RawMessage(`{"type":"user.created","id":123}`)
-	offset, err := client.Append(ctx, "events", msg, nil)
+	// Write using Writer
+	writer, err := client.Writer(ctx, "events")
 	if err != nil {
 		log.Fatal(err)
 	}
-	fmt.Println("Appended at offset:", offset)
 
-	// Read from start
-	result, err := client.Read(ctx, "events", nil)
+	msg := json.RawMessage(`{"type":"user.created","id":123}`)
+	if err := writer.Send(msg); err != nil {
+		log.Fatal(err)
+	}
+	fmt.Println("Appended at offset:", writer.Offset())
+
+	// Read using Reader
+	reader := client.Reader("events", durablestream.ZeroOffset)
+	defer reader.Close()
+
+	result, err := reader.Read(ctx)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -72,7 +80,7 @@ func ExampleReader() {
 	client := durablestream.NewClient().BaseURL("http://localhost:8080/streams")
 
 	// Create a reader starting from offset 0
-	reader := client.Reader("events", "0")
+	reader := client.Reader("events", durablestream.ZeroOffset)
 	defer reader.Close()
 
 	for msg, err := range reader.Messages(ctx) {

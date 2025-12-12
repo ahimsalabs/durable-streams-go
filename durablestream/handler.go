@@ -75,9 +75,11 @@ func (h *Handler) MaxAppendSize(size int64) *Handler {
 	return h
 }
 
-// ChunkSize sets the maximum chunk size for read operations.
-func (h *Handler) ChunkSize(size int) *Handler {
-	h.chunkSize = size
+// ChunkSize sets the maximum response size (in bytes) for read operations.
+// When a read would return more data than this limit, results are paginated.
+// Default: 1MB.
+func (h *Handler) ChunkSize(sizeBytes int) *Handler {
+	h.chunkSize = sizeBytes
 	return h
 }
 

@@ -62,7 +62,7 @@ func (r *Reader) SSE() *Reader {
 
 // Read performs a single read operation based on the current mode.
 // Returns the read result or an error.
-func (r *Reader) Read(ctx context.Context) (*ClientReadResult, error) {
+func (r *Reader) Read(ctx context.Context) (*StreamData, error) {
 	if r.closed {
 		return nil, ErrClosed
 	}
@@ -80,8 +80,8 @@ func (r *Reader) Read(ctx context.Context) (*ClientReadResult, error) {
 }
 
 // readCatchUp performs a catch-up read without waiting.
-func (r *Reader) readCatchUp(ctx context.Context) (*ClientReadResult, error) {
-	result, err := r.client.Read(ctx, r.path, &ReadOptions{Offset: r.offset})
+func (r *Reader) readCatchUp(ctx context.Context) (*StreamData, error) {
+	result, err := r.doRead(ctx, r.offset)
 	if err != nil {
 		return nil, err
 	}
@@ -93,9 +93,66 @@ func (r *Reader) readCatchUp(ctx context.Context) (*ClientReadResult, error) {
 	return result, nil
 }
 
+// doRead performs a basic HTTP GET read.
+func (r *Reader) doRead(ctx context.Context, offset Offset) (*StreamData, error) {
+	streamURL := r.client.buildURL(r.path)
+
+	u, err := url.Parse(streamURL)
+	if err != nil {
+		return nil, fmt.Errorf("read request: %w", err)
+	}
+
+	q := u.Query()
+	if !offset.IsZero() {
+		q.Set(protocol.QueryOffset, offset.String())
+	}
+	u.RawQuery = q.Encode()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
+	if err != nil {
+		return nil, fmt.Errorf("read request: %w", err)
+	}
+
+	resp, err := r.client.httpClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("read request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if err := r.client.checkErrorResponse(resp); err != nil {
+		return nil, err
+	}
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("read response body: %w", err)
+	}
+
+	result := &StreamData{
+		NextOffset: Offset(resp.Header.Get(protocol.HeaderStreamNextOffset)),
+		Cursor:     resp.Header.Get(protocol.HeaderStreamCursor),
+		UpToDate:   resp.Header.Get(protocol.HeaderStreamUpToDate) == "true",
+	}
+
+	contentType := resp.Header.Get("Content-Type")
+	if protocol.IsJSONContentType(contentType) {
+		var messages []json.RawMessage
+		if len(body) > 0 {
+			if err := json.Unmarshal(body, &messages); err != nil {
+				return nil, fmt.Errorf("parse JSON response: %w", err)
+			}
+		}
+		result.Messages = messages
+	} else {
+		result.Data = body
+	}
+
+	return result, nil
+}
+
 // readLongPoll performs a long-poll read, waiting for new data.
 // Section 5.6: Read Stream - Live (Long-poll)
-func (r *Reader) readLongPoll(ctx context.Context) (*ClientReadResult, error) {
+func (r *Reader) readLongPoll(ctx context.Context) (*StreamData, error) {
 	streamURL := r.client.buildURL(r.path)
 
 	// Build URL with query parameters
@@ -133,7 +190,7 @@ func (r *Reader) readLongPoll(ctx context.Context) (*ClientReadResult, error) {
 		if nextOffset := resp.Header.Get(protocol.HeaderStreamNextOffset); nextOffset != "" {
 			r.offset = Offset(nextOffset)
 		}
-		return &ClientReadResult{
+		return &StreamData{
 			NextOffset: r.offset,
 			UpToDate:   true,
 		}, nil
@@ -151,7 +208,7 @@ func (r *Reader) readLongPoll(ctx context.Context) (*ClientReadResult, error) {
 	}
 
 	// Parse response
-	result := &ClientReadResult{
+	result := &StreamData{
 		NextOffset: Offset(resp.Header.Get(protocol.HeaderStreamNextOffset)),
 		Cursor:     resp.Header.Get(protocol.HeaderStreamCursor),
 		UpToDate:   resp.Header.Get(protocol.HeaderStreamUpToDate) == "true",
@@ -180,7 +237,7 @@ func (r *Reader) readLongPoll(ctx context.Context) (*ClientReadResult, error) {
 
 // readSSE performs a read using Server-Sent Events.
 // Section 5.7: Read Stream - Live (SSE)
-func (r *Reader) readSSE(ctx context.Context) (*ClientReadResult, error) {
+func (r *Reader) readSSE(ctx context.Context) (*StreamData, error) {
 	// Establish SSE connection if needed
 	if r.sseConn == nil {
 		if err := r.connectSSE(ctx); err != nil {
@@ -218,7 +275,7 @@ func (r *Reader) readSSE(ctx context.Context) (*ClientReadResult, error) {
 
 	// Handle data events
 	if event.Type == "data" {
-		result := &ClientReadResult{
+		result := &StreamData{
 			NextOffset: r.offset,
 			Cursor:     r.cursor,
 			UpToDate:   true,

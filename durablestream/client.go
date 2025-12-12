@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"net/url"
 	"strconv"
 	"strings"
 	"time"
@@ -57,8 +56,8 @@ func (c *Client) LongPollTimeout(d time.Duration) *Client {
 	return c
 }
 
-// ClientReadResult contains the result of a read operation.
-type ClientReadResult struct {
+// StreamData contains the result of a stream read operation.
+type StreamData struct {
 	Data       []byte            // Raw bytes (non-JSON mode)
 	Messages   []json.RawMessage // Individual messages (JSON mode)
 	NextOffset Offset            // Next offset to read from
@@ -125,118 +124,6 @@ func (c *Client) Create(ctx context.Context, path string, opts *CreateOptions) (
 	return c.parseStreamInfo(resp.Header)
 }
 
-// AppendOptions specifies options for appending to a stream.
-type AppendOptions struct {
-	// Seq sets the sequence number for writer coordination.
-	// If provided and less than or equal to the last sequence, returns ErrConflict.
-	Seq string
-}
-
-// Append appends data to a stream and returns the new tail offset.
-// Pass nil for opts to use defaults.
-func (c *Client) Append(ctx context.Context, path string, data []byte, opts *AppendOptions) (Offset, error) {
-	if len(data) == 0 {
-		return "", fmt.Errorf("empty append not allowed")
-	}
-
-	streamURL := c.buildURL(path)
-
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, streamURL, bytes.NewReader(data))
-	if err != nil {
-		return "", fmt.Errorf("append request: %w", err)
-	}
-
-	// Detect content type from stream info
-	info, err := c.Head(ctx, path)
-	if err != nil {
-		return "", fmt.Errorf("get stream info: %w", err)
-	}
-	req.Header.Set("Content-Type", info.ContentType)
-
-	// Set sequence number if provided
-	if opts != nil && opts.Seq != "" {
-		req.Header.Set(protocol.HeaderStreamSeq, opts.Seq)
-	}
-
-	resp, err := c.httpClient.Do(req)
-	if err != nil {
-		return "", fmt.Errorf("append request: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if err := c.checkErrorResponse(resp); err != nil {
-		return "", err
-	}
-
-	nextOffset := resp.Header.Get(protocol.HeaderStreamNextOffset)
-	return Offset(nextOffset), nil
-}
-
-// ReadOptions specifies options for reading from a stream.
-type ReadOptions struct {
-	// Offset specifies where to start reading.
-	// Default: ZeroOffset (stream start)
-	Offset Offset
-}
-
-// Read performs a catch-up read from the stream.
-// Pass nil for opts to read from the start.
-func (c *Client) Read(ctx context.Context, path string, opts *ReadOptions) (*ClientReadResult, error) {
-	streamURL := c.buildURL(path)
-
-	u, err := url.Parse(streamURL)
-	if err != nil {
-		return nil, fmt.Errorf("read request: %w", err)
-	}
-
-	q := u.Query()
-	if opts != nil && !opts.Offset.IsZero() {
-		q.Set(protocol.QueryOffset, opts.Offset.String())
-	}
-	u.RawQuery = q.Encode()
-
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
-	if err != nil {
-		return nil, fmt.Errorf("read request: %w", err)
-	}
-
-	resp, err := c.httpClient.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("read request: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if err := c.checkErrorResponse(resp); err != nil {
-		return nil, err
-	}
-
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, fmt.Errorf("read response body: %w", err)
-	}
-
-	result := &ClientReadResult{
-		NextOffset: Offset(resp.Header.Get(protocol.HeaderStreamNextOffset)),
-		Cursor:     resp.Header.Get(protocol.HeaderStreamCursor),
-		UpToDate:   resp.Header.Get(protocol.HeaderStreamUpToDate) == "true",
-	}
-
-	contentType := resp.Header.Get("Content-Type")
-	if protocol.IsJSONContentType(contentType) {
-		var messages []json.RawMessage
-		if len(body) > 0 {
-			if err := json.Unmarshal(body, &messages); err != nil {
-				return nil, fmt.Errorf("parse JSON response: %w", err)
-			}
-		}
-		result.Messages = messages
-	} else {
-		result.Data = body
-	}
-
-	return result, nil
-}
-
 // Head queries stream metadata without transferring data.
 func (c *Client) Head(ctx context.Context, path string) (*StreamInfo, error) {
 	streamURL := c.buildURL(path)
@@ -277,19 +164,18 @@ func (c *Client) Delete(ctx context.Context, path string) error {
 	return c.checkErrorResponse(resp)
 }
 
-// StreamWriter provides zero-allocation batch append operations.
-// Use Writer() to create a StreamWriter for high-throughput scenarios.
+// StreamWriter provides efficient append operations by caching stream metadata.
+// Create via Client.Writer(). The writer holds no resources requiring cleanup.
 type StreamWriter struct {
 	client      *Client
 	ctx         context.Context
 	path        string
 	contentType string
 	offset      Offset
-	closed      bool
 }
 
-// Writer creates a new StreamWriter for batch append operations.
-// The writer should be closed when done to release resources.
+// Writer creates a StreamWriter for append operations.
+// The writer caches stream metadata (content-type) to avoid per-append overhead.
 func (c *Client) Writer(ctx context.Context, path string) (*StreamWriter, error) {
 	info, err := c.Head(ctx, path)
 	if err != nil {
@@ -312,11 +198,8 @@ func (w *StreamWriter) Send(data []byte) error {
 }
 
 // SendWithSeq appends a message with sequence coordination.
+// If seq is provided and less than or equal to the last sequence, returns ErrConflict.
 func (w *StreamWriter) SendWithSeq(seq string, data []byte) error {
-	if w.closed {
-		return ErrClosed
-	}
-
 	if len(data) == 0 {
 		return fmt.Errorf("empty append not allowed")
 	}
@@ -350,12 +233,6 @@ func (w *StreamWriter) SendWithSeq(seq string, data []byte) error {
 // Offset returns the current tail offset after the last successful append.
 func (w *StreamWriter) Offset() Offset {
 	return w.offset
-}
-
-// Close closes the writer.
-func (w *StreamWriter) Close() error {
-	w.closed = true
-	return nil
 }
 
 // Reader creates a new Reader for continuous reading from a stream.

@@ -105,127 +105,6 @@ func TestClient_Create_Idempotent(t *testing.T) {
 	}
 }
 
-func TestClient_Append(t *testing.T) {
-	server, _, client := setupTestServer()
-	defer server.Close()
-
-	ctx := context.Background()
-
-	// Create stream
-	_, err := client.Create(ctx, "/stream1", &durablestream.CreateOptions{ContentType: "text/plain"})
-	if err != nil {
-		t.Fatalf("create failed: %v", err)
-	}
-
-	// Append data
-	offset, err := client.Append(ctx, "/stream1", []byte("hello world"), nil)
-	if err != nil {
-		t.Fatalf("append failed: %v", err)
-	}
-
-	if offset == "" {
-		t.Error("expected non-empty offset")
-	}
-}
-
-func TestClient_AppendWithSeq(t *testing.T) {
-	server, _, client := setupTestServer()
-	defer server.Close()
-
-	ctx := context.Background()
-
-	// Create stream
-	_, err := client.Create(ctx, "/stream1", &durablestream.CreateOptions{ContentType: "text/plain"})
-	if err != nil {
-		t.Fatalf("create failed: %v", err)
-	}
-
-	// Append with sequence
-	_, err = client.Append(ctx, "/stream1", []byte("first"), &durablestream.AppendOptions{Seq: "seq001"})
-	if err != nil {
-		t.Fatalf("first append failed: %v", err)
-	}
-
-	// Append with higher sequence (should succeed)
-	_, err = client.Append(ctx, "/stream1", []byte("second"), &durablestream.AppendOptions{Seq: "seq002"})
-	if err != nil {
-		t.Fatalf("second append failed: %v", err)
-	}
-
-	// Append with lower sequence (should fail with durablestream.ErrConflict)
-	_, err = client.Append(ctx, "/stream1", []byte("third"), &durablestream.AppendOptions{Seq: "seq001"})
-	if err == nil {
-		t.Error("expected sequence regression error")
-	}
-	if !errors.Is(err, durablestream.ErrConflict) {
-		t.Errorf("expected durablestream.ErrConflict, got %v", err)
-	}
-}
-
-func TestClient_Read(t *testing.T) {
-	server, _, client := setupTestServer()
-	defer server.Close()
-
-	ctx := context.Background()
-
-	// Create stream with initial data
-	_, err := client.Create(ctx, "/stream1", &durablestream.CreateOptions{
-		ContentType: "text/plain",
-		InitialData: []byte("hello world"),
-	})
-	if err != nil {
-		t.Fatalf("create failed: %v", err)
-	}
-
-	// Read from beginning
-	result, err := client.Read(ctx, "/stream1", nil)
-	if err != nil {
-		t.Fatalf("read failed: %v", err)
-	}
-
-	if string(result.Data) != "hello world" {
-		t.Errorf("Data = %q, want %q", string(result.Data), "hello world")
-	}
-
-	if !result.UpToDate {
-		t.Error("expected UpToDate to be true")
-	}
-}
-
-func TestClient_ReadWithOffset(t *testing.T) {
-	server, _, client := setupTestServer()
-	defer server.Close()
-
-	ctx := context.Background()
-
-	// Create stream with initial data
-	info, err := client.Create(ctx, "/stream1", &durablestream.CreateOptions{
-		ContentType: "text/plain",
-		InitialData: []byte("first"),
-	})
-	if err != nil {
-		t.Fatalf("create failed: %v", err)
-	}
-
-	firstOffset := info.NextOffset
-
-	// Append more data
-	_, err = client.Append(ctx, "/stream1", []byte("second"), nil)
-	if err != nil {
-		t.Fatalf("append failed: %v", err)
-	}
-
-	// Read from first offset (should get "second")
-	result, err := client.Read(ctx, "/stream1", &durablestream.ReadOptions{Offset: firstOffset})
-	if err != nil {
-		t.Fatalf("read failed: %v", err)
-	}
-
-	if string(result.Data) != "second" {
-		t.Errorf("Data = %q, want %q", string(result.Data), "second")
-	}
-}
-
 func TestClient_Head(t *testing.T) {
 	server, _, client := setupTestServer()
 	defer server.Close()
@@ -387,7 +266,6 @@ func TestStreamWriter(t *testing.T) {
 	if err != nil {
 		t.Fatalf("writer creation failed: %v", err)
 	}
-	defer writer.Close()
 
 	// Send multiple messages
 	messages := []string{"first", "second", "third"}
@@ -420,7 +298,6 @@ func TestStreamWriter_SendWithSeq(t *testing.T) {
 	if err != nil {
 		t.Fatalf("writer creation failed: %v", err)
 	}
-	defer writer.Close()
 
 	// Send with sequence
 	if err := writer.SendWithSeq("seq1", []byte("first")); err != nil {
@@ -442,28 +319,75 @@ func TestStreamWriter_SendWithSeq(t *testing.T) {
 	}
 }
 
-func TestStreamWriter_Closed(t *testing.T) {
+func TestReader_Read(t *testing.T) {
 	server, _, client := setupTestServer()
 	defer server.Close()
 
 	ctx := context.Background()
 
-	// Create stream
-	_, err := client.Create(ctx, "/stream1", &durablestream.CreateOptions{ContentType: "text/plain"})
+	// Create stream with initial data
+	_, err := client.Create(ctx, "/stream1", &durablestream.CreateOptions{
+		ContentType: "text/plain",
+		InitialData: []byte("hello world"),
+	})
 	if err != nil {
 		t.Fatalf("create failed: %v", err)
 	}
 
-	// Create and close writer
+	// Read from beginning
+	reader := client.Reader("/stream1", durablestream.ZeroOffset)
+	defer reader.Close()
+
+	result, err := reader.Read(ctx)
+	if err != nil {
+		t.Fatalf("read failed: %v", err)
+	}
+
+	if string(result.Data) != "hello world" {
+		t.Errorf("Data = %q, want %q", string(result.Data), "hello world")
+	}
+
+	if !result.UpToDate {
+		t.Error("expected UpToDate to be true")
+	}
+}
+
+func TestReader_ReadWithOffset(t *testing.T) {
+	server, _, client := setupTestServer()
+	defer server.Close()
+
+	ctx := context.Background()
+
+	// Create stream with initial data
+	info, err := client.Create(ctx, "/stream1", &durablestream.CreateOptions{
+		ContentType: "text/plain",
+		InitialData: []byte("first"),
+	})
+	if err != nil {
+		t.Fatalf("create failed: %v", err)
+	}
+
+	firstOffset := info.NextOffset
+
+	// Append more data using Writer
 	writer, err := client.Writer(ctx, "/stream1")
 	if err != nil {
 		t.Fatalf("writer creation failed: %v", err)
 	}
-	writer.Close()
+	if err := writer.Send([]byte("second")); err != nil {
+		t.Fatalf("append failed: %v", err)
+	}
 
-	// Send after close should fail
-	err = writer.Send([]byte("test"))
-	if !errors.Is(err, durablestream.ErrClosed) {
-		t.Errorf("expected durablestream.ErrClosed, got %v", err)
+	// Read from first offset (should get "second")
+	reader := client.Reader("/stream1", firstOffset)
+	defer reader.Close()
+
+	result, err := reader.Read(ctx)
+	if err != nil {
+		t.Fatalf("read failed: %v", err)
+	}
+
+	if string(result.Data) != "second" {
+		t.Errorf("Data = %q, want %q", string(result.Data), "second")
 	}
 }
