@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"sync"
+	"time"
 )
 
 // testStorage is a minimal storage implementation for internal tests.
@@ -110,7 +111,7 @@ func (s *testStorage) Read(ctx context.Context, streamID string, offset Offset, 
 
 	offsetIdx := 0
 	if offset != "" && offset != "-1" {
-		fmt.Sscanf(string(offset), "%d", &offsetIdx)
+		_, _ = fmt.Sscanf(string(offset), "%d", &offsetIdx)
 	}
 
 	if offsetIdx >= len(stream.offsets) {
@@ -220,10 +221,13 @@ func (s *testStorage) Subscribe(ctx context.Context, streamID string, offset Off
 }
 
 // setupInternalTestServer creates a test HTTP server with testStorage for internal tests.
+// Uses short timeouts (100ms) to avoid slow tests when long-polling is triggered.
 func setupInternalTestServer() (*httptest.Server, *testStorage, *Client) {
 	storage := newTestStorage()
-	handler := NewHandler(storage, nil)
+	handler := NewHandler(storage, &HandlerConfig{
+		LongPollTimeout: 100 * time.Millisecond,
+	})
 	server := httptest.NewServer(handler)
-	client := NewClient(server.URL, nil)
+	client := NewClient(server.URL, &ClientConfig{LongPollTimeout: 100 * time.Millisecond})
 	return server, storage, client
 }

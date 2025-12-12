@@ -1,62 +1,125 @@
 package durablestream
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
-	"fmt"
-	"io"
 	"net/http"
-	"strconv"
-	"strings"
 	"time"
 
-	"github.com/ahimsalabs/durable-streams-go/durablestream/internal/protocol"
+	"github.com/ahimsalabs/durable-streams-go/durablestream/internal/transport"
+)
+
+// Re-export transport types for convenience.
+type (
+	// HeaderProvider is a function that provides HTTP headers per-request.
+	// Re-exported from transport package.
+	HeaderProvider = transport.HeaderProvider
+)
+
+// ReadMode specifies how live reads are handled after catch-up.
+// See transport.ReadMode for detailed documentation.
+type ReadMode = transport.ReadMode
+
+// Read mode constants.
+const (
+	// ReadModeAuto catches up, then uses long-poll for live updates (default).
+	ReadModeAuto = transport.ReadModeAuto
+
+	// ReadModeLongPoll uses long-polling for live updates (Section 5.6).
+	ReadModeLongPoll = transport.ReadModeLongPoll
+
+	// ReadModeSSE uses Server-Sent Events for live updates (Section 5.7).
+	ReadModeSSE = transport.ReadModeSSE
 )
 
 // ClientConfig configures a Client.
+//
+// # Field Precedence
+//
+// Transport takes precedence over all HTTP-specific fields:
+//   - If Transport is set (non-nil), HTTPClient, Headers, and LongPollTimeout are IGNORED.
+//   - If Transport is nil, an HTTPTransport is created using HTTPClient, Headers, and LongPollTimeout.
+//
+// # Zero Values
+//
+// Zero values are replaced with defaults:
+//   - Timeout: 30s (if zero or negative)
+//   - ReadMode: ReadModeAuto (if zero)
+//   - HTTPClient: http.DefaultClient (if nil and Transport is nil)
+//   - LongPollTimeout: 60s (if zero and Transport is nil)
+//   - Headers: none (if nil)
 type ClientConfig struct {
-	// HTTPClient is the underlying HTTP client. Default: http.DefaultClient.
+	// Transport is the underlying transport for all operations.
+	// If non-nil, HTTPClient, Headers, and LongPollTimeout are IGNORED.
+	// If nil, an HTTPTransport is created using the HTTP-specific fields below.
+	Transport transport.Transport
+
+	// HTTPClient is the underlying HTTP client used by the default HTTPTransport.
+	// Only used when Transport is nil. Default: http.DefaultClient.
 	HTTPClient *http.Client
 
-	// Timeout is the default timeout for operations. Default: 30s.
+	// Headers provides headers to include in all requests made by the default HTTPTransport.
+	// Called per-request to allow dynamic values (e.g., auth tokens).
+	// Only used when Transport is nil. Default: no additional headers.
+	Headers transport.HeaderProvider
+
+	// Timeout is the default timeout for all operations (Create, Head, Delete, etc).
+	// Zero or negative values default to 30s.
 	Timeout time.Duration
 
-	// LongPollTimeout is the timeout for long-poll operations. Default: 60s.
+	// LongPollTimeout is the timeout for long-poll read operations (Section 5.6).
+	// Only used when Transport is nil (for the default HTTPTransport).
+	// Zero values default to 60s.
 	LongPollTimeout time.Duration
+
+	// ReadMode specifies how live reads are handled after catch-up (Section 5.6-5.7).
+	// Zero value defaults to ReadModeAuto (catch-up then long-poll).
+	ReadMode ReadMode
 }
 
-// Client provides methods to interact with durable streams over HTTP.
+// Client provides methods to interact with durable streams.
+// See PROTOCOL.md Section 5: HTTP Operations.
 type Client struct {
-	httpClient      *http.Client
-	baseURL         string
-	timeout         time.Duration
-	longPollTimeout time.Duration
+	transport transport.Transport
+	readMode  ReadMode
+	timeout   time.Duration
 }
 
 // NewClient creates a new stream client for the given base URL.
 // Pass nil for cfg to use defaults.
 func NewClient(baseURL string, cfg *ClientConfig) *Client {
 	c := &Client{
-		baseURL:         strings.TrimRight(baseURL, "/"),
-		httpClient:      http.DefaultClient,
-		timeout:         30 * time.Second,
-		longPollTimeout: 60 * time.Second,
+		timeout:  30 * time.Second,
+		readMode: ReadModeAuto,
 	}
 
 	if cfg != nil {
-		if cfg.HTTPClient != nil {
-			c.httpClient = cfg.HTTPClient
-		}
 		if cfg.Timeout > 0 {
 			c.timeout = cfg.Timeout
 		}
-		if cfg.LongPollTimeout > 0 {
-			c.longPollTimeout = cfg.LongPollTimeout
+		c.readMode = cfg.ReadMode
+
+		if cfg.Transport != nil {
+			c.transport = cfg.Transport
+		} else {
+			// Create HTTP transport from config
+			httpCfg := &transport.HTTPConfig{
+				Client:          cfg.HTTPClient,
+				LongPollTimeout: cfg.LongPollTimeout,
+				Headers:         cfg.Headers,
+			}
+			c.transport = transport.NewHTTPTransport(baseURL, httpCfg)
 		}
+	} else {
+		c.transport = transport.NewHTTPTransport(baseURL, nil)
 	}
 
 	return c
+}
+
+// Transport returns the underlying transport for advanced use cases.
+func (c *Client) Transport() transport.Transport {
+	return c.transport
 }
 
 // StreamData contains the result of a stream read operation.
@@ -88,7 +151,7 @@ func (m Message) String() string {
 	return string(m.data)
 }
 
-// CreateOptions specifies options for creating a stream.
+// CreateOptions specifies options for creating a stream (Section 5.1).
 type CreateOptions struct {
 	// ContentType sets the content type for the stream.
 	// Default: "application/octet-stream"
@@ -106,89 +169,56 @@ type CreateOptions struct {
 	InitialData []byte
 }
 
-// Create creates a new stream with the given options.
+// Create creates a new stream with the given options (Section 5.1: Create Stream).
 // Pass nil for opts to use defaults.
 func (c *Client) Create(ctx context.Context, path string, opts *CreateOptions) (*StreamInfo, error) {
-	streamURL := c.buildURL(path)
+	req := transport.CreateRequest{Path: path}
 
-	var body io.Reader
-	if opts != nil && opts.InitialData != nil {
-		body = bytes.NewReader(opts.InitialData)
-	}
-
-	req, err := http.NewRequestWithContext(ctx, http.MethodPut, streamURL, body)
-	if err != nil {
-		return nil, fmt.Errorf("create request: %w", err)
-	}
-
-	// Set headers from options
+	contentType := "application/octet-stream"
 	if opts != nil {
 		if opts.ContentType != "" {
-			req.Header.Set("Content-Type", opts.ContentType)
+			contentType = opts.ContentType
 		}
-		if opts.TTL > 0 {
-			req.Header.Set(protocol.HeaderStreamTTL, strconv.FormatInt(int64(opts.TTL.Seconds()), 10))
-		}
-		if !opts.ExpiresAt.IsZero() {
-			req.Header.Set(protocol.HeaderStreamExpiresAt, opts.ExpiresAt.Format(time.RFC3339))
-		}
+		req.ContentType = opts.ContentType
+		req.TTL = opts.TTL
+		req.ExpiresAt = opts.ExpiresAt
+		req.InitialData = opts.InitialData
 	}
 
-	resp, err := c.httpClient.Do(req)
+	resp, err := c.transport.Create(ctx, req)
 	if err != nil {
-		return nil, fmt.Errorf("create request: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if err := c.checkErrorResponse(resp); err != nil {
-		return nil, err
+		return nil, convertTransportError(err)
 	}
 
-	return c.parseStreamInfo(resp.Header)
+	return &StreamInfo{
+		ContentType: contentType,
+		NextOffset:  Offset(resp.NextOffset),
+	}, nil
 }
 
-// Head queries stream metadata without transferring data.
+// Head queries stream metadata without transferring data (Section 5.4: Stream Metadata).
 func (c *Client) Head(ctx context.Context, path string) (*StreamInfo, error) {
-	streamURL := c.buildURL(path)
-
-	req, err := http.NewRequestWithContext(ctx, http.MethodHead, streamURL, nil)
+	resp, err := c.transport.Head(ctx, transport.HeadRequest{Path: path})
 	if err != nil {
-		return nil, fmt.Errorf("head request: %w", err)
+		return nil, convertTransportError(err)
 	}
 
-	resp, err := c.httpClient.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("head request: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if err := c.checkErrorResponse(resp); err != nil {
-		return nil, err
-	}
-
-	return c.parseStreamInfo(resp.Header)
+	return &StreamInfo{
+		ContentType: resp.ContentType,
+		NextOffset:  Offset(resp.NextOffset),
+		TTL:         resp.TTL,
+		ExpiresAt:   resp.ExpiresAt,
+	}, nil
 }
 
-// Delete removes a stream.
+// Delete removes a stream (Section 5.3: Delete Stream).
 func (c *Client) Delete(ctx context.Context, path string) error {
-	streamURL := c.buildURL(path)
-
-	req, err := http.NewRequestWithContext(ctx, http.MethodDelete, streamURL, nil)
-	if err != nil {
-		return fmt.Errorf("delete request: %w", err)
-	}
-
-	resp, err := c.httpClient.Do(req)
-	if err != nil {
-		return fmt.Errorf("delete request: %w", err)
-	}
-	defer resp.Body.Close()
-
-	return c.checkErrorResponse(resp)
+	return convertTransportError(c.transport.Delete(ctx, transport.DeleteRequest{Path: path}))
 }
 
 // StreamWriter provides efficient append operations by caching stream metadata.
 // Create via Client.Writer(). The writer holds no resources requiring cleanup.
+// See PROTOCOL.md Section 5.2: Append to Stream.
 type StreamWriter struct {
 	client      *Client
 	ctx         context.Context
@@ -214,42 +244,26 @@ func (c *Client) Writer(ctx context.Context, path string) (*StreamWriter, error)
 	}, nil
 }
 
-// Send appends a message to the stream.
+// Send appends a message to the stream (Section 5.2: Append to Stream).
 // Returns error if the stream is closed or the append fails.
 func (w *StreamWriter) Send(data []byte) error {
 	return w.SendWithSeq("", data)
 }
 
-// SendWithSeq appends a message with sequence coordination.
+// SendWithSeq appends a message with sequence coordination (Section 5.2).
 // If seq is provided and less than or equal to the last sequence, returns ErrConflict.
 func (w *StreamWriter) SendWithSeq(seq string, data []byte) error {
-	if len(data) == 0 {
-		return fmt.Errorf("empty append not allowed")
-	}
-
-	streamURL := w.client.buildURL(w.path)
-
-	req, err := http.NewRequestWithContext(w.ctx, http.MethodPost, streamURL, bytes.NewReader(data))
+	resp, err := w.client.transport.Append(w.ctx, transport.AppendRequest{
+		Path:        w.path,
+		Data:        data,
+		ContentType: w.contentType,
+		Seq:         seq,
+	})
 	if err != nil {
-		return fmt.Errorf("append request: %w", err)
+		return convertTransportError(err)
 	}
 
-	req.Header.Set("Content-Type", w.contentType)
-	if seq != "" {
-		req.Header.Set(protocol.HeaderStreamSeq, seq)
-	}
-
-	resp, err := w.client.httpClient.Do(req)
-	if err != nil {
-		return fmt.Errorf("append request: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if err := w.client.checkErrorResponse(resp); err != nil {
-		return err
-	}
-
-	w.offset = Offset(resp.Header.Get(protocol.HeaderStreamNextOffset))
+	w.offset = Offset(resp.NextOffset)
 	return nil
 }
 
@@ -259,62 +273,42 @@ func (w *StreamWriter) Offset() Offset {
 }
 
 // Reader creates a new Reader for continuous reading from a stream.
+// The Reader inherits the client's ReadMode for live tailing behavior.
 func (c *Client) Reader(path string, offset Offset) *Reader {
 	return &Reader{
-		client: c,
-		path:   path,
-		offset: offset,
-		mode:   modeCatchUp,
+		client:   c,
+		path:     path,
+		offset:   offset,
+		readMode: c.readMode,
+		catching: true, // Start in catch-up phase
 	}
 }
 
-// buildURL constructs the full URL for a stream path.
-func (c *Client) buildURL(path string) string {
-	if c.baseURL == "" {
-		return path
-	}
-	return c.baseURL + "/" + strings.TrimLeft(path, "/")
-}
-
-// checkErrorResponse checks for error responses and returns appropriate errors.
-func (c *Client) checkErrorResponse(resp *http.Response) error {
-	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+// convertTransportError converts transport package errors to durablestream errors.
+func convertTransportError(err error) error {
+	if err == nil {
 		return nil
 	}
 
-	// Try to parse JSON error response
-	var streamErr protoError
-	if body, err := io.ReadAll(resp.Body); err == nil && len(body) > 0 {
-		if json.Unmarshal(body, &streamErr) == nil && streamErr.Code != "" {
-			return &streamErr
+	// Check if it's a transport error with a code
+	if tErr, ok := err.(*transport.Error); ok {
+		// Check both uppercase (from HTTP status mapping) and lowercase (from JSON response)
+		switch tErr.Code {
+		case "NOT_FOUND", "not_found":
+			return ErrNotFound
+		case "CONFLICT", "conflict":
+			return ErrConflict
+		case "GONE", "gone":
+			return ErrGone
+		case "BAD_REQUEST", "bad_request":
+			return ErrBadRequest
+		case "RATE_LIMITED", "too_many_requests":
+			return newError(codeTooManyRequests, tErr.Message)
+		default:
+			// Return the transport error as-is
+			return err
 		}
 	}
 
-	// Map HTTP status to error code
-	code := httpStatusToErrorCode(resp.StatusCode)
-	return newError(code, fmt.Sprintf("HTTP %d: %s", resp.StatusCode, resp.Status))
-}
-
-// parseStreamInfo extracts stream metadata from response headers.
-func (c *Client) parseStreamInfo(headers http.Header) (*StreamInfo, error) {
-	info := &StreamInfo{
-		ContentType: headers.Get("Content-Type"),
-		NextOffset:  Offset(headers.Get(protocol.HeaderStreamNextOffset)),
-	}
-
-	if ttlStr := headers.Get(protocol.HeaderStreamTTL); ttlStr != "" {
-		ttlSecs, err := strconv.ParseInt(ttlStr, 10, 64)
-		if err == nil {
-			info.TTL = time.Duration(ttlSecs) * time.Second
-		}
-	}
-
-	if expiresStr := headers.Get(protocol.HeaderStreamExpiresAt); expiresStr != "" {
-		expiresAt, err := time.Parse(time.RFC3339, expiresStr)
-		if err == nil {
-			info.ExpiresAt = expiresAt
-		}
-	}
-
-	return info, nil
+	return err
 }

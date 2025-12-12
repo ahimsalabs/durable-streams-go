@@ -5,244 +5,138 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"io"
 	"iter"
-	"net/http"
-	"net/url"
 
-	"github.com/ahimsalabs/durable-streams-go/durablestream/internal/protocol"
+	"github.com/ahimsalabs/durable-streams-go/durablestream/internal/transport"
 )
 
-// readMode represents the reading mode for continuous stream reading.
-type readMode int
-
-const (
-	// modeCatchUp reads available data without waiting.
-	modeCatchUp readMode = iota
-	// modeLongPoll waits for new data using long-polling.
-	modeLongPoll
-	// modeSSE uses Server-Sent Events for streaming.
-	modeSSE
-)
-
-// Reader provides continuous stream reading with mode switching.
-// It manages offset tracking and mode transitions for efficient streaming.
+// Reader provides continuous stream reading with automatic mode transitions.
+// It manages offset tracking and switches from catch-up to live mode based
+// on the client's configured ReadMode.
+//
+// See PROTOCOL.md Section 5.5-5.7 for read operation details.
 type Reader struct {
-	client *Client
-	path   string
-	offset Offset
-	cursor string
-	mode   readMode
-	closed bool
+	client   *Client
+	path     string
+	offset   Offset
+	cursor   string
+	readMode ReadMode
+	catching bool // true while in catch-up phase
+	closed   bool
 
-	// SSE connection state
-	sseConn *sseConnection
+	// SSE connection state (Section 5.7)
+	sseStream transport.EventStream
 }
 
-// LongPoll switches the reader to long-polling mode.
-// Returns the reader for chaining.
-func (r *Reader) LongPoll() *Reader {
-	if r.mode == modeSSE && r.sseConn != nil {
-		r.sseConn.Close()
-		r.sseConn = nil
-	}
-	r.mode = modeLongPoll
-	return r
-}
-
-// SSE switches the reader to Server-Sent Events mode.
-// Returns the reader for chaining.
-func (r *Reader) SSE() *Reader {
-	if r.mode == modeSSE && r.sseConn != nil {
-		r.sseConn.Close()
-		r.sseConn = nil
-	}
-	r.mode = modeSSE
-	return r
-}
-
-// Read performs a single read operation based on the current mode.
+// Read performs a single read operation based on the current state.
 // Returns the read result or an error.
+//
+// During catch-up phase, uses basic GET requests (Section 5.5).
+// After UpToDate, switches to live mode based on ReadMode:
+//   - ReadModeAuto/ReadModeLongPoll: long-poll requests (Section 5.6)
+//   - ReadModeSSE: Server-Sent Events stream (Section 5.7)
 func (r *Reader) Read(ctx context.Context) (*StreamData, error) {
 	if r.closed {
 		return nil, ErrClosed
 	}
 
-	switch r.mode {
-	case modeCatchUp:
+	// Determine which operation to perform
+	if r.catching {
 		return r.readCatchUp(ctx)
-	case modeLongPoll:
+	}
+
+	switch r.readMode {
+	case ReadModeAuto, ReadModeLongPoll:
 		return r.readLongPoll(ctx)
-	case modeSSE:
+	case ReadModeSSE:
 		return r.readSSE(ctx)
 	default:
-		return nil, fmt.Errorf("unknown read mode: %d", r.mode)
+		return r.readLongPoll(ctx)
 	}
 }
 
-// readCatchUp performs a catch-up read without waiting.
+// readCatchUp performs a catch-up read (Section 5.5: Read Stream - Catch-up).
 func (r *Reader) readCatchUp(ctx context.Context) (*StreamData, error) {
-	result, err := r.doRead(ctx, r.offset)
+	resp, err := r.client.transport.Read(ctx, transport.ReadRequest{
+		Path:   r.path,
+		Offset: r.offset.String(),
+	})
 	if err != nil {
-		return nil, err
+		return nil, convertTransportError(err)
 	}
 
 	// Update state
-	r.offset = result.NextOffset
-	r.cursor = result.Cursor
+	r.offset = Offset(resp.NextOffset)
+	r.cursor = resp.Cursor
 
-	return result, nil
-}
-
-// doRead performs a basic HTTP GET read.
-func (r *Reader) doRead(ctx context.Context, offset Offset) (*StreamData, error) {
-	streamURL := r.client.buildURL(r.path)
-
-	u, err := url.Parse(streamURL)
-	if err != nil {
-		return nil, fmt.Errorf("read request: %w", err)
-	}
-
-	q := u.Query()
-	if !offset.IsZero() {
-		q.Set(protocol.QueryOffset, offset.String())
-	}
-	u.RawQuery = q.Encode()
-
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
-	if err != nil {
-		return nil, fmt.Errorf("read request: %w", err)
-	}
-
-	resp, err := r.client.httpClient.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("read request: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if err := r.client.checkErrorResponse(resp); err != nil {
-		return nil, err
-	}
-
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, fmt.Errorf("read response body: %w", err)
+	// Check if we should transition to live mode
+	if resp.UpToDate {
+		r.catching = false
 	}
 
 	return &StreamData{
-		Data:       body,
-		NextOffset: Offset(resp.Header.Get(protocol.HeaderStreamNextOffset)),
-		Cursor:     resp.Header.Get(protocol.HeaderStreamCursor),
-		UpToDate:   resp.Header.Get(protocol.HeaderStreamUpToDate) == "true",
+		Data:       resp.Data,
+		NextOffset: Offset(resp.NextOffset),
+		Cursor:     resp.Cursor,
+		UpToDate:   resp.UpToDate,
 	}, nil
 }
 
-// readLongPoll performs a long-poll read, waiting for new data.
-// Section 5.6: Read Stream - Live (Long-poll)
+// readLongPoll performs a long-poll read (Section 5.6: Read Stream - Live Long-poll).
 func (r *Reader) readLongPoll(ctx context.Context) (*StreamData, error) {
-	streamURL := r.client.buildURL(r.path)
-
-	// Build URL with query parameters
-	u, err := url.Parse(streamURL)
+	resp, err := r.client.transport.LongPoll(ctx, transport.LongPollRequest{
+		Path:   r.path,
+		Offset: r.offset.String(),
+		Cursor: r.cursor,
+	})
 	if err != nil {
-		return nil, fmt.Errorf("parse URL: %w", err)
-	}
-
-	q := u.Query()
-	q.Set(protocol.QueryOffset, r.offset.String())
-	q.Set(protocol.QueryLive, protocol.LiveModeLongPoll)
-	if r.cursor != "" {
-		q.Set(protocol.QueryCursor, r.cursor)
-	}
-	u.RawQuery = q.Encode()
-
-	// Create request with long-poll timeout
-	ctx, cancel := context.WithTimeout(ctx, r.client.longPollTimeout)
-	defer cancel()
-
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
-	if err != nil {
-		return nil, fmt.Errorf("create request: %w", err)
-	}
-
-	resp, err := r.client.httpClient.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("long-poll request: %w", err)
-	}
-	defer resp.Body.Close()
-
-	// Handle 204 No Content (timeout with no new data)
-	if resp.StatusCode == http.StatusNoContent {
-		// Update offset if provided
-		if nextOffset := resp.Header.Get(protocol.HeaderStreamNextOffset); nextOffset != "" {
-			r.offset = Offset(nextOffset)
-		}
-		return &StreamData{
-			NextOffset: r.offset,
-			UpToDate:   true,
-		}, nil
-	}
-
-	// Check for errors
-	if err := r.client.checkErrorResponse(resp); err != nil {
-		return nil, err
-	}
-
-	// Read response body
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, fmt.Errorf("read response body: %w", err)
-	}
-
-	// Parse response
-	result := &StreamData{
-		Data:       body,
-		NextOffset: Offset(resp.Header.Get(protocol.HeaderStreamNextOffset)),
-		Cursor:     resp.Header.Get(protocol.HeaderStreamCursor),
-		UpToDate:   resp.Header.Get(protocol.HeaderStreamUpToDate) == "true",
+		return nil, convertTransportError(err)
 	}
 
 	// Update state
-	r.offset = result.NextOffset
-	r.cursor = result.Cursor
+	r.offset = Offset(resp.NextOffset)
+	r.cursor = resp.Cursor
 
-	return result, nil
+	return &StreamData{
+		Data:       resp.Data,
+		NextOffset: Offset(resp.NextOffset),
+		Cursor:     resp.Cursor,
+		UpToDate:   resp.UpToDate,
+	}, nil
 }
 
-// readSSE performs a read using Server-Sent Events.
-// Section 5.7: Read Stream - Live (SSE)
+// readSSE performs a read using Server-Sent Events (Section 5.7: Read Stream - Live SSE).
 func (r *Reader) readSSE(ctx context.Context) (*StreamData, error) {
 	// Establish SSE connection if needed
-	if r.sseConn == nil {
-		if err := r.connectSSE(ctx); err != nil {
-			return nil, err
+	if r.sseStream == nil {
+		stream, err := r.client.transport.SSE(ctx, transport.SSERequest{
+			Path:   r.path,
+			Offset: r.offset.String(),
+		})
+		if err != nil {
+			return nil, convertTransportError(err)
 		}
+		r.sseStream = stream
 	}
 
-	// Read next event from SSE connection
-	event, err := r.sseConn.readEvent()
+	// Read next event
+	event, err := r.sseStream.Next(ctx)
 	if err != nil {
-		// Close connection on error and return
-		r.sseConn.Close()
-		r.sseConn = nil
+		// Close connection on error
+		r.sseStream.Close()
+		r.sseStream = nil
 		return nil, fmt.Errorf("read SSE event: %w", err)
 	}
 
-	// Handle control events
+	// Handle control events (Section 5.7)
 	if event.Type == "control" {
-		var control sseControlEvent
-		if err := json.Unmarshal(event.Data, &control); err != nil {
-			return nil, fmt.Errorf("parse control event: %w", err)
-		}
-
 		// Update state from control event
-		if control.StreamNextOffset != "" {
-			r.offset = Offset(control.StreamNextOffset)
+		if event.NextOffset != "" {
+			r.offset = Offset(event.NextOffset)
 		}
-		if control.StreamCursor != "" {
-			r.cursor = control.StreamCursor
+		if event.Cursor != "" {
+			r.cursor = event.Cursor
 		}
-
 		// Control events don't contain data, read next event
 		return r.readSSE(ctx)
 	}
@@ -257,53 +151,7 @@ func (r *Reader) readSSE(ctx context.Context) (*StreamData, error) {
 		}, nil
 	}
 
-	// Unknown event type
 	return nil, fmt.Errorf("unknown SSE event type: %s", event.Type)
-}
-
-// connectSSE establishes an SSE connection.
-func (r *Reader) connectSSE(ctx context.Context) error {
-	streamURL := r.client.buildURL(r.path)
-
-	// Build URL with query parameters
-	u, err := url.Parse(streamURL)
-	if err != nil {
-		return fmt.Errorf("parse URL: %w", err)
-	}
-
-	q := u.Query()
-	q.Set(protocol.QueryOffset, r.offset.String())
-	q.Set(protocol.QueryLive, protocol.LiveModeSSE)
-	u.RawQuery = q.Encode()
-
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
-	if err != nil {
-		return fmt.Errorf("create SSE request: %w", err)
-	}
-
-	// Set Accept header for SSE
-	req.Header.Set("Accept", "text/event-stream")
-
-	resp, err := r.client.httpClient.Do(req)
-	if err != nil {
-		return fmt.Errorf("SSE request: %w", err)
-	}
-
-	// Check for errors (don't close body, we'll use it for streaming)
-	if err := r.client.checkErrorResponse(resp); err != nil {
-		resp.Body.Close()
-		return err
-	}
-
-	// Verify content type
-	if resp.Header.Get("Content-Type") != "text/event-stream" {
-		resp.Body.Close()
-		return fmt.Errorf("unexpected content type: %s", resp.Header.Get("Content-Type"))
-	}
-
-	// Create SSE connection
-	r.sseConn = newSSEConnection(resp)
-	return nil
 }
 
 // Offset returns the current offset position of the reader.
@@ -316,12 +164,13 @@ func (r *Reader) Offset() Offset {
 // Returns the reader for chaining.
 func (r *Reader) Seek(offset Offset) *Reader {
 	// Close any existing SSE connection since we're changing position
-	if r.sseConn != nil {
-		r.sseConn.Close()
-		r.sseConn = nil
+	if r.sseStream != nil {
+		r.sseStream.Close()
+		r.sseStream = nil
 	}
 	r.offset = offset
-	r.cursor = "" // Clear cursor when seeking
+	r.cursor = ""     // Clear cursor when seeking
+	r.catching = true // Reset to catch-up mode
 	return r
 }
 
@@ -334,6 +183,7 @@ func (r *Reader) SeekTail(ctx context.Context) error {
 		return err
 	}
 	r.Seek(info.NextOffset)
+	r.catching = false // Already at tail, go straight to live mode
 	return nil
 }
 
@@ -345,9 +195,9 @@ func (r *Reader) Close() error {
 
 	r.closed = true
 
-	if r.sseConn != nil {
-		r.sseConn.Close()
-		r.sseConn = nil
+	if r.sseStream != nil {
+		r.sseStream.Close()
+		r.sseStream = nil
 	}
 
 	return nil
@@ -386,7 +236,7 @@ func (r *Reader) Messages(ctx context.Context) iter.Seq2[Message, error] {
 				continue
 			}
 
-			// Parse JSON array and yield individual messages
+			// Parse JSON array and yield individual messages (Section 7.1)
 			messages, err := parseJSONMessages(result.Data)
 			if err != nil {
 				// Not valid JSON array - yield as single message
@@ -402,17 +252,13 @@ func (r *Reader) Messages(ctx context.Context) iter.Seq2[Message, error] {
 					}
 				}
 			}
-
-			// If we're up to date in catch-up mode, switch to long-poll
-			if result.UpToDate && r.mode == modeCatchUp {
-				r.LongPoll()
-			}
 		}
 	}
 }
 
 // parseJSONMessages parses a JSON array and returns individual message bytes.
 // Returns error if data is not a valid JSON array.
+// See PROTOCOL.md Section 7.1: JSON Mode.
 func parseJSONMessages(data []byte) ([][]byte, error) {
 	data = bytes.TrimSpace(data)
 	if len(data) == 0 {
@@ -435,46 +281,4 @@ func parseJSONMessages(data []byte) ([][]byte, error) {
 		messages[i] = r
 	}
 	return messages, nil
-}
-
-// Bytes returns an iterator for reading raw bytes from the stream.
-// This enables use with Go 1.22+ range-over-func:
-//
-//	for data, err := range reader.Bytes(ctx) {
-//	    if err != nil {
-//	        log.Fatal(err)
-//	    }
-//	    // Process data
-//	}
-func (r *Reader) Bytes(ctx context.Context) iter.Seq2[[]byte, error] {
-	return func(yield func([]byte, error) bool) {
-		for {
-			select {
-			case <-ctx.Done():
-				yield(nil, ctx.Err())
-				return
-			default:
-			}
-
-			result, err := r.Read(ctx)
-			if err != nil {
-				if !yield(nil, err) {
-					return
-				}
-				continue
-			}
-
-			// Yield data if available
-			if len(result.Data) > 0 {
-				if !yield(result.Data, nil) {
-					return
-				}
-			}
-
-			// If we're up to date in catch-up mode, switch to long-poll
-			if result.UpToDate && r.mode == modeCatchUp {
-				r.LongPoll()
-			}
-		}
-	}
 }

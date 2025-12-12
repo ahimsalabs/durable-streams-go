@@ -255,7 +255,7 @@ func TestHandler_POST_Append(t *testing.T) {
 				streamContentType = "application/octet-stream"
 			}
 
-			storage.Create(context.Background(), "/stream", durablestream.StreamConfig{
+			_, _ = storage.Create(context.Background(), "/stream", durablestream.StreamConfig{
 				ContentType: streamContentType,
 			})
 
@@ -295,7 +295,7 @@ func TestHandler_POST_SequenceValidation(t *testing.T) {
 	handler := durablestream.NewHandler(storage, nil)
 
 	// Create stream
-	storage.Create(context.Background(), "/stream", durablestream.StreamConfig{
+	_, _ = storage.Create(context.Background(), "/stream", durablestream.StreamConfig{
 		ContentType: "text/plain",
 	})
 
@@ -338,11 +338,11 @@ func TestHandler_GET_CatchupRead(t *testing.T) {
 	handler := durablestream.NewHandler(storage, nil)
 
 	// Create stream and append data
-	storage.Create(context.Background(), "/stream", durablestream.StreamConfig{
+	_, _ = storage.Create(context.Background(), "/stream", durablestream.StreamConfig{
 		ContentType: "text/plain",
 	})
-	storage.Append(context.Background(), "/stream", []byte("line1\n"), "")
-	storage.Append(context.Background(), "/stream", []byte("line2\n"), "")
+	_, _ = storage.Append(context.Background(), "/stream", []byte("line1\n"), "")
+	_, _ = storage.Append(context.Background(), "/stream", []byte("line2\n"), "")
 
 	tests := []struct {
 		name         string
@@ -404,13 +404,13 @@ func TestHandler_GET_JSONMode(t *testing.T) {
 	handler := durablestream.NewHandler(storage, nil)
 
 	// Create JSON stream
-	storage.Create(context.Background(), "/stream", durablestream.StreamConfig{
+	_, _ = storage.Create(context.Background(), "/stream", durablestream.StreamConfig{
 		ContentType: "application/json",
 	})
 
 	// Append JSON messages
-	storage.Append(context.Background(), "/stream", []byte(`{"event":"a"}`), "")
-	storage.Append(context.Background(), "/stream", []byte(`{"event":"b"}`), "")
+	_, _ = storage.Append(context.Background(), "/stream", []byte(`{"event":"a"}`), "")
+	_, _ = storage.Append(context.Background(), "/stream", []byte(`{"event":"b"}`), "")
 
 	req := httptest.NewRequest(http.MethodGet, "/stream?offset=0000000000", nil)
 	rec := httptest.NewRecorder()
@@ -438,7 +438,7 @@ func TestHandler_GET_LongPoll(t *testing.T) {
 	})
 
 	// Create stream
-	storage.Create(context.Background(), "/stream", durablestream.StreamConfig{
+	_, _ = storage.Create(context.Background(), "/stream", durablestream.StreamConfig{
 		ContentType: "text/plain",
 	})
 	offset, _ := storage.Append(context.Background(), "/stream", []byte("data1"), "")
@@ -478,7 +478,7 @@ func TestHandler_GET_LongPoll(t *testing.T) {
 		// Append data after a short delay
 		go func() {
 			time.Sleep(20 * time.Millisecond)
-			storage.Append(context.Background(), "/stream", []byte("data2"), "")
+			_, _ = storage.Append(context.Background(), "/stream", []byte("data2"), "")
 		}()
 
 		start := time.Now()
@@ -514,10 +514,10 @@ func TestHandler_GET_SSE(t *testing.T) {
 
 	t.Run("text content type", func(t *testing.T) {
 		// Create text stream
-		storage.Create(context.Background(), "/text-stream", durablestream.StreamConfig{
+		_, _ = storage.Create(context.Background(), "/text-stream", durablestream.StreamConfig{
 			ContentType: "text/plain",
 		})
-		storage.Append(context.Background(), "/text-stream", []byte("line1\n"), "")
+		_, _ = storage.Append(context.Background(), "/text-stream", []byte("line1\n"), "")
 
 		req := httptest.NewRequest(http.MethodGet, "/text-stream?offset=0000000000&live=sse", nil)
 		rec := httptest.NewRecorder()
@@ -548,10 +548,10 @@ func TestHandler_GET_SSE(t *testing.T) {
 
 	t.Run("JSON content type", func(t *testing.T) {
 		// Create JSON stream
-		storage.Create(context.Background(), "/json-stream", durablestream.StreamConfig{
+		_, _ = storage.Create(context.Background(), "/json-stream", durablestream.StreamConfig{
 			ContentType: "application/json",
 		})
-		storage.Append(context.Background(), "/json-stream", []byte(`{"event":"test"}`), "")
+		_, _ = storage.Append(context.Background(), "/json-stream", []byte(`{"event":"test"}`), "")
 
 		req := httptest.NewRequest(http.MethodGet, "/json-stream?offset=0000000000&live=sse", nil)
 		rec := httptest.NewRecorder()
@@ -569,7 +569,7 @@ func TestHandler_GET_SSE(t *testing.T) {
 
 	t.Run("reject incompatible content type", func(t *testing.T) {
 		// Create binary stream
-		storage.Create(context.Background(), "/binary-stream", durablestream.StreamConfig{
+		_, _ = storage.Create(context.Background(), "/binary-stream", durablestream.StreamConfig{
 			ContentType: "application/octet-stream",
 		})
 
@@ -583,7 +583,7 @@ func TestHandler_GET_SSE(t *testing.T) {
 	})
 
 	t.Run("require offset", func(t *testing.T) {
-		storage.Create(context.Background(), "/stream2", durablestream.StreamConfig{
+		_, _ = storage.Create(context.Background(), "/stream2", durablestream.StreamConfig{
 			ContentType: "text/plain",
 		})
 
@@ -602,12 +602,12 @@ func TestHandler_HEAD_Metadata(t *testing.T) {
 	handler := durablestream.NewHandler(storage, nil)
 
 	// Create stream with metadata
-	storage.Create(context.Background(), "/stream", durablestream.StreamConfig{
+	_, _ = storage.Create(context.Background(), "/stream", durablestream.StreamConfig{
 		ContentType: "application/json",
 		TTL:         3600 * time.Second,
 		ExpiresAt:   time.Now().Add(1 * time.Hour),
 	})
-	storage.Append(context.Background(), "/stream", []byte(`{"test":1}`), "")
+	_, _ = storage.Append(context.Background(), "/stream", []byte(`{"test":1}`), "")
 
 	req := httptest.NewRequest(http.MethodHead, "/stream", nil)
 	rec := httptest.NewRecorder()
@@ -649,7 +649,7 @@ func TestHandler_DELETE(t *testing.T) {
 	handler := durablestream.NewHandler(storage, nil)
 
 	// Create stream
-	storage.Create(context.Background(), "/stream", durablestream.StreamConfig{
+	_, _ = storage.Create(context.Background(), "/stream", durablestream.StreamConfig{
 		ContentType: "text/plain",
 	})
 
@@ -687,7 +687,7 @@ func TestHandler_MaxAppendSize(t *testing.T) {
 		MaxAppendSize: 100, // 100 bytes max
 	})
 
-	storage.Create(context.Background(), "/stream", durablestream.StreamConfig{
+	_, _ = storage.Create(context.Background(), "/stream", durablestream.StreamConfig{
 		ContentType: "text/plain",
 	})
 
@@ -784,7 +784,7 @@ func TestHandler_GET_InvalidParameters(t *testing.T) {
 	handler := durablestream.NewHandler(storage, nil)
 
 	// Create stream
-	storage.Create(context.Background(), "/stream", durablestream.StreamConfig{ContentType: "text/plain"})
+	_, _ = storage.Create(context.Background(), "/stream", durablestream.StreamConfig{ContentType: "text/plain"})
 
 	t.Run("duplicate offset parameter", func(t *testing.T) {
 		req := httptest.NewRequest(http.MethodGet, "/stream?offset=123&offset=456", nil)
@@ -907,7 +907,7 @@ func TestHandler_LongPoll_ContextCancellation(t *testing.T) {
 	})
 
 	// Create stream
-	storage.Create(context.Background(), "/stream", durablestream.StreamConfig{ContentType: "text/plain"})
+	_, _ = storage.Create(context.Background(), "/stream", durablestream.StreamConfig{ContentType: "text/plain"})
 	offset, _ := storage.Append(context.Background(), "/stream", []byte("data"), "")
 
 	// Use a short timeout context
@@ -931,10 +931,10 @@ func TestHandler_CacheControlHeaders(t *testing.T) {
 	handler := durablestream.NewHandler(storage, nil)
 
 	// Create stream with data
-	storage.Create(context.Background(), "/stream", durablestream.StreamConfig{
+	_, _ = storage.Create(context.Background(), "/stream", durablestream.StreamConfig{
 		ContentType: "text/plain",
 	})
-	storage.Append(context.Background(), "/stream", []byte("data"), "")
+	_, _ = storage.Append(context.Background(), "/stream", []byte("data"), "")
 
 	t.Run("catch-up read has cache control", func(t *testing.T) {
 		req := httptest.NewRequest(http.MethodGet, "/stream?offset=0000000000", nil)
@@ -977,7 +977,7 @@ func BenchmarkHandler_Append(b *testing.B) {
 	storage := memorystorage.New()
 	handler := durablestream.NewHandler(storage, nil)
 
-	storage.Create(context.Background(), "/stream", durablestream.StreamConfig{
+	_, _ = storage.Create(context.Background(), "/stream", durablestream.StreamConfig{
 		ContentType: "text/plain",
 	})
 
@@ -996,13 +996,13 @@ func BenchmarkHandler_Read(b *testing.B) {
 	storage := memorystorage.New()
 	handler := durablestream.NewHandler(storage, nil)
 
-	storage.Create(context.Background(), "/stream", durablestream.StreamConfig{
+	_, _ = storage.Create(context.Background(), "/stream", durablestream.StreamConfig{
 		ContentType: "text/plain",
 	})
 
 	// Pre-populate with data
 	for i := 0; i < 100; i++ {
-		storage.Append(context.Background(), "/stream", []byte("data"), "")
+		_, _ = storage.Append(context.Background(), "/stream", []byte("data"), "")
 	}
 
 	b.ResetTimer()
@@ -1011,6 +1011,6 @@ func BenchmarkHandler_Read(b *testing.B) {
 		rec := httptest.NewRecorder()
 		handler.ServeHTTP(rec, req)
 		// Consume body to avoid measurement skew
-		io.Copy(io.Discard, rec.Body)
+		_, _ = io.Copy(io.Discard, rec.Body)
 	}
 }

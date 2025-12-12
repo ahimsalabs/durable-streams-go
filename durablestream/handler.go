@@ -416,7 +416,7 @@ func (h *Handler) handleCatchupRead(w http.ResponseWriter, r *http.Request, stre
 	}
 
 	w.WriteHeader(http.StatusOK)
-	w.Write(responseBody)
+	_, _ = w.Write(responseBody)
 }
 
 // handleLongPoll implements long-poll reads (Section 5.6)
@@ -458,7 +458,7 @@ func (h *Handler) handleLongPoll(w http.ResponseWriter, r *http.Request, streamI
 		}
 
 		w.WriteHeader(http.StatusOK)
-		w.Write(responseBody)
+		_, _ = w.Write(responseBody)
 		return
 	}
 
@@ -527,7 +527,7 @@ func (h *Handler) handleLongPoll(w http.ResponseWriter, r *http.Request, streamI
 		}
 
 		w.WriteHeader(http.StatusOK)
-		w.Write(responseBody)
+		_, _ = w.Write(responseBody)
 
 	case <-waitCtx.Done():
 		// Timeout - return 204 No Content
@@ -709,7 +709,7 @@ func (h *Handler) handleDelete(w http.ResponseWriter, r *http.Request, streamID 
 func writeError(w http.ResponseWriter, err *protoError) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(err.Code.httpStatus())
-	json.NewEncoder(w).Encode(err)
+	_ = json.NewEncoder(w).Encode(err)
 }
 
 // writeStorageError converts a storage error to an HTTP error response.

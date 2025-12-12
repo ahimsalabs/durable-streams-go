@@ -178,49 +178,6 @@ func TestClient_ErrorHandling(t *testing.T) {
 	}
 }
 
-func TestReader_Bytes(t *testing.T) {
-	server, _, client := setupTestServer()
-	defer server.Close()
-
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-	defer cancel()
-
-	// Create stream
-	_, err := client.Create(ctx, "/stream1", &durablestream.CreateOptions{
-		ContentType: "text/plain",
-		InitialData: []byte("hello world"),
-	})
-	if err != nil {
-		t.Fatalf("create failed: %v", err)
-	}
-
-	// Create reader
-	reader := client.Reader("/stream1", durablestream.ZeroOffset)
-	defer reader.Close()
-
-	// Read bytes using iterator
-	count := 0
-	for data, err := range reader.Bytes(ctx) {
-		if err != nil {
-			t.Fatalf("unexpected error: %v", err)
-		}
-
-		if string(data) != "hello world" {
-			t.Errorf("data = %q, want %q", string(data), "hello world")
-		}
-
-		count++
-		// Break after first read to avoid long-poll timeout
-		if count >= 1 {
-			break
-		}
-	}
-
-	if count != 1 {
-		t.Errorf("read %d chunks, want 1", count)
-	}
-}
-
 func TestReader_Close(t *testing.T) {
 	server, _, client := setupTestServer()
 	defer server.Close()
