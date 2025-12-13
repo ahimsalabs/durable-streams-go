@@ -19,8 +19,8 @@ func ExampleHandler() {
 	mux := http.NewServeMux()
 	mux.Handle("/v1/stream/", http.StripPrefix("/v1/stream/", handler))
 
-	log.Println("Listening on :8080")
-	log.Fatal(http.ListenAndServe(":8080", mux))
+	log.Println("Listening on :4437")
+	log.Fatal(http.ListenAndServe(":4437", mux))
 }
 
 ```
@@ -33,7 +33,7 @@ func ExampleHandler() {
 func ExampleClient() {
 	ctx := context.Background()
 
-	client := durablestream.NewClient("http://localhost:8080/streams", nil)
+	client := durablestream.NewClient("http://localhost:4437/streams", nil)
 
 	_, err := client.Create(ctx, "events", &durablestream.CreateOptions{
 		ContentType: "application/json",
@@ -77,7 +77,7 @@ func ExampleClient() {
 func ExampleReader() {
 	ctx := context.Background()
 
-	client := durablestream.NewClient("http://localhost:8080/streams", nil)
+	client := durablestream.NewClient("http://localhost:4437/streams", nil)
 
 	// Create a reader starting from offset 0
 	reader := client.Reader("events", durablestream.ZeroOffset)
