@@ -224,7 +224,7 @@ func TestStreamWriter(t *testing.T) {
 	// Send multiple messages
 	messages := []string{"first", "second", "third"}
 	for _, msg := range messages {
-		if err := writer.Send([]byte(msg)); err != nil {
+		if err := writer.Send([]byte(msg), nil); err != nil {
 			t.Fatalf("send failed: %v", err)
 		}
 	}
@@ -254,17 +254,17 @@ func TestStreamWriter_SendWithSeq(t *testing.T) {
 	}
 
 	// Send with sequence
-	if err := writer.SendWithSeq("seq1", []byte("first")); err != nil {
+	if err := writer.Send([]byte("first"), &durablestream.SendOptions{Seq: "seq1"}); err != nil {
 		t.Fatalf("send failed: %v", err)
 	}
 
 	// Send with higher sequence
-	if err := writer.SendWithSeq("seq2", []byte("second")); err != nil {
+	if err := writer.Send([]byte("second"), &durablestream.SendOptions{Seq: "seq2"}); err != nil {
 		t.Fatalf("send failed: %v", err)
 	}
 
 	// Send with lower sequence (should fail)
-	err = writer.SendWithSeq("seq1", []byte("third"))
+	err = writer.Send([]byte("third"), &durablestream.SendOptions{Seq: "seq1"})
 	if err == nil {
 		t.Error("expected error for sequence regression")
 	}
@@ -328,7 +328,7 @@ func TestReader_ReadWithOffset(t *testing.T) {
 	if err != nil {
 		t.Fatalf("writer creation failed: %v", err)
 	}
-	if err := writer.Send([]byte("second")); err != nil {
+	if err := writer.Send([]byte("second"), nil); err != nil {
 		t.Fatalf("append failed: %v", err)
 	}
 

@@ -63,15 +63,6 @@ func TestClient_Config(t *testing.T) {
 	})
 }
 
-func TestClient_Transport(t *testing.T) {
-	client := NewClient("http://example.com", nil)
-
-	tr := client.Transport()
-	if tr == nil {
-		t.Error("Transport() should not return nil")
-	}
-}
-
 // mockStorage is a minimal storage implementation for testing handler config.
 type mockStorage struct{}
 
@@ -393,25 +384,7 @@ func TestStreamWriter_SendError(t *testing.T) {
 		contentType: "text/plain",
 	}
 
-	err := writer.Send([]byte("data"))
-	if err == nil {
-		t.Error("expected error for connection failure")
-	}
-}
-
-func TestStreamWriter_SendWithSeqError(t *testing.T) {
-	// Create a writer with invalid client config
-	client := NewClient("http://localhost:1", nil)
-
-	// Manually create a writer to bypass the Head check
-	writer := &StreamWriter{
-		client:      client,
-		ctx:         context.Background(),
-		path:        "/test",
-		contentType: "text/plain",
-	}
-
-	err := writer.SendWithSeq("seq1", []byte("data"))
+	err := writer.Send([]byte("data"), nil)
 	if err == nil {
 		t.Error("expected error for connection failure")
 	}

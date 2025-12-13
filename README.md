@@ -48,8 +48,8 @@ func ExampleClient() {
 		log.Fatal(err)
 	}
 
-	msg := []byte(`{"type":"user.created","id":123}`)
-	if err := writer.Send(msg); err != nil {
+	event := map[string]any{"type": "user.created", "id": 123}
+	if err := writer.SendJSON(event, nil); err != nil {
 		log.Fatal(err)
 	}
 	fmt.Println("Appended at offset:", writer.Offset())

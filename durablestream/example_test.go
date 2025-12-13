@@ -45,8 +45,8 @@ func ExampleClient() {
 		log.Fatal(err)
 	}
 
-	msg := []byte(`{"type":"user.created","id":123}`)
-	if err := writer.Send(msg); err != nil {
+	event := map[string]any{"type": "user.created", "id": 123}
+	if err := writer.SendJSON(event, nil); err != nil {
 		log.Fatal(err)
 	}
 	fmt.Println("Appended at offset:", writer.Offset())
@@ -107,7 +107,7 @@ func Example_fullDemo() {
 
 	// Write using Writer
 	writer, _ := client.Writer(ctx, "/mystream")
-	_ = writer.Send([]byte(`{"hello":"world"}`))
+	_ = writer.SendJSON(map[string]string{"hello": "world"}, nil)
 
 	// Read using Reader with Messages iterator
 	reader := client.Reader("/mystream", durablestream.ZeroOffset)

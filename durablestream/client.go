@@ -137,11 +137,6 @@ type TransportClientConfig struct {
 	ReadMode ReadMode
 }
 
-// Transport returns the underlying transport for advanced use cases.
-func (c *Client) Transport() transport.Transport {
-	return c.transport
-}
-
 // StreamData contains the result of a stream read operation.
 type StreamData struct {
 	Data       []byte // Raw response bytes (always populated)
@@ -264,15 +259,20 @@ func (c *Client) Writer(ctx context.Context, path string) (*StreamWriter, error)
 	}, nil
 }
 
-// Send appends a message to the stream (Section 5.2: Append to Stream).
-// Returns error if the stream is closed or the append fails.
-func (w *StreamWriter) Send(data []byte) error {
-	return w.SendWithSeq("", data)
+// SendOptions specifies options for Send and SendJSON operations.
+type SendOptions struct {
+	// Seq is an optional monotonic sequence number for writer coordination.
+	// If provided and less than or equal to the last sequence, returns ErrConflict.
+	Seq string
 }
 
-// SendWithSeq appends a message with sequence coordination (Section 5.2).
-// If seq is provided and less than or equal to the last sequence, returns ErrConflict.
-func (w *StreamWriter) SendWithSeq(seq string, data []byte) error {
+// Send appends raw bytes to the stream (Section 5.2: Append to Stream).
+func (w *StreamWriter) Send(data []byte, opts *SendOptions) error {
+	var seq string
+	if opts != nil {
+		seq = opts.Seq
+	}
+
 	resp, err := w.client.transport.Append(w.ctx, transport.AppendRequest{
 		Path:        w.path,
 		Data:        data,
@@ -285,6 +285,15 @@ func (w *StreamWriter) SendWithSeq(seq string, data []byte) error {
 
 	w.offset = Offset(resp.NextOffset)
 	return nil
+}
+
+// SendJSON marshals v as JSON and appends to the stream.
+func (w *StreamWriter) SendJSON(v any, opts *SendOptions) error {
+	data, err := json.Marshal(v)
+	if err != nil {
+		return err
+	}
+	return w.Send(data, opts)
 }
 
 // Offset returns the current tail offset after the last successful append.
