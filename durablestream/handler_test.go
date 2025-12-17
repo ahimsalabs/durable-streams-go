@@ -32,7 +32,7 @@ func TestHandler_PUT_CreateStream(t *testing.T) {
 			wantStatus:  http.StatusCreated,
 			wantHeaders: map[string]string{
 				"Content-Type":       "application/octet-stream",
-				"Stream-Next-Offset": "0000000000",
+				"Stream-Next-Offset": "0000000000000000",
 				"Location":           "http://example.com/test-stream",
 			},
 		},
@@ -359,7 +359,7 @@ func TestHandler_GET_CatchupRead(t *testing.T) {
 		},
 		{
 			name:       "read from offset",
-			offset:     "0000000000",
+			offset:     "0000000000000000",
 			wantStatus: http.StatusOK,
 		},
 	}
@@ -412,7 +412,7 @@ func TestHandler_GET_JSONMode(t *testing.T) {
 	_, _ = storage.Append(context.Background(), "/stream", []byte(`{"event":"a"}`), "")
 	_, _ = storage.Append(context.Background(), "/stream", []byte(`{"event":"b"}`), "")
 
-	req := httptest.NewRequest(http.MethodGet, "/stream?offset=0000000000", nil)
+	req := httptest.NewRequest(http.MethodGet, "/stream?offset=0000000000000000", nil)
 	rec := httptest.NewRecorder()
 	handler.ServeHTTP(rec, req)
 
@@ -444,7 +444,7 @@ func TestHandler_GET_LongPoll(t *testing.T) {
 	offset, _ := storage.Append(context.Background(), "/stream", []byte("data1"), "")
 
 	t.Run("immediate return with data", func(t *testing.T) {
-		req := httptest.NewRequest(http.MethodGet, "/stream?offset=0000000000&live=long-poll", nil)
+		req := httptest.NewRequest(http.MethodGet, "/stream?offset=0000000000000000&live=long-poll", nil)
 		rec := httptest.NewRecorder()
 		handler.ServeHTTP(rec, req)
 
@@ -519,7 +519,7 @@ func TestHandler_GET_SSE(t *testing.T) {
 		})
 		_, _ = storage.Append(context.Background(), "/text-stream", []byte("line1\n"), "")
 
-		req := httptest.NewRequest(http.MethodGet, "/text-stream?offset=0000000000&live=sse", nil)
+		req := httptest.NewRequest(http.MethodGet, "/text-stream?offset=0000000000000000&live=sse", nil)
 		rec := httptest.NewRecorder()
 
 		// Use a timeout to prevent test hanging
@@ -553,7 +553,7 @@ func TestHandler_GET_SSE(t *testing.T) {
 		})
 		_, _ = storage.Append(context.Background(), "/json-stream", []byte(`{"event":"test"}`), "")
 
-		req := httptest.NewRequest(http.MethodGet, "/json-stream?offset=0000000000&live=sse", nil)
+		req := httptest.NewRequest(http.MethodGet, "/json-stream?offset=0000000000000000&live=sse", nil)
 		rec := httptest.NewRecorder()
 
 		ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
@@ -573,7 +573,7 @@ func TestHandler_GET_SSE(t *testing.T) {
 			ContentType: "application/octet-stream",
 		})
 
-		req := httptest.NewRequest(http.MethodGet, "/binary-stream?offset=0000000000&live=sse", nil)
+		req := httptest.NewRequest(http.MethodGet, "/binary-stream?offset=0000000000000000&live=sse", nil)
 		rec := httptest.NewRecorder()
 		handler.ServeHTTP(rec, req)
 
@@ -937,7 +937,7 @@ func TestHandler_CacheControlHeaders(t *testing.T) {
 	_, _ = storage.Append(context.Background(), "/stream", []byte("data"), "")
 
 	t.Run("catch-up read has cache control", func(t *testing.T) {
-		req := httptest.NewRequest(http.MethodGet, "/stream?offset=0000000000", nil)
+		req := httptest.NewRequest(http.MethodGet, "/stream?offset=0000000000000000", nil)
 		rec := httptest.NewRecorder()
 		handler.ServeHTTP(rec, req)
 
@@ -1007,7 +1007,7 @@ func BenchmarkHandler_Read(b *testing.B) {
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		req := httptest.NewRequest(http.MethodGet, "/stream?offset=0000000000", nil)
+		req := httptest.NewRequest(http.MethodGet, "/stream?offset=0000000000000000", nil)
 		rec := httptest.NewRecorder()
 		handler.ServeHTTP(rec, req)
 		// Consume body to avoid measurement skew

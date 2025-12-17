@@ -146,7 +146,7 @@ func TestCreate(t *testing.T) {
 			t.Fatalf("append: %v", err)
 		}
 
-		result, err := s.Read(context.Background(), "test", "0000000000", 0)
+		result, err := s.Read(context.Background(), "test", "0000000000000000", 0)
 		if err != nil {
 			t.Fatalf("read: %v", err)
 		}
@@ -187,8 +187,8 @@ func TestAppend(t *testing.T) {
 		if err != nil {
 			t.Fatalf("append: %v", err)
 		}
-		if offset != "0000000001" {
-			t.Errorf("expected offset 0000000001, got %s", offset)
+		if offset != "0000000000000001" {
+			t.Errorf("expected offset 0000000000000001, got %s", offset)
 		}
 	})
 
@@ -283,8 +283,8 @@ func TestAppend(t *testing.T) {
 
 		select {
 		case offset := <-ch:
-			if offset != "0000000001" {
-				t.Errorf("expected offset 0000000001, got %s", offset)
+			if offset != "0000000000000001" {
+				t.Errorf("expected offset 0000000000000001, got %s", offset)
 			}
 		case <-time.After(100 * time.Millisecond):
 			t.Error("subscriber not notified")
@@ -302,8 +302,8 @@ func TestAppendFrom(t *testing.T) {
 		if err != nil {
 			t.Fatalf("append reader: %v", err)
 		}
-		if offset != "0000000001" {
-			t.Errorf("expected offset 0000000001, got %s", offset)
+		if offset != "0000000000000001" {
+			t.Errorf("expected offset 0000000000000001, got %s", offset)
 		}
 
 		result, _ := s.Read(context.Background(), "test", "0000000000", 0)
@@ -390,7 +390,7 @@ func TestRead(t *testing.T) {
 		_, _ = s.Append(context.Background(), "test", []byte("data"), "")
 
 		// Offset beyond current tail
-		_, err := s.Read(context.Background(), "test", "0000000099", 0)
+		_, err := s.Read(context.Background(), "test", "0000000000000063", 0)
 		if !errors.Is(err, durablestream.ErrGone) {
 			t.Errorf("expected ErrGone, got: %v", err)
 		}
@@ -439,7 +439,7 @@ func TestRead(t *testing.T) {
 		_, _ = s.Append(context.Background(), "test", []byte(`{"b":2}`), "")
 		_, _ = s.Append(context.Background(), "test", []byte(`{"c":3}`), "")
 
-		result, err := s.Read(context.Background(), "test", "0000000000", 0)
+		result, err := s.Read(context.Background(), "test", "0000000000000000", 0)
 		if err != nil {
 			t.Fatalf("read: %v", err)
 		}
@@ -467,7 +467,7 @@ func TestRead(t *testing.T) {
 		_, _ = s.Append(context.Background(), "test", []byte("second"), "")
 
 		// Read from offset 1 (after first message)
-		result, err := s.Read(context.Background(), "test", "0000000001", 0)
+		result, err := s.Read(context.Background(), "test", "0000000000000001", 0)
 		if err != nil {
 			t.Fatalf("read: %v", err)
 		}
@@ -476,15 +476,15 @@ func TestRead(t *testing.T) {
 		}
 	})
 
-	t.Run("returns gone for negative offset", func(t *testing.T) {
+	t.Run("returns bad request for invalid offset format", func(t *testing.T) {
 		s := New()
 		_, _ = s.Create(context.Background(), "test", durablestream.StreamConfig{ContentType: "text/plain"})
 		_, _ = s.Append(context.Background(), "test", []byte("data"), "")
 
-		// -2 is not a valid offset (only -1 is special)
+		// -2 is not valid hex (only -1 and empty string are special-cased)
 		_, err := s.Read(context.Background(), "test", "-2", 0)
-		if !errors.Is(err, durablestream.ErrGone) {
-			t.Errorf("expected ErrGone for negative offset, got: %v", err)
+		if !errors.Is(err, durablestream.ErrBadRequest) {
+			t.Errorf("expected ErrBadRequest for invalid offset, got: %v", err)
 		}
 	})
 }
@@ -507,7 +507,7 @@ func TestHead(t *testing.T) {
 		if info.ContentType != "application/json" {
 			t.Errorf("unexpected content type: %s", info.ContentType)
 		}
-		if info.NextOffset != "0000000001" {
+		if info.NextOffset != "0000000000000001" {
 			t.Errorf("unexpected next offset: %s", info.NextOffset)
 		}
 		if info.TTL != time.Hour {
@@ -724,10 +724,11 @@ func TestFormatOffset(t *testing.T) {
 		idx  int
 		want durablestream.Offset
 	}{
-		{0, "0000000000"},
-		{1, "0000000001"},
-		{123, "0000000123"},
-		{9999999999, "9999999999"},
+		{0, "0000000000000000"},
+		{1, "0000000000000001"},
+		{123, "000000000000007B"},
+		{255, "00000000000000FF"},
+		{65535, "000000000000FFFF"},
 	}
 
 	for _, tt := range tests {
@@ -746,11 +747,14 @@ func TestParseOffset(t *testing.T) {
 	}{
 		{"", 0, false},
 		{"-1", 0, false},
-		{"0000000000", 0, false},
-		{"0000000001", 1, false},
-		{"0000000123", 123, false},
-		{"123", 123, false}, // Without zero-padding
-		{"invalid", 0, true},
+		{"0000000000000000", 0, false},
+		{"0000000000000001", 1, false},
+		{"000000000000007B", 123, false},
+		{"7B", 123, false},    // Without zero-padding
+		{"ff", 255, false},    // Lowercase hex
+		{"FF", 255, false},    // Uppercase hex
+		{"invalid", 0, true},  // Not valid hex
+		{"GHIJKLMN", 0, true}, // Not valid hex
 	}
 
 	for _, tt := range tests {
@@ -912,7 +916,7 @@ func TestConcurrentAccess(t *testing.T) {
 
 	// Verify data integrity
 	info, _ := s.Head(context.Background(), "test")
-	if info.NextOffset != "0000001000" {
+	if info.NextOffset != "00000000000003E8" {
 		t.Errorf("expected 1000 appends, got offset %s", info.NextOffset)
 	}
 }
@@ -952,7 +956,7 @@ func TestReadJSONWithMultipleMessages(t *testing.T) {
 	}
 
 	// Read from middle
-	result, err := s.Read(context.Background(), "test", "0000000002", 0)
+	result, err := s.Read(context.Background(), "test", "0000000000000002", 0)
 	if err != nil {
 		t.Fatalf("read: %v", err)
 	}

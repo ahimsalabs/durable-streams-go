@@ -24,6 +24,27 @@ tasks:
     cmds:
       - go test -race -cover ./...
 
+  fuzz:
+    desc: Run fuzz tests (default 10s per test, use FUZZTIME=60s for longer)
+    vars:
+      FUZZTIME: '{{.FUZZTIME | default "10s"}}'
+    cmds:
+      - go test ./storage/badgerstore/... -fuzz=FuzzParseOffset -fuzztime={{.FUZZTIME}}
+      - go test ./storage/badgerstore/... -fuzz=FuzzParseFormatOffsetRoundtrip -fuzztime={{.FUZZTIME}}
+      - go test ./storage/badgerstore/... -fuzz=FuzzValidateStreamID -fuzztime={{.FUZZTIME}}
+      - go test ./storage/badgerstore/... -fuzz=FuzzContentTypesMatch -fuzztime={{.FUZZTIME}}
+      - go test ./storage/badgerstore/... -fuzz=FuzzSequenceOrdering -fuzztime={{.FUZZTIME}}
+      - go test ./storage/badgerstore/... -fuzz=FuzzStreamIDCharacters -fuzztime={{.FUZZTIME}}
+      - go test ./storage/badgerstore/... -fuzz=FuzzMultipleAppends -fuzztime={{.FUZZTIME}}
+      - go test ./storage/badgerstore/... -fuzz=FuzzStreamOperations -fuzztime={{.FUZZTIME}}
+
+  fuzz:quick:
+    desc: Run fuzz tests briefly (3s each) as smoke test
+    cmds:
+      - task: fuzz
+        vars:
+          FUZZTIME: 3s
+
   lint:
     desc: Run golangci-lint
     cmds:
@@ -126,15 +147,9 @@ tasks:
   precommit:readme:
     internal: true
     cmds:
-      - cmd: |
-          cp README.md README.md.bak
-          go run ./internal/snippet -inject README.md ./durablestream/example_test.go
-          if ! diff -q README.md README.md.bak > /dev/null 2>&1; then
-            mv README.md.bak README.md
-            echo "README.md snippets are out of date. Run 'task readme' to update."
-            exit 1
-          fi
-          rm README.md.bak
+      - cmd: go run ./internal/snippet -check -inject README.md ./durablestream/example_test.go || (echo "README.md snippets are out of date. Run 'task readme' to update." && exit 1)
+        silent: true
+      - cmd: go run ./internal/snippet -check -root . -inject storage/badgerstore/README.md ./storage/badgerstore/example_test.go || (echo "storage/badgerstore/README.md snippets are out of date. Run 'task readme' to update." && exit 1)
         silent: true
 
   # ============================================================================
@@ -154,22 +169,17 @@ tasks:
     desc: Update README.md code snippets from example files
     cmds:
       - go run ./internal/snippet -inject README.md ./durablestream/example_test.go
+      - go run ./internal/snippet -root . -inject storage/badgerstore/README.md ./storage/badgerstore/example_test.go
 
   readme:check:
     desc: Check if README.md snippets are up to date
     cmds:
-      - |
-        cp README.md README.md.bak
-        go run ./internal/snippet -inject README.md ./durablestream/example_test.go
-        if ! diff -q README.md README.md.bak > /dev/null 2>&1; then
-          mv README.md.bak README.md
-          echo "README.md snippets are out of date. Run 'task readme' to update."
-          exit 1
-        fi
-        rm README.md.bak
-        echo "README.md snippets are up to date."
+      - go run ./internal/snippet -check -inject README.md ./durablestream/example_test.go
+      - go run ./internal/snippet -check -root . -inject storage/badgerstore/README.md ./storage/badgerstore/example_test.go
+      - echo "All README snippets are up to date."
 
   readme:lint:
     desc: Check for large code blocks not covered by snippets
     cmds:
       - go run ./internal/snippet -lint README.md
+      - go run ./internal/snippet -lint storage/badgerstore/README.md

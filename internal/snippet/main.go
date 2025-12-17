@@ -8,6 +8,7 @@
 //	  -format string  Output format: simple|mdx (default: mdx)
 //	  -out string     Output file (default: stdout)
 //	  -inject string  Inject snippets into this file (e.g., README.md)
+//	  -check          With -inject, check if file is up to date (exit 1 if not)
 //	  -root string    Root directory for scoping snippet names (e.g., dir:name)
 //
 // Snippet markers in source files:
@@ -56,6 +57,7 @@ var (
 	formatFlag   = flag.String("format", "mdx", "Output format: simple|mdx")
 	outFlag      = flag.String("out", "", "Output file (default: stdout)")
 	injectFlag   = flag.String("inject", "", "Inject snippets into this file (e.g., README.md)")
+	checkFlag    = flag.Bool("check", false, "Check if -inject would change the file (exit 1 if outdated)")
 	rootFlag     = flag.String("root", "", "Root directory for scoping snippet names (e.g., dir:name)")
 	lintFlag     = flag.Bool("lint", false, "Check for large code blocks not covered by snippets")
 	lintMinLines = flag.Int("lint-min-lines", 5, "Minimum lines for lint warnings (default: 5)")
@@ -156,6 +158,19 @@ func main() {
 
 	// Inject mode: update a README file with snippets
 	if *injectFlag != "" {
+		if *checkFlag {
+			// Check mode: verify file is up to date without modifying
+			upToDate, err := checkSnippets(*injectFlag, allSnippets, *formatFlag, root)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Error checking snippets: %v\n", err)
+				os.Exit(1)
+			}
+			if !upToDate {
+				fmt.Fprintf(os.Stderr, "%s: snippets are out of date\n", *injectFlag)
+				os.Exit(1)
+			}
+			return
+		}
 		if err := injectSnippets(*injectFlag, allSnippets, *formatFlag, root); err != nil {
 			fmt.Fprintf(os.Stderr, "Error injecting snippets: %v\n", err)
 			os.Exit(1)
@@ -492,7 +507,30 @@ func lookupSnippet(snippetMap map[string]Snippet, name string) (Snippet, bool) {
 	return Snippet{}, false
 }
 
+// checkSnippets returns true if the file is up to date with the snippets.
+func checkSnippets(filename string, snippets []Snippet, format string, root string) (bool, error) {
+	original, err := os.ReadFile(filename)
+	if err != nil {
+		return false, err
+	}
+
+	updated, err := generateInjectedContent(filename, snippets, format, root)
+	if err != nil {
+		return false, err
+	}
+
+	return string(original) == updated, nil
+}
+
 func injectSnippets(filename string, snippets []Snippet, format string, root string) error {
+	updated, err := generateInjectedContent(filename, snippets, format, root)
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(filename, []byte(updated), 0o644)
+}
+
+func generateInjectedContent(filename string, snippets []Snippet, format string, root string) (string, error) {
 	// Build a map of snippets by name
 	snippetMap := make(map[string]Snippet)
 	for _, s := range snippets {
@@ -510,7 +548,7 @@ func injectSnippets(filename string, snippets []Snippet, format string, root str
 	// Read the file
 	content, err := os.ReadFile(filename)
 	if err != nil {
-		return err
+		return "", err
 	}
 
 	lines := strings.Split(string(content), "\n")
@@ -539,7 +577,7 @@ func injectSnippets(filename string, snippets []Snippet, format string, root str
 
 			fileContent, err := os.ReadFile(filePath)
 			if err != nil {
-				return fmt.Errorf("line %d: cannot read file %q: %v", i+1, matches[1], err)
+				return "", fmt.Errorf("line %d: cannot read file %q: %v", i+1, matches[1], err)
 			}
 
 			// Create a synthetic snippet for the file
@@ -584,7 +622,7 @@ func injectSnippets(filename string, snippets []Snippet, format string, root str
 		// Check for end marker
 		if matches := readmeEndPattern.FindStringSubmatch(line); matches != nil {
 			if matches[1] != currentSnippet {
-				return fmt.Errorf("mismatched README markers: expected %q, got %q", currentSnippet, matches[1])
+				return "", fmt.Errorf("mismatched README markers: expected %q, got %q", currentSnippet, matches[1])
 			}
 			result = append(result, line)
 			skipping = false
@@ -601,15 +639,14 @@ func injectSnippets(filename string, snippets []Snippet, format string, root str
 	}
 
 	if skipping {
-		return fmt.Errorf("unclosed README snippet marker %q", currentSnippet)
+		return "", fmt.Errorf("unclosed README snippet marker %q", currentSnippet)
 	}
 
 	if len(missingSnippets) > 0 {
-		return fmt.Errorf("missing snippets: %v", missingSnippets)
+		return "", fmt.Errorf("missing snippets: %v", missingSnippets)
 	}
 
-	// Write back
-	return os.WriteFile(filename, []byte(strings.Join(result, "\n")), 0o644)
+	return strings.Join(result, "\n"), nil
 }
 
 // lintReadme checks for large code blocks that aren't managed by snippets.

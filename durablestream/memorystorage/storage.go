@@ -24,7 +24,7 @@ type memoryStream struct {
 
 // Storage is an in-memory implementation of durablestream.Storage.
 // Uses hashtriemap for lock-free stream lookups with per-stream locks for mutations.
-// Offsets are zero-padded sequential strings (e.g., "0000000001", "0000000002").
+// Offsets are 16-char uppercase hex strings (e.g., "0000000000000001", "0000000000000002").
 type Storage struct {
 	streams hashtriemap.HashTrieMap[string, *memoryStream]
 }
@@ -274,24 +274,24 @@ func (m *Storage) Subscribe(ctx context.Context, streamID string, offset durable
 	return ch, nil
 }
 
-// formatOffset formats an offset index as a zero-padded string.
-// Uses 10 digits to support up to 9,999,999,999 offsets.
+// formatOffset formats an offset index as a 16-character uppercase hex string.
+// Supports full uint64 range (~18 quintillion offsets).
 func formatOffset(idx int) durablestream.Offset {
-	return durablestream.Offset(fmt.Sprintf("%010d", idx))
+	return durablestream.Offset(fmt.Sprintf("%016X", idx))
 }
 
 // parseOffset parses an offset string back to an index.
-// Special value "-1" is treated as 0 (read from start).
+// Accepts 16-char hex format. Special value "-1" or empty is treated as 0 (read from start).
 func parseOffset(offset durablestream.Offset) (int, error) {
 	if offset == "" || offset == "-1" {
 		return 0, nil
 	}
-	var idx int
-	_, err := fmt.Sscanf(string(offset), "%d", &idx)
+	var idx uint64
+	_, err := fmt.Sscanf(string(offset), "%X", &idx)
 	if err != nil {
 		return 0, fmt.Errorf("invalid offset %q: %w", offset, durablestream.ErrBadRequest)
 	}
-	return idx, nil
+	return int(idx), nil
 }
 
 // configsMatch checks if two StreamConfigs are equivalent for idempotent create.
