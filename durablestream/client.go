@@ -139,7 +139,7 @@ type TransportClientConfig struct {
 
 // StreamData contains the result of a stream read operation.
 type StreamData struct {
-	Data       []byte // Raw response bytes (always populated)
+	Data       []byte // Raw response bytes (empty on 204 timeout)
 	NextOffset Offset // Next offset to read from
 	Cursor     string // Opaque cursor for long-poll
 	UpToDate   bool   // True if caught up to tail
