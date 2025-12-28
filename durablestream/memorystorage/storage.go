@@ -17,6 +17,7 @@ import (
 type memoryStream struct {
 	mu          sync.RWMutex // Per-stream lock for mutations
 	config      durablestream.StreamConfig
+	createdAt   time.Time                     // When the stream was created
 	messages    []durablestream.StoredMessage // All messages in order
 	lastSeq     string                        // Last sequence number seen (lexicographic)
 	subscribers []chan durablestream.Offset
@@ -38,6 +39,7 @@ func New() *Storage {
 func (m *Storage) Create(ctx context.Context, streamID string, cfg durablestream.StreamConfig) (bool, error) {
 	stream := &memoryStream{
 		config:      cfg,
+		createdAt:   time.Now(),
 		messages:    make([]durablestream.StoredMessage, 0),
 		lastSeq:     "",
 		subscribers: make([]chan durablestream.Offset, 0),
@@ -45,7 +47,18 @@ func (m *Storage) Create(ctx context.Context, streamID string, cfg durablestream
 
 	existing, loaded := m.streams.LoadOrStore(streamID, stream)
 	if loaded {
-		// Stream already exists - check if config matches for idempotency
+		// Stream already exists - check expiry first
+		if isExpired(existing.config, existing.createdAt) {
+			// Expired stream - delete it and create new one
+			m.streams.Delete(streamID)
+			_, loaded = m.streams.LoadOrStore(streamID, stream)
+			if loaded {
+				// Race condition - another request recreated it first
+				return false, fmt.Errorf("stream exists with different config: %w", durablestream.ErrConflict)
+			}
+			return true, nil
+		}
+		// Stream exists and not expired - check if config matches for idempotency
 		if configsMatch(existing.config, cfg) {
 			return false, nil // Not newly created, but config matches
 		}
@@ -70,7 +83,7 @@ func (m *Storage) Append(ctx context.Context, streamID string, data []byte, seq 
 	defer stream.mu.Unlock()
 
 	// Check expiry
-	if isExpired(stream.config) {
+	if isExpired(stream.config, stream.createdAt) {
 		return "", durablestream.ErrNotFound
 	}
 
@@ -125,7 +138,7 @@ func (m *Storage) Read(ctx context.Context, streamID string, offset durablestrea
 	defer stream.mu.RUnlock()
 
 	// Check expiry
-	if isExpired(stream.config) {
+	if isExpired(stream.config, stream.createdAt) {
 		return nil, durablestream.ErrNotFound
 	}
 
@@ -195,7 +208,7 @@ func (m *Storage) Head(ctx context.Context, streamID string) (*durablestream.Str
 	defer stream.mu.RUnlock()
 
 	// Check expiry
-	if isExpired(stream.config) {
+	if isExpired(stream.config, stream.createdAt) {
 		return nil, durablestream.ErrNotFound
 	}
 
@@ -242,7 +255,7 @@ func (m *Storage) Subscribe(ctx context.Context, streamID string, offset durable
 	stream.mu.Lock()
 
 	// Check expiry
-	if isExpired(stream.config) {
+	if isExpired(stream.config, stream.createdAt) {
 		stream.mu.Unlock()
 		return nil, durablestream.ErrNotFound
 	}
@@ -310,11 +323,14 @@ func configsMatch(a, b durablestream.StreamConfig) bool {
 }
 
 // isExpired checks if a stream has expired based on its config.
-func isExpired(cfg durablestream.StreamConfig) bool {
+func isExpired(cfg durablestream.StreamConfig, createdAt time.Time) bool {
 	if !cfg.ExpiresAt.IsZero() && time.Now().After(cfg.ExpiresAt) {
 		return true
 	}
-	// TTL is checked at creation time, not on every access in this simple implementation
+	// TTL is relative to creation time
+	if cfg.TTL > 0 && time.Now().After(createdAt.Add(cfg.TTL)) {
+		return true
+	}
 	return false
 }
 

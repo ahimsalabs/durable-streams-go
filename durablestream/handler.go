@@ -180,8 +180,12 @@ func (h *Handler) handleCreate(w http.ResponseWriter, r *http.Request, streamID 
 			if protocol.IsJSONContentType(contentType) {
 				messages, err := protocol.ProcessJSONAppend(body)
 				if err != nil {
-					writeError(w, newError(codeBadRequest, err.Error()))
-					return
+					// For PUT, empty arrays are allowed (creates empty stream)
+					if !errors.Is(err, protocol.ErrEmptyArray) {
+						writeError(w, newError(codeBadRequest, err.Error()))
+						return
+					}
+					// Empty array is OK for PUT, just don't append anything
 				}
 				// Append each message
 				for _, msg := range messages {
@@ -341,8 +345,9 @@ func (h *Handler) handleRead(w http.ResponseWriter, r *http.Request, streamID st
 		writeError(w, newError(codeBadRequest, "offset cannot be empty"))
 		return
 	}
-	// Reject offsets containing invalid characters (commas, spaces, etc.)
-	if strings.ContainsAny(offsetStr, ", \t\n\r") {
+	// Reject offsets containing invalid characters
+	// Offsets should only contain printable ASCII characters (no control chars, no special URL chars)
+	if !isValidOffset(offsetStr) {
 		writeError(w, newError(codeBadRequest, "invalid offset format"))
 		return
 	}
@@ -382,6 +387,15 @@ func (h *Handler) handleCatchupRead(w http.ResponseWriter, r *http.Request, stre
 		return
 	}
 
+	// Set ETag (Section 5.5)
+	etag := fmt.Sprintf("\"%s:%s:%s\"", streamID, offset, result.NextOffset)
+
+	// Check If-None-Match for 304 Not Modified
+	if ifNoneMatch := r.Header.Get("If-None-Match"); ifNoneMatch == etag {
+		w.WriteHeader(http.StatusNotModified)
+		return
+	}
+
 	// Set headers
 	w.Header().Set("Content-Type", info.ContentType)
 	w.Header().Set(protocol.HeaderStreamNextOffset, result.NextOffset.String())
@@ -389,8 +403,6 @@ func (h *Handler) handleCatchupRead(w http.ResponseWriter, r *http.Request, stre
 	// Set Cache-Control (Section 8)
 	w.Header().Set("Cache-Control", "public, max-age=60, stale-while-revalidate=300")
 
-	// Set ETag (Section 5.5)
-	etag := fmt.Sprintf("%s:%s:%s", streamID, offset, result.NextOffset)
 	w.Header().Set("ETag", etag)
 
 	// Set Stream-Up-To-Date if at tail (Section 5.5)
@@ -413,6 +425,10 @@ func (h *Handler) handleLongPoll(w http.ResponseWriter, r *http.Request, streamI
 		return
 	}
 
+	// Generate cursor for CDN collapsing optimization
+	// Cursor is based on time interval; if client sends same cursor, we advance it
+	cursor := generateCursor(r.URL.Query().Get(protocol.QueryCursor))
+
 	// Try immediate read first
 	result, err := h.storage.Read(r.Context(), streamID, offset, h.chunkSize)
 	if err != nil {
@@ -430,6 +446,7 @@ func (h *Handler) handleLongPoll(w http.ResponseWriter, r *http.Request, streamI
 
 		w.Header().Set("Content-Type", info.ContentType)
 		w.Header().Set(protocol.HeaderStreamNextOffset, result.NextOffset.String())
+		w.Header().Set(protocol.HeaderStreamCursor, cursor)
 		w.Header().Set("Cache-Control", "public, max-age=60, stale-while-revalidate=300")
 
 		responseBody := formatResponseBody(result.Messages, info.ContentType)
@@ -488,6 +505,7 @@ func (h *Handler) handleLongPoll(w http.ResponseWriter, r *http.Request, streamI
 
 		w.Header().Set("Content-Type", info.ContentType)
 		w.Header().Set(protocol.HeaderStreamNextOffset, result.NextOffset.String())
+		w.Header().Set(protocol.HeaderStreamCursor, cursor)
 		w.Header().Set("Cache-Control", "public, max-age=60, stale-while-revalidate=300")
 
 		responseBody := formatResponseBody(result.Messages, info.ContentType)
@@ -500,7 +518,9 @@ func (h *Handler) handleLongPoll(w http.ResponseWriter, r *http.Request, streamI
 		info, err := h.storage.Head(r.Context(), streamID)
 		if err == nil {
 			w.Header().Set(protocol.HeaderStreamNextOffset, info.NextOffset.String())
+			w.Header().Set(protocol.HeaderStreamUpToDate, "true")
 		}
+		w.Header().Set(protocol.HeaderStreamCursor, cursor)
 		w.WriteHeader(http.StatusNoContent)
 	}
 }
@@ -559,6 +579,9 @@ func (h *Handler) handleSSE(w http.ResponseWriter, r *http.Request, streamID str
 			return
 		}
 
+		// Generate cursor for this response
+		sseCursor := generateCursor(cursor)
+
 		// If messages available, send them
 		if len(result.Messages) > 0 {
 			// Send data event
@@ -579,17 +602,23 @@ func (h *Handler) handleSSE(w http.ResponseWriter, r *http.Request, streamID str
 			}
 			fmt.Fprintf(w, "\n")
 
-			// Send control event with cursor if provided
+			// Send control event with cursor and upToDate status
 			fmt.Fprintf(w, "event: control\n")
-			if cursor != "" {
-				fmt.Fprintf(w, "data: {\"streamNextOffset\":\"%s\",\"streamCursor\":\"%s\"}\n\n", result.NextOffset, cursor)
+			isUpToDate := result.NextOffset.Compare(result.TailOffset) == 0
+			if isUpToDate {
+				fmt.Fprintf(w, "data: {\"streamNextOffset\":\"%s\",\"streamCursor\":\"%s\",\"upToDate\":true}\n\n", result.NextOffset, sseCursor)
 			} else {
-				fmt.Fprintf(w, "data: {\"streamNextOffset\":\"%s\"}\n\n", result.NextOffset)
+				fmt.Fprintf(w, "data: {\"streamNextOffset\":\"%s\",\"streamCursor\":\"%s\"}\n\n", result.NextOffset, sseCursor)
 			}
 
 			flusher.Flush()
 
 			currentOffset = result.NextOffset
+		} else {
+			// No messages, but we still need to send control event with upToDate
+			fmt.Fprintf(w, "event: control\n")
+			fmt.Fprintf(w, "data: {\"streamNextOffset\":\"%s\",\"streamCursor\":\"%s\",\"upToDate\":true}\n\n", result.NextOffset, sseCursor)
+			flusher.Flush()
 		}
 
 		// Check if we should close
@@ -758,4 +787,40 @@ func (l *limitedCountingReader) Read(p []byte) (n int, err error) {
 		l.exceeded = true
 	}
 	return n, err
+}
+
+// generateCursor generates a cursor for CDN collapsing optimization.
+// The cursor is based on Unix milliseconds. If clientCursor is provided and equals
+// the current time bucket, we advance to the next one to prevent cache cycles.
+func generateCursor(clientCursor string) string {
+	now := time.Now().UnixMilli()
+	cursor := strconv.FormatInt(now, 10)
+
+	// If client sent a cursor, ensure we return a strictly greater one
+	if clientCursor != "" {
+		clientVal, err := strconv.ParseInt(clientCursor, 10, 64)
+		if err == nil && clientVal >= now {
+			// Client cursor is >= current time, advance by 1
+			cursor = strconv.FormatInt(clientVal+1, 10)
+		}
+	}
+
+	return cursor
+}
+
+// isValidOffset checks if an offset string contains only valid characters.
+// Valid offsets contain only alphanumeric characters, hyphens, and underscores.
+// Control characters, whitespace, and special URL characters are rejected.
+func isValidOffset(s string) bool {
+	if s == "" {
+		return true // Empty offset is handled separately
+	}
+	for _, r := range s {
+		// Allow alphanumeric, hyphen, underscore, and period
+		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '-' || r == '_' || r == '.' {
+			continue
+		}
+		return false
+	}
+	return true
 }

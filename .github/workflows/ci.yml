@@ -23,3 +23,37 @@ jobs:
 
       - name: Run precommit checks
         run: task precommit
+
+  conformance:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      - name: Install dependencies
+        run: pnpm install
+
+      - name: Build test server
+        run: go build -o /tmp/ds-testserver ./cmd/testserver
+
+      - name: Start test server
+        run: |
+          /tmp/ds-testserver -port 4437 &
+          sleep 2
+
+      - name: Run server conformance tests
+        run: CONFORMANCE_TEST_URL=http://localhost:4437 pnpm exec vitest run --no-coverage

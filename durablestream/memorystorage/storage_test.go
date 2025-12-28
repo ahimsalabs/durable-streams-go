@@ -792,9 +792,11 @@ func TestContentTypesMatch(t *testing.T) {
 }
 
 func TestIsExpired(t *testing.T) {
+	now := time.Now()
+
 	t.Run("not expired with zero ExpiresAt", func(t *testing.T) {
 		cfg := durablestream.StreamConfig{}
-		if isExpired(cfg) {
+		if isExpired(cfg, now) {
 			t.Error("expected not expired with zero ExpiresAt")
 		}
 	})
@@ -803,7 +805,7 @@ func TestIsExpired(t *testing.T) {
 		cfg := durablestream.StreamConfig{
 			ExpiresAt: time.Now().Add(time.Hour),
 		}
-		if isExpired(cfg) {
+		if isExpired(cfg, now) {
 			t.Error("expected not expired with future ExpiresAt")
 		}
 	})
@@ -812,8 +814,27 @@ func TestIsExpired(t *testing.T) {
 		cfg := durablestream.StreamConfig{
 			ExpiresAt: time.Now().Add(-time.Hour),
 		}
-		if !isExpired(cfg) {
+		if !isExpired(cfg, now) {
 			t.Error("expected expired with past ExpiresAt")
+		}
+	})
+
+	t.Run("not expired when TTL has not passed", func(t *testing.T) {
+		cfg := durablestream.StreamConfig{
+			TTL: time.Hour,
+		}
+		if isExpired(cfg, now) {
+			t.Error("expected not expired when TTL has not passed")
+		}
+	})
+
+	t.Run("expired when TTL has passed", func(t *testing.T) {
+		cfg := durablestream.StreamConfig{
+			TTL: time.Hour,
+		}
+		createdAt := now.Add(-2 * time.Hour)
+		if !isExpired(cfg, createdAt) {
+			t.Error("expected expired when TTL has passed")
 		}
 	})
 }
