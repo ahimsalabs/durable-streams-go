@@ -1,5 +1,9 @@
-testserver
+# Built binaries
+/testserver
 durablestream.test
 API.md
 coverage.out
-snippet
+/snippet
+
+# Node.js (conformance tests)
+node_modules/
