@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -17,17 +18,22 @@ import (
 
 // Command represents a test command from the runner
 type Command struct {
-	Type        string      `json:"type"`
-	ServerURL   string      `json:"serverUrl,omitempty"`
-	Path        string      `json:"path,omitempty"`
-	ContentType string      `json:"contentType,omitempty"`
-	Data        string      `json:"data,omitempty"`
-	Binary      bool        `json:"binary,omitempty"`
-	Seq         interface{} `json:"seq,omitempty"` // can be string or int
-	Offset      string      `json:"offset,omitempty"`
-	Live        interface{} `json:"live,omitempty"` // can be string "long-poll", "sse" or bool false
-	TimeoutMs   int         `json:"timeoutMs,omitempty"`
-	TTL         int         `json:"ttl,omitempty"`
+	Type            string            `json:"type"`
+	ServerURL       string            `json:"serverUrl,omitempty"`
+	Path            string            `json:"path,omitempty"`
+	ContentType     string            `json:"contentType,omitempty"`
+	Data            string            `json:"data,omitempty"`
+	Binary          bool              `json:"binary,omitempty"`
+	Seq             interface{}       `json:"seq,omitempty"` // can be string or int
+	Offset          string            `json:"offset,omitempty"`
+	Live            interface{}       `json:"live,omitempty"` // can be string "long-poll", "sse" or bool false
+	TimeoutMs       int               `json:"timeoutMs,omitempty"`
+	TTL             int               `json:"ttl,omitempty"`
+	WaitForUpToDate bool              `json:"waitForUpToDate,omitempty"`
+	Headers         map[string]string `json:"headers,omitempty"`
+	Name            string            `json:"name,omitempty"`
+	ValueType       string            `json:"valueType,omitempty"`
+	InitialValue    string            `json:"initialValue,omitempty"`
 }
 
 // getLiveMode returns the live mode as a string
@@ -58,19 +64,21 @@ func (c *Command) getSeq() string {
 
 // Result represents a test result sent back to the runner
 type Result struct {
-	Type          string    `json:"type"`
-	Success       bool      `json:"success"`
-	CommandType   string    `json:"commandType,omitempty"`
-	Status        int       `json:"status,omitempty"`
-	Offset        string    `json:"offset,omitempty"`
-	Chunks        []Chunk   `json:"chunks"`
-	UpToDate      bool      `json:"upToDate,omitempty"`
-	ContentType   string    `json:"contentType,omitempty"`
-	ErrorCode     string    `json:"errorCode,omitempty"`
-	Message       string    `json:"message,omitempty"`
-	ClientName    string    `json:"clientName,omitempty"`
-	ClientVersion string    `json:"clientVersion,omitempty"`
-	Features      *Features `json:"features,omitempty"`
+	Type          string            `json:"type"`
+	Success       bool              `json:"success"`
+	CommandType   string            `json:"commandType,omitempty"`
+	Status        int               `json:"status,omitempty"`
+	Offset        string            `json:"offset,omitempty"`
+	Chunks        []Chunk           `json:"chunks"`
+	UpToDate      bool              `json:"upToDate,omitempty"`
+	ContentType   string            `json:"contentType,omitempty"`
+	ErrorCode     string            `json:"errorCode,omitempty"`
+	Message       string            `json:"message,omitempty"`
+	ClientName    string            `json:"clientName,omitempty"`
+	ClientVersion string            `json:"clientVersion,omitempty"`
+	Features      *Features         `json:"features,omitempty"`
+	HeadersSent   map[string]string `json:"headersSent,omitempty"`
+	ParamsSent    map[string]string `json:"paramsSent,omitempty"`
 }
 
 type Chunk struct {
@@ -79,13 +87,75 @@ type Chunk struct {
 }
 
 type Features struct {
-	Batching bool `json:"batching"`
-	SSE      bool `json:"sse"`
-	LongPoll bool `json:"longPoll"`
+	Batching       bool `json:"batching"`
+	SSE            bool `json:"sse"`
+	LongPoll       bool `json:"longPoll"`
+	DynamicHeaders bool `json:"dynamicHeaders"`
 }
 
 var globalServerURL string
 var globalClient *durablestream.Client
+
+// DynamicValue represents a dynamic header/param value
+type DynamicValue struct {
+	Type       string // "counter", "timestamp", "token"
+	Counter    int
+	TokenValue string
+}
+
+var (
+	dynamicHeaders = make(map[string]*DynamicValue)
+	dynamicParams  = make(map[string]*DynamicValue)
+)
+
+// Cache of BatchedWriters per stream path for auto-batching
+var batchedWriters = make(map[string]*durablestream.BatchedWriter)
+
+// getBatchedWriter returns a cached BatchedWriter for the given path.
+// Creates a new one if it doesn't exist.
+func getBatchedWriter(ctx context.Context, path string) (*durablestream.BatchedWriter, error) {
+	if bw, ok := batchedWriters[path]; ok {
+		return bw, nil
+	}
+	bw, err := globalClient.BatchedWriter(ctx, path)
+	if err != nil {
+		return nil, err
+	}
+	batchedWriters[path] = bw
+	return bw, nil
+}
+
+// resolveDynamicHeaders evaluates all dynamic headers and returns the values
+func resolveDynamicHeaders() map[string]string {
+	result := make(map[string]string)
+	for name, dv := range dynamicHeaders {
+		switch dv.Type {
+		case "counter":
+			dv.Counter++
+			result[name] = strconv.Itoa(dv.Counter)
+		case "timestamp":
+			result[name] = strconv.FormatInt(time.Now().UnixMilli(), 10)
+		case "token":
+			result[name] = dv.TokenValue
+		}
+	}
+	return result
+}
+
+// resolveDynamicParams evaluates all dynamic params and returns the values
+func resolveDynamicParams() map[string]string {
+	result := make(map[string]string)
+	for name, dv := range dynamicParams {
+		switch dv.Type {
+		case "counter":
+			dv.Counter++
+			result[name] = strconv.Itoa(dv.Counter)
+		case "timestamp":
+			result[name] = strconv.FormatInt(time.Now().UnixMilli(), 10)
+		}
+	}
+	return result
+}
 
 func main() {
 	scanner := bufio.NewScanner(os.Stdin)
@@ -108,6 +178,11 @@ func main() {
 		if cmd.Type == "init" {
 			globalServerURL = cmd.ServerURL
 			globalClient = durablestream.NewClient(globalServerURL, nil)
+			// Reset dynamic headers/params on init
+			dynamicHeaders = make(map[string]*DynamicValue)
+			dynamicParams = make(map[string]*DynamicValue)
+			// Reset batched writers cache
+			batchedWriters = make(map[string]*durablestream.BatchedWriter)
 		}
 
 		result := handleCommand(cmd)
@@ -138,9 +213,10 @@ func handleCommand(cmd Command) Result {
 			ClientVersion: "0.1.0",
 			Chunks:        []Chunk{},
 			Features: &Features{
-				Batching: false,
-				SSE:      true,
-				LongPoll: true,
+				Batching:       true,
+				SSE:            true,
+				LongPoll:       true,
+				DynamicHeaders: true,
 			},
 		}
 
@@ -186,10 +262,9 @@ func handleCommand(cmd Command) Result {
 		if globalClient == nil {
 			return errorResult("append", "INTERNAL_ERROR", "client not initialized")
 		}
-		writer, err := globalClient.Writer(ctx, cmd.Path)
-		if err != nil {
-			return mapError("append", err)
-		}
+
+		// Resolve dynamic headers/params
+		headersSent := resolveDynamicHeaders()
 
 		var opts *durablestream.SendOptions
 		seq := cmd.getSeq()
@@ -199,6 +274,7 @@ func handleCommand(cmd Command) Result {
 
 		// Decode base64 if binary flag is set
 		var data []byte
+		var err error
 		if cmd.Binary {
 			data, err = base64.StdEncoding.DecodeString(cmd.Data)
 			if err != nil {
@@ -208,33 +284,70 @@ func handleCommand(cmd Command) Result {
 			data = []byte(cmd.Data)
 		}
 
-		if err := writer.Send(data, opts); err != nil {
-			// Empty append returns a specific error with status 400
-			if strings.Contains(err.Error(), "empty") {
-				return Result{
-					Type:        "error",
-					Success:     false,
-					CommandType: "append",
-					Status:      400,
-					ErrorCode:   "BAD_REQUEST",
-					Message:     err.Error(),
-					Chunks:      []Chunk{},
+		// Use regular Writer with retry logic for appends
+		// BatchedWriter is available for explicit batching scenarios
+		maxRetries := 3
+		var lastErr error
+		for i := 0; i < maxRetries; i++ {
+			writer, err := globalClient.Writer(ctx, cmd.Path)
+			if err != nil {
+				var tErr *transport.Error
+				if errors.As(err, &tErr) {
+					if tErr.StatusCode == 500 || tErr.StatusCode == 503 || tErr.StatusCode == 429 {
+						lastErr = err
+						time.Sleep(10 * time.Millisecond)
+						continue
+					}
 				}
+				return mapError("append", err)
 			}
-			return mapError("append", err)
+
+			if err := writer.Send(data, opts); err != nil {
+				if strings.Contains(err.Error(), "empty") {
+					return Result{
+						Type:        "error",
+						Success:     false,
+						CommandType: "append",
+						Status:      400,
+						ErrorCode:   "BAD_REQUEST",
+						Message:     err.Error(),
+						Chunks:      []Chunk{},
+					}
+				}
+				var tErr *transport.Error
+				if errors.As(err, &tErr) {
+					if tErr.StatusCode == 500 || tErr.StatusCode == 503 || tErr.StatusCode == 429 {
+						lastErr = err
+						time.Sleep(10 * time.Millisecond)
+						continue
+					}
+				}
+				return mapError("append", err)
+			}
+
+			// Success
+			result := Result{
+				Type:    "append",
+				Success: true,
+				Status:  200,
+				Offset:  string(writer.Offset()),
+				Chunks:  []Chunk{},
+			}
+			if len(headersSent) > 0 {
+				result.HeadersSent = headersSent
+			}
+			return result
 		}
-		return Result{
-			Type:    "append",
-			Success: true,
-			Status:  200,
-			Offset:  string(writer.Offset()),
-			Chunks:  []Chunk{},
-		}
+		return mapError("append", lastErr)
 
 	case "read":
 		if globalClient == nil {
 			return errorResult("read", "INTERNAL_ERROR", "client not initialized")
 		}
+
+		// Resolve dynamic headers/params
+		headersSent := resolveDynamicHeaders()
+		paramsSent := resolveDynamicParams()
 
 		// Determine read mode
 		var readMode durablestream.ReadMode
@@ -256,27 +369,63 @@ func handleCommand(cmd Command) Result {
 		reader := readClient.Reader(cmd.Path, durablestream.Offset(cmd.Offset))
 		defer reader.Close()
 
-		result, err := reader.Read(ctx)
-		if err != nil {
-			return mapError("read", err)
-		}
-
+		// Loop pattern from reference implementation:
+		// Keep reading until timeout or reach end of stream (non-live mode)
 		chunks := []Chunk{}
-		if len(result.Data) > 0 {
-			chunks = append(chunks, Chunk{
-				Data:   string(result.Data),
-				Offset: string(result.NextOffset),
-			})
+		var finalOffset string
+		var upToDate bool
+		maxChunks := 100 // Reasonable limit to prevent infinite loops
+
+		for len(chunks) < maxChunks {
+			readResult, err := reader.Read(ctx)
+			if err != nil {
+				// Context deadline/cancellation means we've caught up with no new data
+				if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
+					upToDate = true
+					break
+				}
+				return mapError("read", err)
+			}
+
+			if len(readResult.Data) > 0 {
+				chunks = append(chunks, Chunk{
+					Data:   string(readResult.Data),
+					Offset: string(readResult.NextOffset),
+				})
+			}
+
+			finalOffset = string(readResult.NextOffset)
+			upToDate = readResult.UpToDate
+
+			// For waitForUpToDate, stop when we've reached up-to-date
+			if cmd.WaitForUpToDate && readResult.UpToDate {
+				break
+			}
+
+			// In non-live mode, stop when caught up
+			if liveMode == "" && readResult.UpToDate {
+				break
+			}
+
+			// In live mode, keep reading until timeout (controlled by context)
+			// The Reader's long-poll/SSE will block waiting for new data
 		}
 
-		return Result{
+		result := Result{
 			Type:     "read",
 			Success:  true,
 			Status:   200,
 			Chunks:   chunks,
-			Offset:   string(result.NextOffset),
-			UpToDate: result.UpToDate,
+			Offset:   finalOffset,
+			UpToDate: upToDate,
 		}
+		if len(headersSent) > 0 {
+			result.HeadersSent = headersSent
+		}
+		if len(paramsSent) > 0 {
+			result.ParamsSent = paramsSent
+		}
+		return result
 
 	case "head":
 		if globalClient == nil {
@@ -302,6 +451,8 @@ func handleCommand(cmd Command) Result {
 		if err := globalClient.Delete(ctx, cmd.Path); err != nil {
 			return mapError("delete", err)
 		}
+		// Invalidate cached BatchedWriter for this path
+		delete(batchedWriters, cmd.Path)
 		return Result{
 			Type:    "delete",
 			Success: true,
@@ -328,6 +479,38 @@ func handleCommand(cmd Command) Result {
 	case "shutdown":
 		return Result{
 			Type:    "shutdown",
+			Success: true,
+			Chunks:  []Chunk{},
+		}
+
+	case "set-dynamic-header":
+		dynamicHeaders[cmd.Name] = &DynamicValue{
+			Type:       cmd.ValueType,
+			Counter:    0,
+			TokenValue: cmd.InitialValue,
+		}
+		return Result{
+			Type:    "set-dynamic-header",
+			Success: true,
+			Chunks:  []Chunk{},
+		}
+
+	case "set-dynamic-param":
+		dynamicParams[cmd.Name] = &DynamicValue{
+			Type:    cmd.ValueType,
+			Counter: 0,
+		}
+		return Result{
+			Type:    "set-dynamic-param",
+			Success: true,
+			Chunks:  []Chunk{},
+		}
+
+	case "clear-dynamic":
+		dynamicHeaders = make(map[string]*DynamicValue)
+		dynamicParams = make(map[string]*DynamicValue)
+		return Result{
+			Type:    "clear-dynamic",
 			Success: true,
 			Chunks:  []Chunk{},
 		}
