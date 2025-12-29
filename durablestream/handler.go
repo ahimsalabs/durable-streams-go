@@ -346,7 +346,7 @@ func (h *Handler) handleRead(w http.ResponseWriter, r *http.Request, streamID st
 		return
 	}
 	// Reject offsets containing invalid characters
-	// Offsets should only contain printable ASCII characters (no control chars, no special URL chars)
+	// Offsets should only contain alphanumeric characters, hyphens, underscores, and periods
 	if !isValidOffset(offsetStr) {
 		writeError(w, newError(codeBadRequest, "invalid offset format"))
 		return

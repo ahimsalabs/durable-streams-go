@@ -265,7 +265,7 @@ func (t *HTTPTransport) SSE(ctx context.Context, req SSERequest) (EventStream, e
 func (t *HTTPTransport) Append(ctx context.Context, req AppendRequest) (*AppendResponse, error) {
 	// Reject empty body (Section 5.2)
 	if len(req.Data) == 0 {
-		return nil, fmt.Errorf("empty append not allowed")
+		return nil, &Error{Code: "BAD_REQUEST", Message: "empty append not allowed", StatusCode: 400}
 	}
 
 	u, err := t.buildURL(req.Path)

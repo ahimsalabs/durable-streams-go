@@ -45,7 +45,7 @@ jobs:
           version: 10
 
       - name: Install dependencies
-        run: pnpm install
+        run: pnpm install --frozen-lockfile
 
       - name: Build test server
         run: go build -o /tmp/ds-testserver ./cmd/testserver
@@ -53,7 +53,10 @@ jobs:
       - name: Start test server
         run: |
           /tmp/ds-testserver -port 4437 &
-          sleep 2
+          for i in {1..30}; do
+            curl -s http://localhost:4437 >/dev/null && break
+            sleep 0.1
+          done
 
       - name: Run server conformance tests
         run: CONFORMANCE_TEST_URL=http://localhost:4437 pnpm exec vitest run --no-coverage

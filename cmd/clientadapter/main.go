@@ -237,7 +237,15 @@ func handleCommand(cmd Command) Result {
 			opts.TTL = time.Duration(cmd.TTL) * time.Second
 		}
 		if cmd.Data != "" {
-			opts.InitialData = []byte(cmd.Data)
+			if cmd.Binary {
+				decoded, err := base64.StdEncoding.DecodeString(cmd.Data)
+				if err != nil {
+					return errorResult("create", "BAD_REQUEST", "invalid base64 data: "+err.Error())
+				}
+				opts.InitialData = decoded
+			} else {
+				opts.InitialData = []byte(cmd.Data)
+			}
 		}
 
 		info, err := globalClient.Create(ctx, cmd.Path, opts)
@@ -303,7 +311,7 @@ func handleCommand(cmd Command) Result {
 			}
 
 			if err := writer.Send(data, opts); err != nil {
-				if strings.Contains(err.Error(), "empty") {
+				if errors.Is(err, durablestream.ErrBadRequest) {
 					return Result{
 						Type:        "error",
 						Success:     false,
