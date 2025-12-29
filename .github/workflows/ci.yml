@@ -57,3 +57,9 @@ jobs:
 
       - name: Run server conformance tests
         run: CONFORMANCE_TEST_URL=http://localhost:4437 pnpm exec vitest run --no-coverage
+
+      - name: Build client adapter
+        run: go build -o /tmp/clientadapter ./cmd/clientadapter
+
+      - name: Run client conformance tests
+        run: npx @durable-streams/client-conformance-tests --run /tmp/clientadapter

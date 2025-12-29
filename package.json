@@ -3,7 +3,8 @@
   "version": "1.0.0",
   "private": true,
   "scripts": {
-    "test:conformance": "vitest run --no-coverage"
+    "test:conformance": "vitest run --no-coverage",
+    "test:conformance:client": "go build -o /tmp/clientadapter ./cmd/clientadapter && npx @durable-streams/client-conformance-tests --run /tmp/clientadapter"
   },
   "devDependencies": {
     "@durable-streams/client-conformance-tests": "^0.1.4",
