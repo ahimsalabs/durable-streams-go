@@ -9,6 +9,94 @@ import (
 	"time"
 )
 
+func TestReader_OffsetNow_LongPollSkipsCatchup(t *testing.T) {
+	storage := newTestStorage()
+	handler := NewHandler(storage, &HandlerConfig{LongPollTimeout: 100 * time.Millisecond})
+	server := httptest.NewServer(handler)
+	defer server.Close()
+
+	ctx := context.Background()
+
+	// Create empty stream
+	_, _ = storage.Create(ctx, "/nowtest", StreamConfig{ContentType: "text/plain"})
+
+	t.Run("offset=now with long-poll mode skips catch-up", func(t *testing.T) {
+		// Create client with explicit long-poll mode
+		client := NewClient(server.URL, &ClientConfig{ReadMode: ReadModeLongPoll})
+		reader := client.Reader("/nowtest", Offset("now"))
+		defer reader.Close()
+
+		// Per protocol spec Section 6, for offset=now with long-poll:
+		// "Servers MUST immediately begin waiting for new data (no initial empty response)"
+		// Reader should skip catch-up phase and go directly to long-poll
+
+		// The reader should NOT be in catch-up mode
+		if reader.catching {
+			t.Error("expected reader to skip catch-up for offset=now with long-poll mode")
+		}
+
+		// Reading should trigger long-poll which times out with 204
+		start := time.Now()
+		result, err := reader.Read(ctx)
+		duration := time.Since(start)
+
+		if err != nil {
+			t.Fatalf("read failed: %v", err)
+		}
+
+		// Should have waited for the long-poll timeout
+		if duration < 80*time.Millisecond {
+			t.Errorf("expected long-poll to wait for timeout, returned in %v", duration)
+		}
+
+		// Should be up to date after timeout
+		if !result.UpToDate {
+			t.Error("expected UpToDate to be true after long-poll timeout")
+		}
+
+		// Should have empty data (no new messages arrived)
+		if len(result.Data) > 0 {
+			t.Errorf("expected empty data, got %q", string(result.Data))
+		}
+	})
+
+	t.Run("offset=now with auto mode also skips catch-up", func(t *testing.T) {
+		// Auto mode should also skip catch-up for offset=now
+		client := NewClient(server.URL, &ClientConfig{ReadMode: ReadModeAuto})
+		reader := client.Reader("/nowtest", Offset("now"))
+		defer reader.Close()
+
+		// Reader should NOT be in catch-up mode
+		if reader.catching {
+			t.Error("expected reader to skip catch-up for offset=now with auto mode")
+		}
+	})
+
+	t.Run("regular offset still uses catch-up", func(t *testing.T) {
+		// Regular offsets should still use catch-up
+		client := NewClient(server.URL, &ClientConfig{ReadMode: ReadModeLongPoll})
+		reader := client.Reader("/nowtest", ZeroOffset)
+		defer reader.Close()
+
+		// Reader SHOULD be in catch-up mode for regular offsets
+		if !reader.catching {
+			t.Error("expected reader to use catch-up for regular offset")
+		}
+	})
+
+	t.Run("offset=now with SSE mode uses catch-up", func(t *testing.T) {
+		// SSE mode should still use catch-up (SSE handles offset=now differently)
+		client := NewClient(server.URL, &ClientConfig{ReadMode: ReadModeSSE})
+		reader := client.Reader("/nowtest", Offset("now"))
+		defer reader.Close()
+
+		// Reader SHOULD be in catch-up mode for SSE mode
+		if !reader.catching {
+			t.Error("expected reader to use catch-up for SSE mode with offset=now")
+		}
+	})
+}
+
 func TestReader_Offset(t *testing.T) {
 	server, _, client := setupInternalTestServer()
 	defer server.Close()

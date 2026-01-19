@@ -56,7 +56,7 @@ func TestHandler_PUT_CreateStream(t *testing.T) {
 			name:        "create with Expires-At",
 			contentType: "text/plain",
 			headers: map[string]string{
-				"Stream-Expires-At": "2026-01-15T12:00:00Z",
+				"Stream-Expires-At": "2027-01-15T12:00:00Z",
 			},
 			wantStatus: http.StatusCreated,
 		},
@@ -65,7 +65,7 @@ func TestHandler_PUT_CreateStream(t *testing.T) {
 			contentType: "text/plain",
 			headers: map[string]string{
 				"Stream-TTL":        "3600",
-				"Stream-Expires-At": "2026-01-15T12:00:00Z",
+				"Stream-Expires-At": "2027-01-15T12:00:00Z",
 			},
 			wantStatus:  http.StatusBadRequest,
 			wantErrCode: "bad_request",
@@ -954,6 +954,260 @@ func TestHandler_CacheControlHeaders(t *testing.T) {
 
 		if rec.Header().Get("Cache-Control") != "no-store" {
 			t.Errorf("Cache-Control = %q, want no-store", rec.Header().Get("Cache-Control"))
+		}
+	})
+}
+
+func TestHandler_GET_OffsetNow(t *testing.T) {
+	t.Run("catch-up read JSON stream", func(t *testing.T) {
+		storage := memorystorage.New()
+		handler := durablestream.NewHandler(storage, nil)
+
+		// Create JSON stream with some data
+		_, _ = storage.Create(context.Background(), "/json-stream", durablestream.StreamConfig{
+			ContentType: "application/json",
+		})
+		tailOffset, _ := storage.Append(context.Background(), "/json-stream", []byte(`{"event":"test"}`), "")
+
+		// Read with offset=now
+		req := httptest.NewRequest(http.MethodGet, "/json-stream?offset=now", nil)
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusOK {
+			t.Errorf("status = %d, want %d. Body: %s", rec.Code, http.StatusOK, rec.Body.String())
+		}
+
+		// Should return empty JSON array
+		if body := rec.Body.String(); body != "[]" {
+			t.Errorf("body = %q, want []", body)
+		}
+
+		// Should have tail offset
+		nextOffset := rec.Header().Get(protocol.HeaderStreamNextOffset)
+		if nextOffset != tailOffset.String() {
+			t.Errorf("Stream-Next-Offset = %q, want %q", nextOffset, tailOffset.String())
+		}
+
+		// Should be up-to-date
+		if rec.Header().Get(protocol.HeaderStreamUpToDate) != "true" {
+			t.Errorf("Stream-Up-To-Date = %q, want true", rec.Header().Get(protocol.HeaderStreamUpToDate))
+		}
+
+		// Should have no-store cache control
+		if rec.Header().Get("Cache-Control") != "no-store" {
+			t.Errorf("Cache-Control = %q, want no-store", rec.Header().Get("Cache-Control"))
+		}
+	})
+
+	t.Run("catch-up read non-JSON stream", func(t *testing.T) {
+		storage := memorystorage.New()
+		handler := durablestream.NewHandler(storage, nil)
+
+		// Create text stream with some data
+		_, _ = storage.Create(context.Background(), "/text-stream", durablestream.StreamConfig{
+			ContentType: "text/plain",
+		})
+		tailOffset, _ := storage.Append(context.Background(), "/text-stream", []byte("hello world"), "")
+
+		// Read with offset=now
+		req := httptest.NewRequest(http.MethodGet, "/text-stream?offset=now", nil)
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusOK {
+			t.Errorf("status = %d, want %d", rec.Code, http.StatusOK)
+		}
+
+		// Should return empty body
+		if body := rec.Body.String(); body != "" {
+			t.Errorf("body = %q, want empty", body)
+		}
+
+		// Should have tail offset
+		if rec.Header().Get(protocol.HeaderStreamNextOffset) != tailOffset.String() {
+			t.Errorf("Stream-Next-Offset = %q, want %q", rec.Header().Get(protocol.HeaderStreamNextOffset), tailOffset.String())
+		}
+	})
+
+	t.Run("catch-up read empty stream", func(t *testing.T) {
+		storage := memorystorage.New()
+		handler := durablestream.NewHandler(storage, nil)
+
+		// Create empty stream
+		_, _ = storage.Create(context.Background(), "/empty-stream", durablestream.StreamConfig{
+			ContentType: "application/json",
+		})
+
+		// Read with offset=now
+		req := httptest.NewRequest(http.MethodGet, "/empty-stream?offset=now", nil)
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusOK {
+			t.Errorf("status = %d, want %d", rec.Code, http.StatusOK)
+		}
+
+		// Should return empty JSON array
+		if body := rec.Body.String(); body != "[]" {
+			t.Errorf("body = %q, want []", body)
+		}
+	})
+
+	t.Run("long-poll waits with offset=now", func(t *testing.T) {
+		storage := memorystorage.New()
+		handler := durablestream.NewHandler(storage, &durablestream.HandlerConfig{
+			LongPollTimeout: 100 * time.Millisecond,
+		})
+
+		// Create stream with some existing data
+		_, _ = storage.Create(context.Background(), "/stream", durablestream.StreamConfig{
+			ContentType: "text/plain",
+		})
+		_, _ = storage.Append(context.Background(), "/stream", []byte("existing"), "")
+
+		// Long-poll with offset=now should wait (not return existing data)
+		req := httptest.NewRequest(http.MethodGet, "/stream?offset=now&live=long-poll", nil)
+		rec := httptest.NewRecorder()
+
+		start := time.Now()
+		handler.ServeHTTP(rec, req)
+		duration := time.Since(start)
+
+		// Should timeout with 204 (not return immediately with existing data)
+		if rec.Code != http.StatusNoContent {
+			t.Errorf("status = %d, want %d", rec.Code, http.StatusNoContent)
+		}
+
+		// Should have waited for timeout
+		if duration < 50*time.Millisecond {
+			t.Errorf("returned too quickly: %v, expected to wait", duration)
+		}
+	})
+
+	t.Run("long-poll returns new data with offset=now", func(t *testing.T) {
+		storage := memorystorage.New()
+		handler := durablestream.NewHandler(storage, &durablestream.HandlerConfig{
+			LongPollTimeout: 500 * time.Millisecond,
+		})
+
+		// Create stream
+		_, _ = storage.Create(context.Background(), "/stream", durablestream.StreamConfig{
+			ContentType: "text/plain",
+		})
+
+		// Append new data after a short delay
+		go func() {
+			time.Sleep(50 * time.Millisecond)
+			_, _ = storage.Append(context.Background(), "/stream", []byte("new data"), "")
+		}()
+
+		// Long-poll with offset=now
+		req := httptest.NewRequest(http.MethodGet, "/stream?offset=now&live=long-poll", nil)
+		rec := httptest.NewRecorder()
+
+		start := time.Now()
+		handler.ServeHTTP(rec, req)
+		duration := time.Since(start)
+
+		// Should return 200 with data
+		if rec.Code != http.StatusOK {
+			t.Errorf("status = %d, want %d", rec.Code, http.StatusOK)
+		}
+
+		// Should return quickly after data arrives
+		if duration > 200*time.Millisecond {
+			t.Errorf("returned too slowly: %v", duration)
+		}
+
+		// Should contain new data
+		if !strings.Contains(rec.Body.String(), "new data") {
+			t.Errorf("body = %q, want to contain 'new data'", rec.Body.String())
+		}
+	})
+
+	t.Run("SSE sends initial control event with offset=now", func(t *testing.T) {
+		storage := memorystorage.New()
+		handler := durablestream.NewHandler(storage, &durablestream.HandlerConfig{
+			SSECloseAfter: 100 * time.Millisecond,
+		})
+
+		// Create stream
+		_, _ = storage.Create(context.Background(), "/stream", durablestream.StreamConfig{
+			ContentType: "text/plain",
+		})
+		tailOffset, _ := storage.Append(context.Background(), "/stream", []byte("existing"), "")
+
+		// SSE with offset=now
+		req := httptest.NewRequest(http.MethodGet, "/stream?offset=now&live=sse", nil)
+		rec := httptest.NewRecorder()
+
+		ctx, cancel := context.WithTimeout(context.Background(), 150*time.Millisecond)
+		defer cancel()
+		req = req.WithContext(ctx)
+
+		handler.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusOK {
+			t.Errorf("status = %d, want %d", rec.Code, http.StatusOK)
+		}
+
+		body := rec.Body.String()
+
+		// Should contain initial control event with upToDate
+		if !strings.Contains(body, "event: control") {
+			t.Errorf("SSE response missing control event: %s", body)
+		}
+		if !strings.Contains(body, "upToDate") {
+			t.Errorf("SSE response missing upToDate in control event: %s", body)
+		}
+		if !strings.Contains(body, tailOffset.String()) {
+			t.Errorf("SSE response missing tail offset %q: %s", tailOffset.String(), body)
+		}
+
+		// Should NOT contain data event (we skipped existing data)
+		if strings.Contains(body, "existing") {
+			t.Errorf("SSE response should not contain existing data: %s", body)
+		}
+	})
+
+	t.Run("offset=now on non-existent stream returns 404", func(t *testing.T) {
+		storage := memorystorage.New()
+		handler := durablestream.NewHandler(storage, nil)
+
+		// Try catch-up read
+		req := httptest.NewRequest(http.MethodGet, "/nonexistent?offset=now", nil)
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusNotFound {
+			t.Errorf("catch-up status = %d, want %d", rec.Code, http.StatusNotFound)
+		}
+	})
+
+	t.Run("offset=now with long-poll on non-existent stream returns 404", func(t *testing.T) {
+		storage := memorystorage.New()
+		handler := durablestream.NewHandler(storage, nil)
+
+		req := httptest.NewRequest(http.MethodGet, "/nonexistent?offset=now&live=long-poll", nil)
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusNotFound {
+			t.Errorf("long-poll status = %d, want %d", rec.Code, http.StatusNotFound)
+		}
+	})
+
+	t.Run("offset=now with SSE on non-existent stream returns 404", func(t *testing.T) {
+		storage := memorystorage.New()
+		handler := durablestream.NewHandler(storage, nil)
+
+		req := httptest.NewRequest(http.MethodGet, "/nonexistent?offset=now&live=sse", nil)
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusNotFound {
+			t.Errorf("SSE status = %d, want %d", rec.Code, http.StatusNotFound)
 		}
 	})
 }

@@ -304,13 +304,25 @@ func (w *StreamWriter) Offset() Offset {
 
 // Reader creates a new Reader for continuous reading from a stream.
 // The Reader inherits the client's ReadMode for live tailing behavior.
+//
+// When offset is "now" and the read mode is LongPoll or Auto, the reader
+// skips catch-up and goes directly to long-poll mode. Per PROTOCOL.md Section 6:
+// "Servers MUST immediately begin waiting for new data (no initial empty response)"
 func (c *Client) Reader(path string, offset Offset) *Reader {
+	// Per protocol spec Section 6, for offset=now with long-poll:
+	// "Servers MUST immediately begin waiting for new data (no initial empty response)"
+	// Skip catch-up phase for long-poll compatible modes with offset=now
+	catching := true
+	if offset == Offset("now") && (c.readMode == ReadModeAuto || c.readMode == ReadModeLongPoll) {
+		catching = false
+	}
+
 	return &Reader{
 		client:   c,
 		path:     path,
 		offset:   offset,
 		readMode: c.readMode,
-		catching: true, // Start in catch-up phase
+		catching: catching,
 	}
 }
 
