@@ -514,6 +514,17 @@ func TestHTTPTransport_Append(t *testing.T) {
 		if !strings.Contains(err.Error(), "empty append") {
 			t.Errorf("expected empty append error, got %v", err)
 		}
+		// Verify error type and status code for conformance
+		var tErr *Error
+		if !errors.As(err, &tErr) {
+			t.Fatalf("expected *transport.Error, got %T", err)
+		}
+		if tErr.Code != "BAD_REQUEST" {
+			t.Errorf("expected code BAD_REQUEST, got %s", tErr.Code)
+		}
+		if tErr.StatusCode != http.StatusBadRequest {
+			t.Errorf("expected status 400, got %d", tErr.StatusCode)
+		}
 	})
 }
 
