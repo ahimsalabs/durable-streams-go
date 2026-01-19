@@ -1129,6 +1129,76 @@ func TestHandler_GET_ETagAndIfNoneMatch(t *testing.T) {
 			t.Errorf("status = %d, want %d", rec.Code, http.StatusOK)
 		}
 	})
+
+	t.Run("ETag is valid with stream ID containing control characters", func(t *testing.T) {
+		storage := memorystorage.New()
+
+		// Create stream with control character in path (null byte)
+		// Storage allows arbitrary stream IDs even with control characters
+		streamPath := "/stream\x00test"
+		_, _ = storage.Create(context.Background(), streamPath, durablestream.StreamConfig{
+			ContentType: "text/plain",
+		})
+		_, _ = storage.Append(context.Background(), streamPath, []byte("data"), "")
+
+		// Create request with valid URL, then manually set path to include control char
+		// This simulates what happens when a client sends a URL-encoded null byte
+		req := httptest.NewRequest(http.MethodGet, "/stream?offset=0000000000", nil)
+		// Override the path extraction to return the stream path with control chars
+		customHandler := durablestream.NewHandler(storage, &durablestream.HandlerConfig{
+			PathExtractor: func(*http.Request) string { return streamPath },
+		})
+		rec := httptest.NewRecorder()
+		customHandler.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status = %d, want %d", rec.Code, http.StatusOK)
+		}
+
+		// ETag should be present and properly encoded (no raw control chars)
+		etag := rec.Header().Get("ETag")
+		if etag == "" {
+			t.Error("missing ETag header")
+		}
+		// ETag should not contain raw null bytes
+		if strings.Contains(etag, "\x00") {
+			t.Errorf("ETag contains raw null byte: %q", etag)
+		}
+		// ETag should contain the encoded null byte (%00)
+		if !strings.Contains(etag, "%00") {
+			t.Errorf("ETag should contain encoded null byte (%%00), got: %q", etag)
+		}
+	})
+}
+
+func TestSanitizeForETag(t *testing.T) {
+	tests := []struct {
+		name  string
+		input string
+		want  string
+	}{
+		{"empty string", "", ""},
+		{"normal ASCII", "hello/world", "hello/world"},
+		{"with spaces", "hello world", "hello world"},
+		{"null byte", "hello\x00world", "hello%00world"},
+		{"newline", "hello\nworld", "hello%0Aworld"},
+		{"carriage return", "hello\rworld", "hello%0Dworld"},
+		{"tab", "hello\tworld", "hello%09world"},
+		{"high bytes", "hello\x80\xFFworld", "hello%80%FFworld"},
+		{"all control chars", "\x00\x01\x1F", "%00%01%1F"},
+		{"mixed", "/stream/\x00/test\r\n", "/stream/%00/test%0D%0A"},
+		{"DEL char (0x7F)", "hello\x7Fworld", "hello%7Fworld"},
+		{"tilde is ok (0x7E)", "hello~world", "hello~world"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := durablestream.SanitizeForETag(tt.input)
+			if got != tt.want {
+				t.Errorf("sanitizeForETag(%q) = %q, want %q", tt.input, got, tt.want)
+			}
+		})
+	}
 }
 
 func TestHandler_GET_OffsetNow(t *testing.T) {
