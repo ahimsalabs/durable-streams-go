@@ -37,6 +37,7 @@ type errorCode string
 
 const (
 	codeBadRequest      errorCode = "bad_request"
+	codeForbidden       errorCode = "forbidden"
 	codeNotFound        errorCode = "not_found"
 	codeConflict        errorCode = "conflict"
 	codeGone            errorCode = "gone"
@@ -51,6 +52,8 @@ func (c errorCode) httpStatus() int {
 	switch c {
 	case codeBadRequest:
 		return 400
+	case codeForbidden:
+		return 403
 	case codeNotFound:
 		return 404
 	case codeConflict:
@@ -75,6 +78,8 @@ func httpStatusToErrorCode(status int) errorCode {
 	switch status {
 	case 400:
 		return codeBadRequest
+	case 403:
+		return codeForbidden
 	case 404:
 		return codeNotFound
 	case 409:
