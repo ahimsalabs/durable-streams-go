@@ -584,9 +584,9 @@ func (h *Handler) handleRead(w http.ResponseWriter, r *http.Request, streamID st
 		writeError(w, newError(codeBadRequest, "offset cannot be empty"))
 		return
 	}
-	// Reject offsets containing invalid characters (commas, spaces, etc.)
-	if strings.ContainsAny(offsetStr, ", \t\n\r") {
-		writeError(w, newError(codeBadRequest, "invalid offset format"))
+	// Reject invalid offsets per spec Sections 6 and 10.2
+	if err := validateOffset(offsetStr); err != nil {
+		writeError(w, newError(codeBadRequest, err.Error()))
 		return
 	}
 	offset := Offset(offsetStr)
@@ -877,6 +877,11 @@ func (h *Handler) handleSSE(w http.ResponseWriter, r *http.Request, streamID str
 		flusher.Flush()
 	}
 
+	// Track whether we've sent the initial control event for non-offset=now cases.
+	// Per spec, when client is caught up (at tail), we should send a control event
+	// with upToDate: true even if there's no data.
+	sentInitialControl := isOffsetNow
+
 	// Stream loop
 	for {
 		// Try to read data
@@ -888,6 +893,8 @@ func (h *Handler) handleSSE(w http.ResponseWriter, r *http.Request, streamID str
 
 		// If messages available, send them
 		if len(result.Messages) > 0 {
+			sentInitialControl = true // We're sending events now
+
 			// Send data event
 			fmt.Fprintf(w, "event: data\n")
 
@@ -910,12 +917,27 @@ func (h *Handler) handleSSE(w http.ResponseWriter, r *http.Request, streamID str
 			fmt.Fprintf(w, "\n")
 
 			// Send control event with generated cursor (Section 8.1)
+			// Include upToDate: true if we're at the tail
 			fmt.Fprintf(w, "event: control\n")
-			fmt.Fprintf(w, "data: {\"streamNextOffset\":\"%s\",\"streamCursor\":\"%s\"}\n\n", result.NextOffset, protocol.GenerateCursor(clientCursor))
+			if result.NextOffset.Compare(result.TailOffset) == 0 {
+				fmt.Fprintf(w, "data: {\"streamNextOffset\":\"%s\",\"upToDate\":true,\"streamCursor\":\"%s\"}\n\n", result.NextOffset, protocol.GenerateCursor(clientCursor))
+			} else {
+				fmt.Fprintf(w, "data: {\"streamNextOffset\":\"%s\",\"streamCursor\":\"%s\"}\n\n", result.NextOffset, protocol.GenerateCursor(clientCursor))
+			}
 
 			flusher.Flush()
 
 			currentOffset = result.NextOffset
+		} else if !sentInitialControl {
+			// No messages and haven't sent initial control yet.
+			// Check if we're at tail (caught up) and send control with upToDate: true.
+			// This handles the case of SSE on an empty stream or starting from tail.
+			if currentOffset.Compare(result.TailOffset) == 0 || result.NextOffset.Compare(result.TailOffset) == 0 {
+				sentInitialControl = true
+				fmt.Fprintf(w, "event: control\n")
+				fmt.Fprintf(w, "data: {\"streamNextOffset\":\"%s\",\"upToDate\":true,\"streamCursor\":\"%s\"}\n\n", result.NextOffset, protocol.GenerateCursor(clientCursor))
+				flusher.Flush()
+			}
 		}
 
 		// Check if we should close
@@ -1188,4 +1210,37 @@ func (l *limitedCountingReader) Read(p []byte) (n int, err error) {
 		l.exceeded = true
 	}
 	return n, err
+}
+
+// validateOffset validates an offset string per protocol Section 6 and 10.2.
+// Returns an error if the offset contains invalid characters or patterns.
+//
+// Per Section 6: Offsets MUST NOT contain commas, ampersands, equals signs,
+// or question marks (to avoid conflict with URL query parameter syntax).
+//
+// Per Section 10.2: Servers SHOULD validate and sanitize to prevent path
+// traversal attacks (patterns like "..").
+func validateOffset(offset string) error {
+	// Empty offset is valid (equivalent to stream start)
+	if offset == "" {
+		return nil
+	}
+
+	// Per Section 6: MUST NOT contain these URL query parameter conflict characters
+	if strings.ContainsAny(offset, ",&=?") {
+		return errors.New("invalid offset format")
+	}
+
+	// Reject whitespace and control characters (common validation)
+	if strings.ContainsAny(offset, " \t\n\r") {
+		return errors.New("invalid offset format")
+	}
+
+	// Per Section 10.2: prevent path traversal attacks
+	// Check for ".." anywhere in the offset
+	if strings.Contains(offset, "..") {
+		return errors.New("invalid offset format")
+	}
+
+	return nil
 }
