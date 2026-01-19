@@ -130,6 +130,94 @@ func TestProcessJSONAppend(t *testing.T) {
 	}
 }
 
+func TestProcessJSONCreate(t *testing.T) {
+	tests := []struct {
+		name     string
+		input    []byte
+		want     [][]byte
+		wantErr  error
+		errMatch string
+	}{
+		{
+			name:  "single object",
+			input: []byte(`{"key":"value"}`),
+			want:  [][]byte{[]byte(`{"key":"value"}`)},
+		},
+		{
+			name:  "array with elements",
+			input: []byte(`[{"a":1},{"b":2}]`),
+			want: [][]byte{
+				[]byte(`{"a":1}`),
+				[]byte(`{"b":2}`),
+			},
+		},
+		{
+			name:  "empty array - allowed for PUT/create",
+			input: []byte(`[]`),
+			want:  [][]byte{},
+		},
+		{
+			name:     "invalid JSON",
+			input:    []byte(`{invalid`),
+			wantErr:  ErrInvalidJSON,
+			errMatch: "invalid",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := ProcessJSONCreate(tt.input)
+
+			if tt.wantErr != nil {
+				if err == nil {
+					t.Fatalf("expected error, got nil")
+				}
+				if !errors.Is(err, tt.wantErr) {
+					t.Errorf("expected error %v, got %v", tt.wantErr, err)
+				}
+				return
+			}
+
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+
+			if len(got) != len(tt.want) {
+				t.Fatalf("expected %d messages, got %d", len(tt.want), len(got))
+			}
+
+			for i := range tt.want {
+				if string(got[i]) != string(tt.want[i]) {
+					t.Errorf("message %d: expected %s, got %s", i, tt.want[i], got[i])
+				}
+			}
+		})
+	}
+}
+
+// TestProcessJSONAppendVsCreate verifies the semantic difference between Append and Create.
+// Per PROTOCOL.md Section 7.1:
+// - POST with []: MUST reject with 400 (no-op append)
+// - PUT with []: valid, creates empty stream
+func TestProcessJSONAppendVsCreate(t *testing.T) {
+	emptyArray := []byte(`[]`)
+
+	// ProcessJSONAppend MUST reject empty arrays
+	_, err := ProcessJSONAppend(emptyArray)
+	if !errors.Is(err, ErrEmptyArray) {
+		t.Errorf("ProcessJSONAppend([]) should return ErrEmptyArray, got %v", err)
+	}
+
+	// ProcessJSONCreate MUST accept empty arrays
+	msgs, err := ProcessJSONCreate(emptyArray)
+	if err != nil {
+		t.Errorf("ProcessJSONCreate([]) should not return error, got %v", err)
+	}
+	if len(msgs) != 0 {
+		t.Errorf("ProcessJSONCreate([]) should return empty slice, got %d messages", len(msgs))
+	}
+}
+
 func TestFormatJSONResponse(t *testing.T) {
 	tests := []struct {
 		name     string
