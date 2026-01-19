@@ -595,6 +595,67 @@ func TestHandler_GET_SSE(t *testing.T) {
 			t.Errorf("status = %d, want %d", rec.Code, http.StatusBadRequest)
 		}
 	})
+
+	t.Run("CRLF injection prevention with CR-only terminators", func(t *testing.T) {
+		// This tests the critical security fix: CR characters must be treated as
+		// line terminators to prevent SSE event injection attacks.
+		// Per SSE spec, CR is a valid line terminator, so embedded CRs in data
+		// must be split into separate data: lines to prevent injection.
+
+		_, _ = storage.Create(context.Background(), "/cr-injection-test", durablestream.StreamConfig{
+			ContentType: "text/plain",
+		})
+		// Payload with CR-only terminators attempting to inject a fake control event
+		// Without proper handling, this would create multiple SSE events
+		maliciousPayload := "start\r\revent: control\rdata: {\"cr_injected\":true}\r\rend"
+		_, _ = storage.Append(context.Background(), "/cr-injection-test", []byte(maliciousPayload), "")
+
+		req := httptest.NewRequest(http.MethodGet, "/cr-injection-test?offset=0000000000&live=sse", nil)
+		rec := httptest.NewRecorder()
+
+		ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+		defer cancel()
+		req = req.WithContext(ctx)
+
+		handler.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusOK {
+			t.Errorf("status = %d, want %d", rec.Code, http.StatusOK)
+		}
+
+		body := rec.Body.String()
+
+		// Count actual SSE event types (lines that START with "event: control")
+		// vs escaped data (lines that start with "data: event: control").
+		// The injected one should appear as a data line, not an SSE command.
+		actualControlEvents := 0
+		escapedControlStrings := 0
+		for _, line := range strings.Split(body, "\n") {
+			if strings.HasPrefix(line, "event: control") {
+				actualControlEvents++
+			}
+			if strings.HasPrefix(line, "data: event: control") {
+				escapedControlStrings++
+			}
+		}
+
+		// We expect exactly 1 actual SSE control event (the real one from server)
+		if actualControlEvents != 1 {
+			t.Errorf("Expected exactly 1 actual SSE control event, got %d. Body:\n%s",
+				actualControlEvents, body)
+		}
+
+		// We expect the injected "event: control" to appear as escaped data
+		if escapedControlStrings != 1 {
+			t.Errorf("Expected injected 'event: control' to appear as escaped data line, found %d. Body:\n%s",
+				escapedControlStrings, body)
+		}
+
+		// Verify the injected data payload also appears as a data line
+		if !strings.Contains(body, "data: data: {\"cr_injected\":true}") {
+			t.Errorf("Expected injected data to be escaped as data line. Body:\n%s", body)
+		}
+	})
 }
 
 func TestHandler_HEAD_Metadata(t *testing.T) {
