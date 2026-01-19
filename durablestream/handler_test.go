@@ -958,6 +958,179 @@ func TestHandler_CacheControlHeaders(t *testing.T) {
 	})
 }
 
+func TestHandler_GET_ETagAndIfNoneMatch(t *testing.T) {
+	storage := memorystorage.New()
+	handler := durablestream.NewHandler(storage, nil)
+
+	// Create stream with data
+	_, _ = storage.Create(context.Background(), "/stream", durablestream.StreamConfig{
+		ContentType: "text/plain",
+	})
+	_, _ = storage.Append(context.Background(), "/stream", []byte("data"), "")
+
+	t.Run("catch-up read returns ETag header", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodGet, "/stream?offset=0000000000", nil)
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status = %d, want %d", rec.Code, http.StatusOK)
+		}
+
+		etag := rec.Header().Get("ETag")
+		if etag == "" {
+			t.Error("missing ETag header")
+		}
+		// ETag should be quoted per RFC 7232
+		if !strings.HasPrefix(etag, `"`) || !strings.HasSuffix(etag, `"`) {
+			t.Errorf("ETag = %q, should be quoted", etag)
+		}
+	})
+
+	t.Run("304 Not Modified when If-None-Match matches ETag", func(t *testing.T) {
+		// First request to get the ETag
+		req1 := httptest.NewRequest(http.MethodGet, "/stream?offset=0000000000", nil)
+		rec1 := httptest.NewRecorder()
+		handler.ServeHTTP(rec1, req1)
+
+		if rec1.Code != http.StatusOK {
+			t.Fatalf("first request status = %d, want %d", rec1.Code, http.StatusOK)
+		}
+		etag := rec1.Header().Get("ETag")
+		if etag == "" {
+			t.Fatal("first request missing ETag header")
+		}
+
+		// Second request with If-None-Match should get 304
+		req2 := httptest.NewRequest(http.MethodGet, "/stream?offset=0000000000", nil)
+		req2.Header.Set("If-None-Match", etag)
+		rec2 := httptest.NewRecorder()
+		handler.ServeHTTP(rec2, req2)
+
+		if rec2.Code != http.StatusNotModified {
+			t.Errorf("status = %d, want %d", rec2.Code, http.StatusNotModified)
+		}
+
+		// 304 response should have ETag and Cache-Control but no body
+		if rec2.Header().Get("ETag") != etag {
+			t.Errorf("304 response ETag = %q, want %q", rec2.Header().Get("ETag"), etag)
+		}
+		if rec2.Header().Get("Cache-Control") == "" {
+			t.Error("304 response missing Cache-Control header")
+		}
+		if rec2.Body.Len() > 0 {
+			t.Errorf("304 response should have no body, got %s", rec2.Body.String())
+		}
+	})
+
+	t.Run("200 OK when If-None-Match does not match ETag", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodGet, "/stream?offset=0000000000", nil)
+		req.Header.Set("If-None-Match", `"wrong-etag"`)
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusOK {
+			t.Errorf("status = %d, want %d", rec.Code, http.StatusOK)
+		}
+		// Should have body
+		if rec.Body.Len() == 0 {
+			t.Error("expected response body")
+		}
+	})
+
+	t.Run("304 with If-None-Match containing multiple ETags", func(t *testing.T) {
+		// First request to get the ETag
+		req1 := httptest.NewRequest(http.MethodGet, "/stream?offset=0000000000", nil)
+		rec1 := httptest.NewRecorder()
+		handler.ServeHTTP(rec1, req1)
+
+		etag := rec1.Header().Get("ETag")
+
+		// Request with multiple ETags (one matching)
+		req2 := httptest.NewRequest(http.MethodGet, "/stream?offset=0000000000", nil)
+		req2.Header.Set("If-None-Match", `"other-etag", `+etag+`, "another-etag"`)
+		rec2 := httptest.NewRecorder()
+		handler.ServeHTTP(rec2, req2)
+
+		if rec2.Code != http.StatusNotModified {
+			t.Errorf("status = %d, want %d", rec2.Code, http.StatusNotModified)
+		}
+	})
+
+	t.Run("304 with If-None-Match wildcard", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodGet, "/stream?offset=0000000000", nil)
+		req.Header.Set("If-None-Match", "*")
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusNotModified {
+			t.Errorf("status = %d, want %d", rec.Code, http.StatusNotModified)
+		}
+	})
+
+	t.Run("304 with weak ETag (W/ prefix)", func(t *testing.T) {
+		// First request to get the ETag
+		req1 := httptest.NewRequest(http.MethodGet, "/stream?offset=0000000000", nil)
+		rec1 := httptest.NewRecorder()
+		handler.ServeHTTP(rec1, req1)
+
+		etag := rec1.Header().Get("ETag")
+
+		// Request with weak ETag prefix
+		req2 := httptest.NewRequest(http.MethodGet, "/stream?offset=0000000000", nil)
+		req2.Header.Set("If-None-Match", "W/"+etag)
+		rec2 := httptest.NewRecorder()
+		handler.ServeHTTP(rec2, req2)
+
+		if rec2.Code != http.StatusNotModified {
+			t.Errorf("status = %d, want %d", rec2.Code, http.StatusNotModified)
+		}
+	})
+
+	t.Run("ETag changes when data changes", func(t *testing.T) {
+		// Get ETag at current offset
+		info, _ := storage.Head(context.Background(), "/stream")
+		req1 := httptest.NewRequest(http.MethodGet, "/stream?offset="+info.NextOffset.String(), nil)
+		rec1 := httptest.NewRecorder()
+		handler.ServeHTTP(rec1, req1)
+
+		etag1 := rec1.Header().Get("ETag")
+
+		// Append more data
+		_, _ = storage.Append(context.Background(), "/stream", []byte("more data"), "")
+
+		// Read from same offset - ETag should be different now
+		info2, _ := storage.Head(context.Background(), "/stream")
+		req2 := httptest.NewRequest(http.MethodGet, "/stream?offset="+info.NextOffset.String(), nil)
+		rec2 := httptest.NewRecorder()
+		handler.ServeHTTP(rec2, req2)
+
+		etag2 := rec2.Header().Get("ETag")
+
+		// New offset means new ETag
+		if info2.NextOffset == info.NextOffset {
+			t.Skip("offset unchanged, skipping ETag comparison")
+		}
+
+		if etag1 == etag2 {
+			t.Errorf("ETag should change when data changes, got %q both times", etag1)
+		}
+	})
+
+	t.Run("no 304 for offset=now", func(t *testing.T) {
+		// offset=now should never return 304 (per spec: no ETag for offset=now responses)
+		req := httptest.NewRequest(http.MethodGet, "/stream?offset=now", nil)
+		req.Header.Set("If-None-Match", "*")
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+
+		// offset=now should always return 200
+		if rec.Code != http.StatusOK {
+			t.Errorf("status = %d, want %d", rec.Code, http.StatusOK)
+		}
+	})
+}
+
 func TestHandler_GET_OffsetNow(t *testing.T) {
 	t.Run("catch-up read JSON stream", func(t *testing.T) {
 		storage := memorystorage.New()

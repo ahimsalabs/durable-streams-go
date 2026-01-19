@@ -228,12 +228,23 @@ func (h *Handler) handleCreate(w http.ResponseWriter, r *http.Request, streamID 
 
 	// Return success headers
 	setSecurityHeaders(w)
+
+	// Set Location header on 201 Created (Section 5.1)
+	// Use r.RequestURI which preserves the original path (before StripPrefix etc.)
 	// Location must be absolute URL per RFC 7231
-	scheme := "http"
-	if r.TLS != nil || r.Header.Get("X-Forwarded-Proto") == "https" {
-		scheme = "https"
+	if created {
+		scheme := "http"
+		if r.TLS != nil || r.Header.Get("X-Forwarded-Proto") == "https" {
+			scheme = "https"
+		}
+		// r.RequestURI is the unmodified request-target, preserving the original path
+		// We need to strip any query string for the Location header
+		path := r.RequestURI
+		if idx := strings.Index(path, "?"); idx != -1 {
+			path = path[:idx]
+		}
+		w.Header().Set("Location", scheme+"://"+r.Host+path)
 	}
-	w.Header().Set("Location", scheme+"://"+r.Host+r.URL.Path)
 	w.Header().Set("Content-Type", contentType)
 	w.Header().Set(protocol.HeaderStreamNextOffset, nextOffset.String())
 
@@ -632,6 +643,24 @@ func (h *Handler) handleCatchupRead(w http.ResponseWriter, r *http.Request, stre
 		return
 	}
 
+	// Compute ETag (Section 5.5)
+	// Format: "{streamID}:{start_offset}:{end_offset}"
+	// ETag must be quoted per HTTP spec (RFC 7232)
+	etag := fmt.Sprintf(`"%s:%s:%s"`, streamID, offset, result.NextOffset)
+
+	// Check If-None-Match for 304 Not Modified (Section 8.1)
+	// Per spec: "When a client provides a valid If-None-Match header that matches
+	// the current ETag, servers MUST respond with 304 Not Modified"
+	if ifNoneMatch := r.Header.Get("If-None-Match"); ifNoneMatch != "" {
+		if etagMatches(ifNoneMatch, etag) {
+			setSecurityHeaders(w)
+			w.Header().Set("ETag", etag)
+			w.Header().Set("Cache-Control", "public, max-age=60, stale-while-revalidate=300")
+			w.WriteHeader(http.StatusNotModified)
+			return
+		}
+	}
+
 	// Set headers
 	setSecurityHeaders(w)
 	w.Header().Set("Content-Type", info.ContentType)
@@ -640,8 +669,7 @@ func (h *Handler) handleCatchupRead(w http.ResponseWriter, r *http.Request, stre
 	// Set Cache-Control (Section 8)
 	w.Header().Set("Cache-Control", "public, max-age=60, stale-while-revalidate=300")
 
-	// Set ETag (Section 5.5)
-	etag := fmt.Sprintf("%s:%s:%s", streamID, offset, result.NextOffset)
+	// Set ETag
 	w.Header().Set("ETag", etag)
 
 	// Set Stream-Up-To-Date if at tail (Section 5.5)
@@ -1045,6 +1073,33 @@ func writeStorageError(w http.ResponseWriter, err error) {
 	default:
 		writeError(w, newError(codeInternal, err.Error()))
 	}
+}
+
+// etagMatches checks if the If-None-Match header value matches the given ETag.
+// Per RFC 7232, If-None-Match can contain multiple ETags (comma-separated) or "*".
+// ETags are compared as opaque quoted strings.
+func etagMatches(ifNoneMatch, etag string) bool {
+	// Handle wildcard
+	if strings.TrimSpace(ifNoneMatch) == "*" {
+		return true
+	}
+
+	// Split by comma and check each ETag
+	// If-None-Match: "etag1", "etag2", ...
+	for _, candidate := range strings.Split(ifNoneMatch, ",") {
+		candidate = strings.TrimSpace(candidate)
+		// Exact match (ETags include quotes)
+		if candidate == etag {
+			return true
+		}
+		// Handle weak ETags: W/"etag" matches "etag" for cache validation
+		// Per RFC 7232, weak comparison is used for If-None-Match
+		if strings.HasPrefix(candidate, "W/") && candidate[2:] == etag {
+			return true
+		}
+	}
+
+	return false
 }
 
 // limitedCountingReader wraps an io.Reader to count bytes read and enforce a size limit.
