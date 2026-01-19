@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/ahimsalabs/durable-streams-go/durablestream/internal/protocol"
@@ -46,6 +47,19 @@ type HandlerConfig struct {
 	ChunkSize int
 }
 
+// producerState tracks the state for a single producer on a single stream.
+// Per PROTOCOL.md Section 5.2.1.
+type producerState struct {
+	epoch   int64 // Current epoch for this producer
+	lastSeq int64 // Highest accepted sequence number in current epoch
+}
+
+// producerKey uniquely identifies a producer on a stream.
+type producerKey struct {
+	streamID   string
+	producerID string
+}
+
 // Handler implements http.Handler for serving durable streams.
 // Per spec Section 5: routes requests based on HTTP method.
 type Handler struct {
@@ -55,6 +69,10 @@ type Handler struct {
 	sseCloseAfter   time.Duration
 	maxAppendSize   int64
 	chunkSize       int
+
+	// Producer state tracking (PROTOCOL.md Section 5.2.1)
+	producersMu sync.Mutex
+	producers   map[producerKey]*producerState
 }
 
 // NewHandler creates a new stream handler with the given storage.
@@ -67,6 +85,7 @@ func NewHandler(storage Storage, cfg *HandlerConfig) *Handler {
 		sseCloseAfter:   defaultSSECloseAfter,
 		maxAppendSize:   defaultMaxAppendSize,
 		chunkSize:       defaultChunkSize,
+		producers:       make(map[producerKey]*producerState),
 	}
 
 	if cfg != nil {
@@ -225,6 +244,14 @@ func (h *Handler) handleCreate(w http.ResponseWriter, r *http.Request, streamID 
 	}
 }
 
+// producerResult represents the outcome of producer validation.
+type producerResult struct {
+	isDuplicate bool  // True if this is a duplicate request (return 204)
+	isNew       bool  // True if this is a new request (return 200)
+	epoch       int64 // Epoch to echo in response
+	highestSeq  int64 // Highest seq to echo in response
+}
+
 // handleAppend implements POST (Append) - Section 5.2
 func (h *Handler) handleAppend(w http.ResponseWriter, r *http.Request, streamID string) {
 	// Get stream info to validate content type
@@ -251,7 +278,33 @@ func (h *Handler) handleAppend(w http.ResponseWriter, r *http.Request, streamID 
 		return
 	}
 
-	// Get sequence number if provided
+	// Parse and validate producer headers (Section 5.2.1)
+	producerID, producerEpoch, producerSeq, hasProducer, err := h.parseProducerHeaders(r)
+	if err != nil {
+		writeError(w, newError(codeBadRequest, err.Error()))
+		return
+	}
+
+	// Validate producer state BEFORE reading body (for deduplication efficiency)
+	var producerRes *producerResult
+	if hasProducer {
+		producerRes, err = h.validateProducer(w, streamID, producerID, producerEpoch, producerSeq)
+		if err != nil {
+			// Error already written to response
+			return
+		}
+		// If duplicate, return 204 immediately without reading body
+		if producerRes.isDuplicate {
+			setSecurityHeaders(w)
+			w.Header().Set(protocol.HeaderStreamNextOffset, info.NextOffset.String())
+			w.Header().Set(protocol.HeaderProducerEpoch, strconv.FormatInt(producerRes.epoch, 10))
+			w.Header().Set(protocol.HeaderProducerSeq, strconv.FormatInt(producerRes.highestSeq, 10))
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+	}
+
+	// Get Stream-Seq if provided (separate from producer seq)
 	seq := r.Header.Get(protocol.HeaderStreamSeq)
 
 	var nextOffset Offset
@@ -321,10 +374,182 @@ func (h *Handler) handleAppend(w http.ResponseWriter, r *http.Request, streamID 
 		}
 	}
 
+	// Commit producer state after successful append
+	if hasProducer {
+		h.commitProducerState(streamID, producerID, producerEpoch, producerSeq)
+	}
+
 	// Return success
 	setSecurityHeaders(w)
 	w.Header().Set(protocol.HeaderStreamNextOffset, nextOffset.String())
-	w.WriteHeader(http.StatusNoContent)
+
+	if hasProducer {
+		// With producer headers: return 200 OK for new data
+		w.Header().Set(protocol.HeaderProducerEpoch, strconv.FormatInt(producerEpoch, 10))
+		w.Header().Set(protocol.HeaderProducerSeq, strconv.FormatInt(producerSeq, 10))
+		w.WriteHeader(http.StatusOK)
+	} else {
+		// Without producer headers: return 204 No Content
+		w.WriteHeader(http.StatusNoContent)
+	}
+}
+
+// parseProducerHeaders extracts and validates producer headers.
+// Per Section 5.2.1: all three headers MUST be provided together or none at all.
+func (h *Handler) parseProducerHeaders(r *http.Request) (producerID string, epoch, seq int64, hasProducer bool, err error) {
+	idStr := r.Header.Get(protocol.HeaderProducerID)
+	epochStr := r.Header.Get(protocol.HeaderProducerEpoch)
+	seqStr := r.Header.Get(protocol.HeaderProducerSeq)
+
+	// Count how many producer headers are present
+	hasID := idStr != ""
+	hasEpoch := epochStr != ""
+	hasSeq := seqStr != ""
+
+	// All or none
+	count := 0
+	if hasID {
+		count++
+	}
+	if hasEpoch {
+		count++
+	}
+	if hasSeq {
+		count++
+	}
+
+	if count == 0 {
+		return "", 0, 0, false, nil
+	}
+	if count != 3 {
+		return "", 0, 0, false, errors.New("all producer headers (Producer-Id, Producer-Epoch, Producer-Seq) must be provided together")
+	}
+
+	// Validate Producer-Id is non-empty (already checked above with hasID)
+	producerID = idStr
+
+	// Parse and validate epoch (must be non-negative integer ≤ 2^53-1)
+	epoch, err = parseProducerInt(epochStr, "Producer-Epoch")
+	if err != nil {
+		return "", 0, 0, false, err
+	}
+
+	// Parse and validate seq (must be non-negative integer ≤ 2^53-1)
+	seq, err = parseProducerInt(seqStr, "Producer-Seq")
+	if err != nil {
+		return "", 0, 0, false, err
+	}
+
+	return producerID, epoch, seq, true, nil
+}
+
+// parseProducerInt parses a string as a non-negative integer with strict validation.
+// Rejects leading zeros (except "0"), plus signs, and values > 2^53-1.
+func parseProducerInt(s string, headerName string) (int64, error) {
+	if s == "" {
+		return 0, fmt.Errorf("invalid %s: empty value", headerName)
+	}
+
+	// Reject leading zeros (except "0" itself)
+	if len(s) > 1 && s[0] == '0' {
+		return 0, fmt.Errorf("invalid %s: leading zeros not allowed", headerName)
+	}
+
+	// Reject plus sign
+	if s[0] == '+' {
+		return 0, fmt.Errorf("invalid %s: plus sign not allowed", headerName)
+	}
+
+	// Reject negative numbers
+	if s[0] == '-' {
+		return 0, fmt.Errorf("invalid %s: negative values not allowed", headerName)
+	}
+
+	// Parse as integer
+	val, err := strconv.ParseInt(s, 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("invalid %s: must be a valid integer", headerName)
+	}
+
+	// Check max value for JavaScript interoperability (2^53-1)
+	const maxSafeInt = 9007199254740991
+	if val > maxSafeInt {
+		return 0, fmt.Errorf("invalid %s: exceeds maximum safe integer", headerName)
+	}
+
+	return val, nil
+}
+
+// validateProducer implements the validation logic from Section 5.2.1.
+// Returns a producerResult or writes an error response and returns an error.
+func (h *Handler) validateProducer(w http.ResponseWriter, streamID, producerID string, epoch, seq int64) (*producerResult, error) {
+	h.producersMu.Lock()
+	defer h.producersMu.Unlock()
+
+	key := producerKey{streamID: streamID, producerID: producerID}
+	state := h.producers[key]
+
+	// New producer - validate seq starts at 0
+	if state == nil {
+		if seq != 0 {
+			setSecurityHeaders(w)
+			w.Header().Set(protocol.HeaderProducerExpectedSeq, "0")
+			w.Header().Set(protocol.HeaderProducerReceivedSeq, strconv.FormatInt(seq, 10))
+			writeError(w, newError(codeConflict, "sequence gap: expected 0"))
+			return nil, errors.New("sequence gap")
+		}
+		// Will be committed after successful append
+		return &producerResult{isNew: true, epoch: epoch, highestSeq: seq}, nil
+	}
+
+	// Epoch validation (client-declared, server-validated)
+	if epoch < state.epoch {
+		// Stale epoch - zombie fencing (403 Forbidden)
+		setSecurityHeaders(w)
+		w.Header().Set(protocol.HeaderProducerEpoch, strconv.FormatInt(state.epoch, 10))
+		writeError(w, newError(codeForbidden, "stale producer epoch"))
+		return nil, errors.New("stale epoch")
+	}
+
+	if epoch > state.epoch {
+		// New epoch - must start at seq=0
+		if seq != 0 {
+			writeError(w, newError(codeBadRequest, "new epoch must start at seq=0"))
+			return nil, errors.New("new epoch must start at seq=0")
+		}
+		// Will be committed after successful append
+		return &producerResult{isNew: true, epoch: epoch, highestSeq: seq}, nil
+	}
+
+	// Same epoch - sequence validation
+	if seq <= state.lastSeq {
+		// Duplicate (idempotent success)
+		return &producerResult{isDuplicate: true, epoch: state.epoch, highestSeq: state.lastSeq}, nil
+	}
+
+	if seq == state.lastSeq+1 {
+		// Valid next sequence - will be committed after successful append
+		return &producerResult{isNew: true, epoch: epoch, highestSeq: seq}, nil
+	}
+
+	// Sequence gap (seq > lastSeq + 1)
+	setSecurityHeaders(w)
+	w.Header().Set(protocol.HeaderProducerExpectedSeq, strconv.FormatInt(state.lastSeq+1, 10))
+	w.Header().Set(protocol.HeaderProducerReceivedSeq, strconv.FormatInt(seq, 10))
+	writeError(w, newError(codeConflict, "sequence gap"))
+	return nil, errors.New("sequence gap")
+}
+
+// commitProducerState updates the producer state after a successful append.
+func (h *Handler) commitProducerState(streamID, producerID string, epoch, seq int64) {
+	h.producersMu.Lock()
+	defer h.producersMu.Unlock()
+
+	key := producerKey{streamID: streamID, producerID: producerID}
+	h.producers[key] = &producerState{
+		epoch:   epoch,
+		lastSeq: seq,
+	}
 }
 
 // handleRead implements GET (Read) - Sections 5.5, 5.6, 5.7

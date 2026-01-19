@@ -23,6 +23,24 @@ const (
 	HeaderStreamUpToDate = "Stream-Up-To-Date"
 )
 
+// Idempotent Producer headers (PROTOCOL.md Section 5.2.1).
+const (
+	// HeaderProducerID identifies the logical producer.
+	HeaderProducerID = "Producer-Id"
+
+	// HeaderProducerEpoch is the client-declared epoch for session management.
+	HeaderProducerEpoch = "Producer-Epoch"
+
+	// HeaderProducerSeq is the monotonically increasing sequence number per epoch.
+	HeaderProducerSeq = "Producer-Seq"
+
+	// HeaderProducerExpectedSeq indicates the expected sequence on 409 Conflict.
+	HeaderProducerExpectedSeq = "Producer-Expected-Seq"
+
+	// HeaderProducerReceivedSeq indicates the received sequence on 409 Conflict.
+	HeaderProducerReceivedSeq = "Producer-Received-Seq"
+)
+
 // Query parameter names used in stream operations.
 const (
 	QueryOffset = "offset"

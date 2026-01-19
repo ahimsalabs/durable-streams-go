@@ -1268,3 +1268,567 @@ func BenchmarkHandler_Read(b *testing.B) {
 		_, _ = io.Copy(io.Discard, rec.Body)
 	}
 }
+
+// ============================================================================
+// Idempotent Producer Tests (Section 5.2.1)
+// ============================================================================
+
+func TestHandler_POST_IdempotentProducer_Basic(t *testing.T) {
+	storage := memorystorage.New()
+	handler := durablestream.NewHandler(storage, nil)
+
+	// Create stream
+	_, _ = storage.Create(context.Background(), "/stream", durablestream.StreamConfig{
+		ContentType: "text/plain",
+	})
+
+	t.Run("first append with producer headers returns 200", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodPost, "/stream", strings.NewReader("hello"))
+		req.Header.Set("Content-Type", "text/plain")
+		req.Header.Set(protocol.HeaderProducerID, "test-producer")
+		req.Header.Set(protocol.HeaderProducerEpoch, "0")
+		req.Header.Set(protocol.HeaderProducerSeq, "0")
+
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusOK {
+			t.Errorf("status = %d, want %d. Body: %s", rec.Code, http.StatusOK, rec.Body.String())
+		}
+
+		// Check response headers
+		if rec.Header().Get(protocol.HeaderStreamNextOffset) == "" {
+			t.Error("missing Stream-Next-Offset header")
+		}
+		if rec.Header().Get(protocol.HeaderProducerEpoch) != "0" {
+			t.Errorf("Producer-Epoch = %q, want 0", rec.Header().Get(protocol.HeaderProducerEpoch))
+		}
+		if rec.Header().Get(protocol.HeaderProducerSeq) != "0" {
+			t.Errorf("Producer-Seq = %q, want 0", rec.Header().Get(protocol.HeaderProducerSeq))
+		}
+	})
+}
+
+func TestHandler_POST_IdempotentProducer_Sequential(t *testing.T) {
+	storage := memorystorage.New()
+	handler := durablestream.NewHandler(storage, nil)
+
+	_, _ = storage.Create(context.Background(), "/stream", durablestream.StreamConfig{
+		ContentType: "text/plain",
+	})
+
+	// Send seq=0
+	req0 := httptest.NewRequest(http.MethodPost, "/stream", strings.NewReader("msg0"))
+	req0.Header.Set("Content-Type", "text/plain")
+	req0.Header.Set(protocol.HeaderProducerID, "test-producer")
+	req0.Header.Set(protocol.HeaderProducerEpoch, "0")
+	req0.Header.Set(protocol.HeaderProducerSeq, "0")
+	rec0 := httptest.NewRecorder()
+	handler.ServeHTTP(rec0, req0)
+
+	if rec0.Code != http.StatusOK {
+		t.Fatalf("seq=0 status = %d, want %d", rec0.Code, http.StatusOK)
+	}
+
+	// Send seq=1
+	req1 := httptest.NewRequest(http.MethodPost, "/stream", strings.NewReader("msg1"))
+	req1.Header.Set("Content-Type", "text/plain")
+	req1.Header.Set(protocol.HeaderProducerID, "test-producer")
+	req1.Header.Set(protocol.HeaderProducerEpoch, "0")
+	req1.Header.Set(protocol.HeaderProducerSeq, "1")
+	rec1 := httptest.NewRecorder()
+	handler.ServeHTTP(rec1, req1)
+
+	if rec1.Code != http.StatusOK {
+		t.Errorf("seq=1 status = %d, want %d", rec1.Code, http.StatusOK)
+	}
+
+	// Send seq=2
+	req2 := httptest.NewRequest(http.MethodPost, "/stream", strings.NewReader("msg2"))
+	req2.Header.Set("Content-Type", "text/plain")
+	req2.Header.Set(protocol.HeaderProducerID, "test-producer")
+	req2.Header.Set(protocol.HeaderProducerEpoch, "0")
+	req2.Header.Set(protocol.HeaderProducerSeq, "2")
+	rec2 := httptest.NewRecorder()
+	handler.ServeHTTP(rec2, req2)
+
+	if rec2.Code != http.StatusOK {
+		t.Errorf("seq=2 status = %d, want %d", rec2.Code, http.StatusOK)
+	}
+}
+
+func TestHandler_POST_IdempotentProducer_Duplicate(t *testing.T) {
+	storage := memorystorage.New()
+	handler := durablestream.NewHandler(storage, nil)
+
+	_, _ = storage.Create(context.Background(), "/stream", durablestream.StreamConfig{
+		ContentType: "text/plain",
+	})
+
+	// First append
+	req1 := httptest.NewRequest(http.MethodPost, "/stream", strings.NewReader("hello"))
+	req1.Header.Set("Content-Type", "text/plain")
+	req1.Header.Set(protocol.HeaderProducerID, "test-producer")
+	req1.Header.Set(protocol.HeaderProducerEpoch, "0")
+	req1.Header.Set(protocol.HeaderProducerSeq, "0")
+	rec1 := httptest.NewRecorder()
+	handler.ServeHTTP(rec1, req1)
+
+	if rec1.Code != http.StatusOK {
+		t.Fatalf("first append status = %d, want %d", rec1.Code, http.StatusOK)
+	}
+
+	// Duplicate append (same seq=0) - should return 204
+	req2 := httptest.NewRequest(http.MethodPost, "/stream", strings.NewReader("hello"))
+	req2.Header.Set("Content-Type", "text/plain")
+	req2.Header.Set(protocol.HeaderProducerID, "test-producer")
+	req2.Header.Set(protocol.HeaderProducerEpoch, "0")
+	req2.Header.Set(protocol.HeaderProducerSeq, "0")
+	rec2 := httptest.NewRecorder()
+	handler.ServeHTTP(rec2, req2)
+
+	if rec2.Code != http.StatusNoContent {
+		t.Errorf("duplicate append status = %d, want %d. Body: %s", rec2.Code, http.StatusNoContent, rec2.Body.String())
+	}
+
+	// Check response headers are still present
+	if rec2.Header().Get(protocol.HeaderProducerEpoch) != "0" {
+		t.Errorf("Producer-Epoch = %q, want 0", rec2.Header().Get(protocol.HeaderProducerEpoch))
+	}
+	if rec2.Header().Get(protocol.HeaderProducerSeq) != "0" {
+		t.Errorf("Producer-Seq = %q, want 0", rec2.Header().Get(protocol.HeaderProducerSeq))
+	}
+}
+
+func TestHandler_POST_IdempotentProducer_EpochUpgrade(t *testing.T) {
+	storage := memorystorage.New()
+	handler := durablestream.NewHandler(storage, nil)
+
+	_, _ = storage.Create(context.Background(), "/stream", durablestream.StreamConfig{
+		ContentType: "text/plain",
+	})
+
+	// Establish epoch=0
+	req0 := httptest.NewRequest(http.MethodPost, "/stream", strings.NewReader("epoch0"))
+	req0.Header.Set("Content-Type", "text/plain")
+	req0.Header.Set(protocol.HeaderProducerID, "test-producer")
+	req0.Header.Set(protocol.HeaderProducerEpoch, "0")
+	req0.Header.Set(protocol.HeaderProducerSeq, "0")
+	rec0 := httptest.NewRecorder()
+	handler.ServeHTTP(rec0, req0)
+
+	if rec0.Code != http.StatusOK {
+		t.Fatalf("epoch=0 status = %d, want %d", rec0.Code, http.StatusOK)
+	}
+
+	// Upgrade to epoch=1, seq=0
+	req1 := httptest.NewRequest(http.MethodPost, "/stream", strings.NewReader("epoch1"))
+	req1.Header.Set("Content-Type", "text/plain")
+	req1.Header.Set(protocol.HeaderProducerID, "test-producer")
+	req1.Header.Set(protocol.HeaderProducerEpoch, "1")
+	req1.Header.Set(protocol.HeaderProducerSeq, "0")
+	rec1 := httptest.NewRecorder()
+	handler.ServeHTTP(rec1, req1)
+
+	if rec1.Code != http.StatusOK {
+		t.Errorf("epoch=1 status = %d, want %d. Body: %s", rec1.Code, http.StatusOK, rec1.Body.String())
+	}
+	if rec1.Header().Get(protocol.HeaderProducerEpoch) != "1" {
+		t.Errorf("Producer-Epoch = %q, want 1", rec1.Header().Get(protocol.HeaderProducerEpoch))
+	}
+}
+
+func TestHandler_POST_IdempotentProducer_StaleEpoch(t *testing.T) {
+	storage := memorystorage.New()
+	handler := durablestream.NewHandler(storage, nil)
+
+	_, _ = storage.Create(context.Background(), "/stream", durablestream.StreamConfig{
+		ContentType: "text/plain",
+	})
+
+	// Establish epoch=1
+	req1 := httptest.NewRequest(http.MethodPost, "/stream", strings.NewReader("msg"))
+	req1.Header.Set("Content-Type", "text/plain")
+	req1.Header.Set(protocol.HeaderProducerID, "test-producer")
+	req1.Header.Set(protocol.HeaderProducerEpoch, "1")
+	req1.Header.Set(protocol.HeaderProducerSeq, "0")
+	rec1 := httptest.NewRecorder()
+	handler.ServeHTTP(rec1, req1)
+
+	if rec1.Code != http.StatusOK {
+		t.Fatalf("epoch=1 status = %d, want %d", rec1.Code, http.StatusOK)
+	}
+
+	// Try to write with epoch=0 (stale) - should get 403
+	req0 := httptest.NewRequest(http.MethodPost, "/stream", strings.NewReader("zombie"))
+	req0.Header.Set("Content-Type", "text/plain")
+	req0.Header.Set(protocol.HeaderProducerID, "test-producer")
+	req0.Header.Set(protocol.HeaderProducerEpoch, "0")
+	req0.Header.Set(protocol.HeaderProducerSeq, "0")
+	rec0 := httptest.NewRecorder()
+	handler.ServeHTTP(rec0, req0)
+
+	if rec0.Code != http.StatusForbidden {
+		t.Errorf("stale epoch status = %d, want %d. Body: %s", rec0.Code, http.StatusForbidden, rec0.Body.String())
+	}
+
+	// Response should include current epoch
+	if rec0.Header().Get(protocol.HeaderProducerEpoch) != "1" {
+		t.Errorf("Producer-Epoch = %q, want 1 (current epoch)", rec0.Header().Get(protocol.HeaderProducerEpoch))
+	}
+}
+
+func TestHandler_POST_IdempotentProducer_SequenceGap(t *testing.T) {
+	storage := memorystorage.New()
+	handler := durablestream.NewHandler(storage, nil)
+
+	_, _ = storage.Create(context.Background(), "/stream", durablestream.StreamConfig{
+		ContentType: "text/plain",
+	})
+
+	// Send seq=0
+	req0 := httptest.NewRequest(http.MethodPost, "/stream", strings.NewReader("msg0"))
+	req0.Header.Set("Content-Type", "text/plain")
+	req0.Header.Set(protocol.HeaderProducerID, "test-producer")
+	req0.Header.Set(protocol.HeaderProducerEpoch, "0")
+	req0.Header.Set(protocol.HeaderProducerSeq, "0")
+	rec0 := httptest.NewRecorder()
+	handler.ServeHTTP(rec0, req0)
+
+	if rec0.Code != http.StatusOK {
+		t.Fatalf("seq=0 status = %d, want %d", rec0.Code, http.StatusOK)
+	}
+
+	// Skip seq=1, send seq=2 (should fail with 409 Conflict)
+	req2 := httptest.NewRequest(http.MethodPost, "/stream", strings.NewReader("msg2"))
+	req2.Header.Set("Content-Type", "text/plain")
+	req2.Header.Set(protocol.HeaderProducerID, "test-producer")
+	req2.Header.Set(protocol.HeaderProducerEpoch, "0")
+	req2.Header.Set(protocol.HeaderProducerSeq, "2")
+	rec2 := httptest.NewRecorder()
+	handler.ServeHTTP(rec2, req2)
+
+	if rec2.Code != http.StatusConflict {
+		t.Errorf("sequence gap status = %d, want %d. Body: %s", rec2.Code, http.StatusConflict, rec2.Body.String())
+	}
+
+	// Check gap error headers
+	if rec2.Header().Get(protocol.HeaderProducerExpectedSeq) != "1" {
+		t.Errorf("Producer-Expected-Seq = %q, want 1", rec2.Header().Get(protocol.HeaderProducerExpectedSeq))
+	}
+	if rec2.Header().Get(protocol.HeaderProducerReceivedSeq) != "2" {
+		t.Errorf("Producer-Received-Seq = %q, want 2", rec2.Header().Get(protocol.HeaderProducerReceivedSeq))
+	}
+}
+
+func TestHandler_POST_IdempotentProducer_NewEpochMustStartAtZero(t *testing.T) {
+	storage := memorystorage.New()
+	handler := durablestream.NewHandler(storage, nil)
+
+	_, _ = storage.Create(context.Background(), "/stream", durablestream.StreamConfig{
+		ContentType: "text/plain",
+	})
+
+	// Establish epoch=0
+	req0 := httptest.NewRequest(http.MethodPost, "/stream", strings.NewReader("msg"))
+	req0.Header.Set("Content-Type", "text/plain")
+	req0.Header.Set(protocol.HeaderProducerID, "test-producer")
+	req0.Header.Set(protocol.HeaderProducerEpoch, "0")
+	req0.Header.Set(protocol.HeaderProducerSeq, "0")
+	rec0 := httptest.NewRecorder()
+	handler.ServeHTTP(rec0, req0)
+
+	if rec0.Code != http.StatusOK {
+		t.Fatalf("epoch=0 status = %d, want %d", rec0.Code, http.StatusOK)
+	}
+
+	// Try epoch=1 with seq=5 (should fail - new epoch must start at seq=0)
+	req1 := httptest.NewRequest(http.MethodPost, "/stream", strings.NewReader("msg"))
+	req1.Header.Set("Content-Type", "text/plain")
+	req1.Header.Set(protocol.HeaderProducerID, "test-producer")
+	req1.Header.Set(protocol.HeaderProducerEpoch, "1")
+	req1.Header.Set(protocol.HeaderProducerSeq, "5")
+	rec1 := httptest.NewRecorder()
+	handler.ServeHTTP(rec1, req1)
+
+	if rec1.Code != http.StatusBadRequest {
+		t.Errorf("new epoch with seq!=0 status = %d, want %d. Body: %s", rec1.Code, http.StatusBadRequest, rec1.Body.String())
+	}
+}
+
+func TestHandler_POST_IdempotentProducer_PartialHeaders(t *testing.T) {
+	storage := memorystorage.New()
+	handler := durablestream.NewHandler(storage, nil)
+
+	_, _ = storage.Create(context.Background(), "/stream", durablestream.StreamConfig{
+		ContentType: "text/plain",
+	})
+
+	tests := []struct {
+		name  string
+		id    string
+		epoch string
+		seq   string
+	}{
+		{"only Producer-Id", "test", "", ""},
+		{"only Producer-Epoch", "", "0", ""},
+		{"only Producer-Seq", "", "", "0"},
+		{"missing Producer-Seq", "test", "0", ""},
+		{"missing Producer-Epoch", "test", "", "0"},
+		{"missing Producer-Id", "", "0", "0"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodPost, "/stream", strings.NewReader("data"))
+			req.Header.Set("Content-Type", "text/plain")
+			if tt.id != "" {
+				req.Header.Set(protocol.HeaderProducerID, tt.id)
+			}
+			if tt.epoch != "" {
+				req.Header.Set(protocol.HeaderProducerEpoch, tt.epoch)
+			}
+			if tt.seq != "" {
+				req.Header.Set(protocol.HeaderProducerSeq, tt.seq)
+			}
+
+			rec := httptest.NewRecorder()
+			handler.ServeHTTP(rec, req)
+
+			if rec.Code != http.StatusBadRequest {
+				t.Errorf("status = %d, want %d. Body: %s", rec.Code, http.StatusBadRequest, rec.Body.String())
+			}
+		})
+	}
+}
+
+func TestHandler_POST_IdempotentProducer_InvalidFormats(t *testing.T) {
+	storage := memorystorage.New()
+	handler := durablestream.NewHandler(storage, nil)
+
+	_, _ = storage.Create(context.Background(), "/stream", durablestream.StreamConfig{
+		ContentType: "text/plain",
+	})
+
+	tests := []struct {
+		name  string
+		epoch string
+		seq   string
+	}{
+		{"non-integer epoch", "abc", "0"},
+		{"non-integer seq", "0", "xyz"},
+		{"leading zero epoch", "01", "0"},
+		{"leading zero seq", "0", "01"},
+		{"plus sign epoch", "+1", "0"},
+		{"plus sign seq", "0", "+1"},
+		{"negative epoch", "-1", "0"},
+		{"negative seq", "0", "-1"},
+		{"floating point epoch", "1.5", "0"},
+		{"floating point seq", "0", "1.5"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodPost, "/stream", strings.NewReader("data"))
+			req.Header.Set("Content-Type", "text/plain")
+			req.Header.Set(protocol.HeaderProducerID, "test-producer")
+			req.Header.Set(protocol.HeaderProducerEpoch, tt.epoch)
+			req.Header.Set(protocol.HeaderProducerSeq, tt.seq)
+
+			rec := httptest.NewRecorder()
+			handler.ServeHTTP(rec, req)
+
+			if rec.Code != http.StatusBadRequest {
+				t.Errorf("status = %d, want %d. Body: %s", rec.Code, http.StatusBadRequest, rec.Body.String())
+			}
+		})
+	}
+}
+
+func TestHandler_POST_IdempotentProducer_MultipleProducers(t *testing.T) {
+	storage := memorystorage.New()
+	handler := durablestream.NewHandler(storage, nil)
+
+	_, _ = storage.Create(context.Background(), "/stream", durablestream.StreamConfig{
+		ContentType: "text/plain",
+	})
+
+	// Producer A: seq=0
+	reqA0 := httptest.NewRequest(http.MethodPost, "/stream", strings.NewReader("A-msg0"))
+	reqA0.Header.Set("Content-Type", "text/plain")
+	reqA0.Header.Set(protocol.HeaderProducerID, "producer-A")
+	reqA0.Header.Set(protocol.HeaderProducerEpoch, "0")
+	reqA0.Header.Set(protocol.HeaderProducerSeq, "0")
+	recA0 := httptest.NewRecorder()
+	handler.ServeHTTP(recA0, reqA0)
+
+	if recA0.Code != http.StatusOK {
+		t.Fatalf("producer-A seq=0 status = %d, want %d", recA0.Code, http.StatusOK)
+	}
+
+	// Producer B: seq=0 (should be independent)
+	reqB0 := httptest.NewRequest(http.MethodPost, "/stream", strings.NewReader("B-msg0"))
+	reqB0.Header.Set("Content-Type", "text/plain")
+	reqB0.Header.Set(protocol.HeaderProducerID, "producer-B")
+	reqB0.Header.Set(protocol.HeaderProducerEpoch, "0")
+	reqB0.Header.Set(protocol.HeaderProducerSeq, "0")
+	recB0 := httptest.NewRecorder()
+	handler.ServeHTTP(recB0, reqB0)
+
+	if recB0.Code != http.StatusOK {
+		t.Errorf("producer-B seq=0 status = %d, want %d. Body: %s", recB0.Code, http.StatusOK, recB0.Body.String())
+	}
+
+	// Producer A: seq=1
+	reqA1 := httptest.NewRequest(http.MethodPost, "/stream", strings.NewReader("A-msg1"))
+	reqA1.Header.Set("Content-Type", "text/plain")
+	reqA1.Header.Set(protocol.HeaderProducerID, "producer-A")
+	reqA1.Header.Set(protocol.HeaderProducerEpoch, "0")
+	reqA1.Header.Set(protocol.HeaderProducerSeq, "1")
+	recA1 := httptest.NewRecorder()
+	handler.ServeHTTP(recA1, reqA1)
+
+	if recA1.Code != http.StatusOK {
+		t.Errorf("producer-A seq=1 status = %d, want %d", recA1.Code, http.StatusOK)
+	}
+
+	// Producer B: seq=1
+	reqB1 := httptest.NewRequest(http.MethodPost, "/stream", strings.NewReader("B-msg1"))
+	reqB1.Header.Set("Content-Type", "text/plain")
+	reqB1.Header.Set(protocol.HeaderProducerID, "producer-B")
+	reqB1.Header.Set(protocol.HeaderProducerEpoch, "0")
+	reqB1.Header.Set(protocol.HeaderProducerSeq, "1")
+	recB1 := httptest.NewRecorder()
+	handler.ServeHTTP(recB1, reqB1)
+
+	if recB1.Code != http.StatusOK {
+		t.Errorf("producer-B seq=1 status = %d, want %d", recB1.Code, http.StatusOK)
+	}
+}
+
+func TestHandler_POST_IdempotentProducer_WithStreamSeq(t *testing.T) {
+	storage := memorystorage.New()
+	handler := durablestream.NewHandler(storage, nil)
+
+	_, _ = storage.Create(context.Background(), "/stream", durablestream.StreamConfig{
+		ContentType: "text/plain",
+	})
+
+	// Both producer headers and Stream-Seq should work together
+	req := httptest.NewRequest(http.MethodPost, "/stream", strings.NewReader("data"))
+	req.Header.Set("Content-Type", "text/plain")
+	req.Header.Set(protocol.HeaderProducerID, "test-producer")
+	req.Header.Set(protocol.HeaderProducerEpoch, "0")
+	req.Header.Set(protocol.HeaderProducerSeq, "0")
+	req.Header.Set(protocol.HeaderStreamSeq, "seq_001")
+
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Errorf("status = %d, want %d. Body: %s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+}
+
+func TestHandler_POST_IdempotentProducer_NoProducerHeadersStillWorks(t *testing.T) {
+	storage := memorystorage.New()
+	handler := durablestream.NewHandler(storage, nil)
+
+	_, _ = storage.Create(context.Background(), "/stream", durablestream.StreamConfig{
+		ContentType: "text/plain",
+	})
+
+	// Append without producer headers should return 204 (old behavior)
+	req := httptest.NewRequest(http.MethodPost, "/stream", strings.NewReader("data"))
+	req.Header.Set("Content-Type", "text/plain")
+
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusNoContent {
+		t.Errorf("status = %d, want %d. Body: %s", rec.Code, http.StatusNoContent, rec.Body.String())
+	}
+}
+
+func TestHandler_POST_IdempotentProducer_JSON(t *testing.T) {
+	storage := memorystorage.New()
+	handler := durablestream.NewHandler(storage, nil)
+
+	_, _ = storage.Create(context.Background(), "/stream", durablestream.StreamConfig{
+		ContentType: "application/json",
+	})
+
+	t.Run("JSON object with producer headers", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodPost, "/stream", strings.NewReader(`{"event":"test"}`))
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set(protocol.HeaderProducerID, "test-producer")
+		req.Header.Set(protocol.HeaderProducerEpoch, "0")
+		req.Header.Set(protocol.HeaderProducerSeq, "0")
+
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusOK {
+			t.Errorf("status = %d, want %d. Body: %s", rec.Code, http.StatusOK, rec.Body.String())
+		}
+	})
+
+	t.Run("JSON array (flattened) with producer headers", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodPost, "/stream", strings.NewReader(`[{"id":1},{"id":2}]`))
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set(protocol.HeaderProducerID, "test-producer")
+		req.Header.Set(protocol.HeaderProducerEpoch, "0")
+		req.Header.Set(protocol.HeaderProducerSeq, "1")
+
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusOK {
+			t.Errorf("status = %d, want %d. Body: %s", rec.Code, http.StatusOK, rec.Body.String())
+		}
+	})
+
+	t.Run("duplicate JSON append returns 204", func(t *testing.T) {
+		// Retry seq=1
+		req := httptest.NewRequest(http.MethodPost, "/stream", strings.NewReader(`[{"id":1},{"id":2}]`))
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set(protocol.HeaderProducerID, "test-producer")
+		req.Header.Set(protocol.HeaderProducerEpoch, "0")
+		req.Header.Set(protocol.HeaderProducerSeq, "1")
+
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusNoContent {
+			t.Errorf("status = %d, want %d. Body: %s", rec.Code, http.StatusNoContent, rec.Body.String())
+		}
+	})
+}
+
+func TestHandler_POST_IdempotentProducer_InitialSequenceGap(t *testing.T) {
+	storage := memorystorage.New()
+	handler := durablestream.NewHandler(storage, nil)
+
+	_, _ = storage.Create(context.Background(), "/stream", durablestream.StreamConfig{
+		ContentType: "text/plain",
+	})
+
+	// New producer must start at seq=0
+	req := httptest.NewRequest(http.MethodPost, "/stream", strings.NewReader("data"))
+	req.Header.Set("Content-Type", "text/plain")
+	req.Header.Set(protocol.HeaderProducerID, "new-producer")
+	req.Header.Set(protocol.HeaderProducerEpoch, "0")
+	req.Header.Set(protocol.HeaderProducerSeq, "5") // Should fail
+
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusConflict {
+		t.Errorf("status = %d, want %d. Body: %s", rec.Code, http.StatusConflict, rec.Body.String())
+	}
+
+	// Check expected seq header
+	if rec.Header().Get(protocol.HeaderProducerExpectedSeq) != "0" {
+		t.Errorf("Producer-Expected-Seq = %q, want 0", rec.Header().Get(protocol.HeaderProducerExpectedSeq))
+	}
+}
