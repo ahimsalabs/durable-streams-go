@@ -131,6 +131,63 @@ func TestCreate(t *testing.T) {
 		}
 	})
 
+	t.Run("allows recreation of expired stream", func(t *testing.T) {
+		s := New()
+
+		// Create with already-expired ExpiresAt
+		_, err := s.Create(context.Background(), "expired-test", durablestream.StreamConfig{
+			ContentType: "text/plain",
+			ExpiresAt:   time.Now().Add(-time.Hour), // Already expired
+		})
+		if err != nil {
+			t.Fatalf("first create: %v", err)
+		}
+
+		// Should be able to recreate since original is expired
+		created, err := s.Create(context.Background(), "expired-test", durablestream.StreamConfig{
+			ContentType: "application/json",
+		})
+		if err != nil {
+			t.Fatalf("recreation should succeed for expired stream: %v", err)
+		}
+		if !created {
+			t.Error("expected created=true when replacing expired stream")
+		}
+	})
+
+	t.Run("idempotent create with same TTL but different computed ExpiresAt", func(t *testing.T) {
+		s := New()
+		now := time.Now()
+
+		// First create with TTL (simulating what handler does)
+		cfg1 := durablestream.StreamConfig{
+			ContentType: "text/plain",
+			TTL:         time.Hour,
+			ExpiresAt:   now.Add(time.Hour),
+		}
+		created1, err := s.Create(context.Background(), "ttl-idem", cfg1)
+		if err != nil {
+			t.Fatalf("first create: %v", err)
+		}
+		if !created1 {
+			t.Error("first create should return created=true")
+		}
+
+		// Second create with same TTL but different ExpiresAt (computed later)
+		cfg2 := durablestream.StreamConfig{
+			ContentType: "text/plain",
+			TTL:         time.Hour,
+			ExpiresAt:   now.Add(time.Hour + time.Second), // Slightly later
+		}
+		created2, err := s.Create(context.Background(), "ttl-idem", cfg2)
+		if err != nil {
+			t.Fatalf("second create should be idempotent: %v", err)
+		}
+		if created2 {
+			t.Error("second create should return created=false (idempotent)")
+		}
+	})
+
 	t.Run("initializes JSON messages slice for JSON content type", func(t *testing.T) {
 		s := New()
 		_, err := s.Create(context.Background(), "test", durablestream.StreamConfig{
@@ -855,6 +912,18 @@ func TestConfigsMatch(t *testing.T) {
 			a:    durablestream.StreamConfig{ContentType: "TEXT/PLAIN"},
 			b:    durablestream.StreamConfig{ContentType: "text/plain"},
 			want: true,
+		},
+		{
+			name: "same TTL with different ExpiresAt should match (idempotent)",
+			a:    durablestream.StreamConfig{ContentType: "text/plain", TTL: time.Hour, ExpiresAt: now},
+			b:    durablestream.StreamConfig{ContentType: "text/plain", TTL: time.Hour, ExpiresAt: now.Add(time.Second)},
+			want: true,
+		},
+		{
+			name: "different ExpiresAt without TTL should not match",
+			a:    durablestream.StreamConfig{ContentType: "text/plain", TTL: 0, ExpiresAt: now},
+			b:    durablestream.StreamConfig{ContentType: "text/plain", TTL: 0, ExpiresAt: now.Add(time.Hour)},
+			want: false,
 		},
 	}
 

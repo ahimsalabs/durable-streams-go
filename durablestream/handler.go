@@ -164,6 +164,7 @@ func (h *Handler) handleCreate(w http.ResponseWriter, r *http.Request, streamID 
 			return
 		}
 		cfg.TTL = time.Duration(ttlSec) * time.Second
+		cfg.ExpiresAt = time.Now().Add(cfg.TTL)
 	}
 
 	if hasExpiresAt {
