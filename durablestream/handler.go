@@ -22,7 +22,7 @@ const (
 	defaultSSECloseAfter   = 60 * time.Second
 
 	// Security headers per protocol Section 10.7
-	headerXContentTypeOptions      = "X-Content-Type-Options"
+	headerXContentTypeOptions       = "X-Content-Type-Options"
 	headerCrossOriginResourcePolicy = "Cross-Origin-Resource-Policy"
 )
 
@@ -646,7 +646,8 @@ func (h *Handler) handleCatchupRead(w http.ResponseWriter, r *http.Request, stre
 	// Compute ETag (Section 5.5)
 	// Format: "{streamID}:{start_offset}:{end_offset}"
 	// ETag must be quoted per HTTP spec (RFC 7232)
-	etag := fmt.Sprintf(`"%s:%s:%s"`, streamID, offset, result.NextOffset)
+	// Sanitize streamID to ensure no control characters in header value
+	etag := fmt.Sprintf(`"%s:%s:%s"`, SanitizeForETag(streamID), offset, result.NextOffset)
 
 	// Check If-None-Match for 304 Not Modified (Section 8.1)
 	// Per spec: "When a client provides a valid If-None-Match header that matches
@@ -1100,6 +1101,34 @@ func etagMatches(ifNoneMatch, etag string) bool {
 	}
 
 	return false
+}
+
+// SanitizeForETag encodes characters that are invalid in HTTP header values.
+// Per RFC 7230, header values must not contain NUL, CR, or LF characters.
+// We URL-encode any byte < 0x20 (control characters) or > 0x7E to ensure valid HTTP headers.
+func SanitizeForETag(s string) string {
+	var needsEncoding bool
+	for i := 0; i < len(s); i++ {
+		if s[i] < 0x20 || s[i] > 0x7E {
+			needsEncoding = true
+			break
+		}
+	}
+	if !needsEncoding {
+		return s
+	}
+
+	var buf strings.Builder
+	buf.Grow(len(s) * 3) // worst case: all bytes need encoding
+	for i := 0; i < len(s); i++ {
+		b := s[i]
+		if b < 0x20 || b > 0x7E {
+			buf.WriteString(fmt.Sprintf("%%%02X", b))
+		} else {
+			buf.WriteByte(b)
+		}
+	}
+	return buf.String()
 }
 
 // limitedCountingReader wraps an io.Reader to count bytes read and enforce a size limit.
