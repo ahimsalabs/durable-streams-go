@@ -375,6 +375,23 @@ func (h *Handler) handleCatchupRead(w http.ResponseWriter, r *http.Request, stre
 		return
 	}
 
+	// Handle offset=now sentinel (Section 6)
+	// Returns empty response with current tail offset
+	if offset == Offset(protocol.OffsetNow) {
+		w.Header().Set("Content-Type", info.ContentType)
+		w.Header().Set(protocol.HeaderStreamNextOffset, info.NextOffset.String())
+		w.Header().Set(protocol.HeaderStreamUpToDate, "true")
+		// Per spec: SHOULD return Cache-Control: no-store for offset=now
+		w.Header().Set("Cache-Control", "no-store")
+
+		w.WriteHeader(http.StatusOK)
+		// Return empty body appropriate to content type
+		if protocol.IsJSONContentType(info.ContentType) {
+			_, _ = w.Write([]byte("[]"))
+		}
+		return
+	}
+
 	// Read data
 	result, err := h.storage.Read(r.Context(), streamID, offset, h.chunkSize)
 	if err != nil {
@@ -413,30 +430,46 @@ func (h *Handler) handleLongPoll(w http.ResponseWriter, r *http.Request, streamI
 		return
 	}
 
-	// Try immediate read first
-	result, err := h.storage.Read(r.Context(), streamID, offset, h.chunkSize)
-	if err != nil {
-		writeStorageError(w, err)
-		return
-	}
-
-	// If messages available, return immediately
-	if len(result.Messages) > 0 {
+	// Handle offset=now sentinel (Section 6)
+	// For long-poll, immediately begin waiting (no initial empty response)
+	isOffsetNow := offset == Offset(protocol.OffsetNow)
+	if isOffsetNow {
+		// Get the actual tail offset to wait from
 		info, err := h.storage.Head(r.Context(), streamID)
 		if err != nil {
 			writeStorageError(w, err)
 			return
 		}
+		// Replace "now" with actual tail offset for subscription
+		offset = info.NextOffset
+	}
 
-		w.Header().Set("Content-Type", info.ContentType)
-		w.Header().Set(protocol.HeaderStreamNextOffset, result.NextOffset.String())
-		w.Header().Set("Cache-Control", "public, max-age=60, stale-while-revalidate=300")
+	// Try immediate read first (skip for offset=now per spec)
+	if !isOffsetNow {
+		result, err := h.storage.Read(r.Context(), streamID, offset, h.chunkSize)
+		if err != nil {
+			writeStorageError(w, err)
+			return
+		}
 
-		responseBody := formatResponseBody(result.Messages, info.ContentType)
+		// If messages available, return immediately
+		if len(result.Messages) > 0 {
+			info, err := h.storage.Head(r.Context(), streamID)
+			if err != nil {
+				writeStorageError(w, err)
+				return
+			}
 
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write(responseBody)
-		return
+			w.Header().Set("Content-Type", info.ContentType)
+			w.Header().Set(protocol.HeaderStreamNextOffset, result.NextOffset.String())
+			w.Header().Set("Cache-Control", "public, max-age=60, stale-while-revalidate=300")
+
+			responseBody := formatResponseBody(result.Messages, info.ContentType)
+
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write(responseBody)
+			return
+		}
 	}
 
 	// No data available, subscribe and wait
@@ -490,17 +523,23 @@ func (h *Handler) handleLongPoll(w http.ResponseWriter, r *http.Request, streamI
 		w.Header().Set(protocol.HeaderStreamNextOffset, result.NextOffset.String())
 		w.Header().Set("Cache-Control", "public, max-age=60, stale-while-revalidate=300")
 
+		// Set Stream-Up-To-Date if at tail (per spec Section 5.6)
+		if result.NextOffset.Compare(result.TailOffset) == 0 {
+			w.Header().Set(protocol.HeaderStreamUpToDate, "true")
+		}
+
 		responseBody := formatResponseBody(result.Messages, info.ContentType)
 
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write(responseBody)
 
 	case <-waitCtx.Done():
-		// Timeout - return 204 No Content
+		// Timeout - return 204 No Content (per spec Section 5.6)
 		info, err := h.storage.Head(r.Context(), streamID)
 		if err == nil {
 			w.Header().Set(protocol.HeaderStreamNextOffset, info.NextOffset.String())
 		}
+		w.Header().Set(protocol.HeaderStreamUpToDate, "true")
 		w.WriteHeader(http.StatusNoContent)
 	}
 }
@@ -529,6 +568,14 @@ func (h *Handler) handleSSE(w http.ResponseWriter, r *http.Request, streamID str
 		return
 	}
 
+	// Handle offset=now sentinel (Section 6)
+	// Start from tail position, sending initial control event with upToDate
+	isOffsetNow := offset == Offset(protocol.OffsetNow)
+	if isOffsetNow {
+		// Replace "now" with actual tail offset
+		offset = info.NextOffset
+	}
+
 	// Set SSE headers
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
@@ -549,6 +596,17 @@ func (h *Handler) handleSSE(w http.ResponseWriter, r *http.Request, streamID str
 	defer closeTimer.Stop()
 
 	currentOffset := offset
+
+	// For offset=now, send initial control event with upToDate: true (per spec Section 6)
+	if isOffsetNow {
+		fmt.Fprintf(w, "event: control\n")
+		if cursor != "" {
+			fmt.Fprintf(w, "data: {\"streamNextOffset\":\"%s\",\"upToDate\":true,\"streamCursor\":\"%s\"}\n\n", currentOffset, cursor)
+		} else {
+			fmt.Fprintf(w, "data: {\"streamNextOffset\":\"%s\",\"upToDate\":true}\n\n", currentOffset)
+		}
+		flusher.Flush()
+	}
 
 	// Stream loop
 	for {

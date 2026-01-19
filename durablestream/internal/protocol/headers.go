@@ -35,3 +35,10 @@ const (
 	LiveModeLongPoll = "long-poll"
 	LiveModeSSE      = "sse"
 )
+
+// Offset sentinel values.
+const (
+	// OffsetNow is the special offset value that indicates the current tail position.
+	// Per spec Section 6: allows clients to skip historical data and read only future data.
+	OffsetNow = "now"
+)
