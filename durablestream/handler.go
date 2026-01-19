@@ -201,12 +201,13 @@ func (h *Handler) handleCreate(w http.ResponseWriter, r *http.Request, streamID 
 		if len(body) > 0 {
 			// For JSON mode, process the body
 			if protocol.IsJSONContentType(contentType) {
-				messages, err := protocol.ProcessJSONAppend(body)
+				// Use ProcessJSONCreate for PUT - allows empty arrays per Section 7.1
+				messages, err := protocol.ProcessJSONCreate(body)
 				if err != nil {
 					writeError(w, newError(codeBadRequest, err.Error()))
 					return
 				}
-				// Append each message
+				// Append each message (may be empty for [] body)
 				for _, msg := range messages {
 					nextOffset, err = h.storage.Append(r.Context(), streamID, msg, "")
 					if err != nil {

@@ -17,7 +17,21 @@ var (
 // ProcessJSONAppend validates JSON and flattens one level of arrays.
 // Returns individual messages to store.
 // Per spec Section 7.1: "servers MUST flatten exactly one level of the array"
+// Empty arrays are rejected per Section 7.1 (no-op append not allowed).
 func ProcessJSONAppend(data []byte) ([][]byte, error) {
+	return processJSON(data, false)
+}
+
+// ProcessJSONCreate validates JSON and flattens one level of arrays for PUT (create) operations.
+// Unlike ProcessJSONAppend, this allows empty arrays per spec Section 7.1:
+// "PUT requests with an empty array body (`[]`) are valid and create an empty stream."
+func ProcessJSONCreate(data []byte) ([][]byte, error) {
+	return processJSON(data, true)
+}
+
+// processJSON is the shared implementation for JSON processing.
+// allowEmptyArray controls whether empty arrays return an error (POST) or empty slice (PUT).
+func processJSON(data []byte, allowEmptyArray bool) ([][]byte, error) {
 	var temp interface{}
 	if err := json.Unmarshal(data, &temp); err != nil {
 		return nil, fmt.Errorf("%w: %v", ErrInvalidJSON, err)
@@ -29,6 +43,9 @@ func ProcessJSONAppend(data []byte) ([][]byte, error) {
 	}
 
 	if len(arr) == 0 {
+		if allowEmptyArray {
+			return [][]byte{}, nil
+		}
 		return nil, ErrEmptyArray
 	}
 
