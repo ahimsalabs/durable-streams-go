@@ -897,9 +897,12 @@ func (h *Handler) handleSSE(w http.ResponseWriter, r *http.Request, streamID str
 				jsonArray := formatResponseBody(result.Messages, info.ContentType)
 				fmt.Fprintf(w, "data: %s\n", string(jsonArray))
 			} else {
-				// For text/*, send concatenated data split by lines
+				// For text/*, send concatenated data split by lines.
+				// Per SSE spec, lines can be terminated by CR, LF, or CRLF.
+				// We must split by all terminators to prevent CRLF injection attacks
+				// where embedded CR characters could be interpreted as line terminators.
 				data := concatenateMessages(result.Messages)
-				lines := strings.Split(string(data), "\n")
+				lines := splitBySSELineTerminators(string(data))
 				for _, line := range lines {
 					fmt.Fprintf(w, "data: %s\n", line)
 				}
@@ -1035,6 +1038,44 @@ func concatenateMessages(messages []StoredMessage) []byte {
 		result = append(result, msg.Data...)
 	}
 	return result
+}
+
+// splitBySSELineTerminators splits a string by SSE line terminators (CR, LF, or CRLF).
+// Per the SSE spec, all three are valid line terminators. This function is used to
+// safely encode text data for SSE transmission, preventing CRLF injection attacks
+// where embedded CR or LF characters could be interpreted as event boundaries.
+func splitBySSELineTerminators(s string) []string {
+	if s == "" {
+		return []string{""}
+	}
+
+	var lines []string
+	var current strings.Builder
+
+	i := 0
+	for i < len(s) {
+		c := s[i]
+		if c == '\r' {
+			// CR - ends current line; if followed by LF, consume both as one terminator
+			lines = append(lines, current.String())
+			current.Reset()
+			if i+1 < len(s) && s[i+1] == '\n' {
+				i++ // Skip the LF in CRLF
+			}
+		} else if c == '\n' {
+			// LF - ends current line
+			lines = append(lines, current.String())
+			current.Reset()
+		} else {
+			current.WriteByte(c)
+		}
+		i++
+	}
+
+	// Append final segment (may be empty if string ended with terminator)
+	lines = append(lines, current.String())
+
+	return lines
 }
 
 // setSecurityHeaders adds browser security headers to the response.
