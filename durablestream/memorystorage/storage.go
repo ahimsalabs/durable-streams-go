@@ -45,7 +45,13 @@ func (m *Storage) Create(ctx context.Context, streamID string, cfg durablestream
 
 	existing, loaded := m.streams.LoadOrStore(streamID, stream)
 	if loaded {
-		// Stream already exists - check if config matches for idempotency
+		// Stream already exists - check if it's expired
+		if isExpired(existing.config) {
+			// Expired stream can be replaced (Section 5.1)
+			m.streams.Store(streamID, stream)
+			return true, nil
+		}
+		// Not expired - check if config matches for idempotency
 		if configsMatch(existing.config, cfg) {
 			return false, nil // Not newly created, but config matches
 		}
@@ -303,7 +309,9 @@ func configsMatch(a, b durablestream.StreamConfig) bool {
 	if a.TTL != b.TTL {
 		return false
 	}
-	if !a.ExpiresAt.Equal(b.ExpiresAt) {
+	// Only compare ExpiresAt directly when TTL isn't set (i.e., explicit Stream-Expires-At header).
+	// When TTL is set, ExpiresAt is derived from TTL at request time and will differ between requests.
+	if a.TTL == 0 && b.TTL == 0 && !a.ExpiresAt.Equal(b.ExpiresAt) {
 		return false
 	}
 	return true
