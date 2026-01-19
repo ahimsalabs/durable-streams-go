@@ -19,6 +19,10 @@ const (
 	defaultChunkSize       = 1 * 1024 * 1024  // 1MB
 	defaultLongPollTimeout = 30 * time.Second
 	defaultSSECloseAfter   = 60 * time.Second
+
+	// Security headers per protocol Section 10.7
+	headerXContentTypeOptions      = "X-Content-Type-Options"
+	headerCrossOriginResourcePolicy = "Cross-Origin-Resource-Policy"
 )
 
 // HandlerConfig configures a Handler.
@@ -203,6 +207,7 @@ func (h *Handler) handleCreate(w http.ResponseWriter, r *http.Request, streamID 
 	}
 
 	// Return success headers
+	setSecurityHeaders(w)
 	// Location must be absolute URL per RFC 7231
 	scheme := "http"
 	if r.TLS != nil || r.Header.Get("X-Forwarded-Proto") == "https" {
@@ -317,6 +322,7 @@ func (h *Handler) handleAppend(w http.ResponseWriter, r *http.Request, streamID 
 	}
 
 	// Return success
+	setSecurityHeaders(w)
 	w.Header().Set(protocol.HeaderStreamNextOffset, nextOffset.String())
 	w.WriteHeader(http.StatusNoContent)
 }
@@ -378,6 +384,7 @@ func (h *Handler) handleCatchupRead(w http.ResponseWriter, r *http.Request, stre
 	// Handle offset=now sentinel (Section 6)
 	// Returns empty response with current tail offset
 	if offset == Offset(protocol.OffsetNow) {
+		setSecurityHeaders(w)
 		w.Header().Set("Content-Type", info.ContentType)
 		w.Header().Set(protocol.HeaderStreamNextOffset, info.NextOffset.String())
 		w.Header().Set(protocol.HeaderStreamUpToDate, "true")
@@ -400,6 +407,7 @@ func (h *Handler) handleCatchupRead(w http.ResponseWriter, r *http.Request, stre
 	}
 
 	// Set headers
+	setSecurityHeaders(w)
 	w.Header().Set("Content-Type", info.ContentType)
 	w.Header().Set(protocol.HeaderStreamNextOffset, result.NextOffset.String())
 
@@ -429,6 +437,9 @@ func (h *Handler) handleLongPoll(w http.ResponseWriter, r *http.Request, streamI
 		writeError(w, newError(codeBadRequest, "offset required for long-poll"))
 		return
 	}
+
+	// Get cursor parameter for CDN collapsing (Section 8.1)
+	clientCursor := r.URL.Query().Get(protocol.QueryCursor)
 
 	// Handle offset=now sentinel (Section 6)
 	// For long-poll, immediately begin waiting (no initial empty response)
@@ -460,8 +471,10 @@ func (h *Handler) handleLongPoll(w http.ResponseWriter, r *http.Request, streamI
 				return
 			}
 
+			setSecurityHeaders(w)
 			w.Header().Set("Content-Type", info.ContentType)
 			w.Header().Set(protocol.HeaderStreamNextOffset, result.NextOffset.String())
+			w.Header().Set(protocol.HeaderStreamCursor, protocol.GenerateCursor(clientCursor))
 			w.Header().Set("Cache-Control", "public, max-age=60, stale-while-revalidate=300")
 
 			responseBody := formatResponseBody(result.Messages, info.ContentType)
@@ -519,8 +532,10 @@ func (h *Handler) handleLongPoll(w http.ResponseWriter, r *http.Request, streamI
 			return
 		}
 
+		setSecurityHeaders(w)
 		w.Header().Set("Content-Type", info.ContentType)
 		w.Header().Set(protocol.HeaderStreamNextOffset, result.NextOffset.String())
+		w.Header().Set(protocol.HeaderStreamCursor, protocol.GenerateCursor(clientCursor))
 		w.Header().Set("Cache-Control", "public, max-age=60, stale-while-revalidate=300")
 
 		// Set Stream-Up-To-Date if at tail (per spec Section 5.6)
@@ -535,10 +550,12 @@ func (h *Handler) handleLongPoll(w http.ResponseWriter, r *http.Request, streamI
 
 	case <-waitCtx.Done():
 		// Timeout - return 204 No Content (per spec Section 5.6)
+		setSecurityHeaders(w)
 		info, err := h.storage.Head(r.Context(), streamID)
 		if err == nil {
 			w.Header().Set(protocol.HeaderStreamNextOffset, info.NextOffset.String())
 		}
+		w.Header().Set(protocol.HeaderStreamCursor, protocol.GenerateCursor(clientCursor))
 		w.Header().Set(protocol.HeaderStreamUpToDate, "true")
 		w.WriteHeader(http.StatusNoContent)
 	}
@@ -552,8 +569,8 @@ func (h *Handler) handleSSE(w http.ResponseWriter, r *http.Request, streamID str
 		return
 	}
 
-	// Get cursor parameter for echo in control events
-	cursor := r.URL.Query().Get(protocol.QueryCursor)
+	// Get cursor parameter for CDN collapsing (Section 8.1)
+	clientCursor := r.URL.Query().Get(protocol.QueryCursor)
 
 	// Get stream info
 	info, err := h.storage.Head(r.Context(), streamID)
@@ -577,6 +594,7 @@ func (h *Handler) handleSSE(w http.ResponseWriter, r *http.Request, streamID str
 	}
 
 	// Set SSE headers
+	setSecurityHeaders(w)
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
@@ -600,11 +618,7 @@ func (h *Handler) handleSSE(w http.ResponseWriter, r *http.Request, streamID str
 	// For offset=now, send initial control event with upToDate: true (per spec Section 6)
 	if isOffsetNow {
 		fmt.Fprintf(w, "event: control\n")
-		if cursor != "" {
-			fmt.Fprintf(w, "data: {\"streamNextOffset\":\"%s\",\"upToDate\":true,\"streamCursor\":\"%s\"}\n\n", currentOffset, cursor)
-		} else {
-			fmt.Fprintf(w, "data: {\"streamNextOffset\":\"%s\",\"upToDate\":true}\n\n", currentOffset)
-		}
+		fmt.Fprintf(w, "data: {\"streamNextOffset\":\"%s\",\"upToDate\":true,\"streamCursor\":\"%s\"}\n\n", currentOffset, protocol.GenerateCursor(clientCursor))
 		flusher.Flush()
 	}
 
@@ -637,13 +651,9 @@ func (h *Handler) handleSSE(w http.ResponseWriter, r *http.Request, streamID str
 			}
 			fmt.Fprintf(w, "\n")
 
-			// Send control event with cursor if provided
+			// Send control event with generated cursor (Section 8.1)
 			fmt.Fprintf(w, "event: control\n")
-			if cursor != "" {
-				fmt.Fprintf(w, "data: {\"streamNextOffset\":\"%s\",\"streamCursor\":\"%s\"}\n\n", result.NextOffset, cursor)
-			} else {
-				fmt.Fprintf(w, "data: {\"streamNextOffset\":\"%s\"}\n\n", result.NextOffset)
-			}
+			fmt.Fprintf(w, "data: {\"streamNextOffset\":\"%s\",\"streamCursor\":\"%s\"}\n\n", result.NextOffset, protocol.GenerateCursor(clientCursor))
 
 			flusher.Flush()
 
@@ -696,6 +706,7 @@ func (h *Handler) handleHead(w http.ResponseWriter, r *http.Request, streamID st
 	}
 
 	// Set headers
+	setSecurityHeaders(w)
 	w.Header().Set("Content-Type", info.ContentType)
 	w.Header().Set(protocol.HeaderStreamNextOffset, info.NextOffset.String())
 
@@ -721,6 +732,7 @@ func (h *Handler) handleDelete(w http.ResponseWriter, r *http.Request, streamID 
 		return
 	}
 
+	setSecurityHeaders(w)
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -770,8 +782,17 @@ func concatenateMessages(messages []StoredMessage) []byte {
 	return result
 }
 
+// setSecurityHeaders adds browser security headers to the response.
+// Per protocol Section 10.7, these headers prevent MIME-sniffing attacks
+// and cross-origin embedding exploits.
+func setSecurityHeaders(w http.ResponseWriter) {
+	w.Header().Set(headerXContentTypeOptions, "nosniff")
+	w.Header().Set(headerCrossOriginResourcePolicy, "cross-origin")
+}
+
 // writeError writes a JSON error response.
 func writeError(w http.ResponseWriter, err *protoError) {
+	setSecurityHeaders(w)
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(err.Code.httpStatus())
 	_ = json.NewEncoder(w).Encode(err)
