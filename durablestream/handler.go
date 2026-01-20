@@ -274,7 +274,9 @@ func (h *Handler) handleAppend(w http.ResponseWriter, r *http.Request, streamID 
 		return
 	}
 
-	// Validate Content-Type is present and matches stream
+	// Validate Content-Type is present and matches stream (Section 5.2)
+	// Per spec: "MUST match the stream's existing content type"
+	// Per spec: "MUST return 409 Conflict when the content type is valid but does not match"
 	contentType := r.Header.Get("Content-Type")
 	if contentType == "" {
 		writeError(w, newError(codeBadRequest, "Content-Type header required"))
@@ -332,6 +334,7 @@ func (h *Handler) handleAppend(w http.ResponseWriter, r *http.Request, streamID 
 		}
 
 		// Reject empty body (Section 5.2)
+		// Per spec: "Servers MUST reject POST requests with an empty body...with 400 Bad Request"
 		if len(body) == 0 {
 			writeError(w, newError(codeBadRequest, "empty body not allowed"))
 			return
@@ -374,7 +377,8 @@ func (h *Handler) handleAppend(w http.ResponseWriter, r *http.Request, streamID 
 			return
 		}
 
-		// Check if body was empty (after streaming)
+		// Check if body was empty (after streaming) - Section 5.2
+		// Per spec: "Servers MUST reject POST requests with an empty body...with 400 Bad Request"
 		if limitedReader.n == 0 {
 			writeError(w, newError(codeBadRequest, "empty body not allowed"))
 			return
@@ -840,7 +844,8 @@ func (h *Handler) handleSSE(w http.ResponseWriter, r *http.Request, streamID str
 		return
 	}
 
-	// Validate content type supports SSE (Section 5.7)
+	// Validate content type supports SSE (Section 5.7, Section 7)
+	// Per spec: "ONLY valid for streams with content-type: text/* or application/json"
 	if !protocol.IsSSECompatible(info.ContentType) {
 		writeError(w, newError(codeBadRequest, "content type not compatible with SSE (must be text/* or application/json)"))
 		return
@@ -984,6 +989,7 @@ func (h *Handler) handleSSE(w http.ResponseWriter, r *http.Request, streamID str
 }
 
 // handleHead implements HEAD (Metadata) - Section 5.4
+// Response codes: 200 OK, 404 Not Found, 429 Too Many Requests (Section 5.4)
 func (h *Handler) handleHead(w http.ResponseWriter, r *http.Request, streamID string) {
 	info, err := h.storage.Head(r.Context(), streamID)
 	if err != nil {
@@ -991,12 +997,12 @@ func (h *Handler) handleHead(w http.ResponseWriter, r *http.Request, streamID st
 		return
 	}
 
-	// Set headers
+	// Set response headers per Section 5.4
 	setSecurityHeaders(w)
-	w.Header().Set("Content-Type", info.ContentType)
-	w.Header().Set(protocol.HeaderStreamNextOffset, info.NextOffset.String())
+	w.Header().Set("Content-Type", info.ContentType)                          // Per spec: stream's content type
+	w.Header().Set(protocol.HeaderStreamNextOffset, info.NextOffset.String()) // Per spec: current tail offset
 
-	// Set TTL/Expires-At if present
+	// Set TTL/Expires-At if present (Section 5.4)
 	if info.TTL > 0 {
 		w.Header().Set(protocol.HeaderStreamTTL, strconv.FormatInt(int64(info.TTL.Seconds()), 10))
 	}
@@ -1011,6 +1017,7 @@ func (h *Handler) handleHead(w http.ResponseWriter, r *http.Request, streamID st
 }
 
 // handleDelete implements DELETE (Delete) - Section 5.3
+// Response codes: 204 No Content (success), 404 Not Found, 429 Too Many Requests (Section 5.3)
 func (h *Handler) handleDelete(w http.ResponseWriter, r *http.Request, streamID string) {
 	err := h.storage.Delete(r.Context(), streamID)
 	if err != nil {

@@ -282,11 +282,13 @@ func (m *Storage) Subscribe(ctx context.Context, streamID string, offset durable
 
 // formatOffset formats an offset index as a zero-padded string.
 // Uses 10 digits to support up to 9,999,999,999 offsets.
+// Per Section 6: Offsets must be lexicographically sortable and strictly increasing.
 func formatOffset(idx int) durablestream.Offset {
 	return durablestream.Offset(fmt.Sprintf("%010d", idx))
 }
 
 // parseOffset parses an offset string back to an index.
+// Per Section 6: "-1" is the sentinel value for stream beginning.
 // Special value "-1" is treated as 0 (read from start).
 func parseOffset(offset durablestream.Offset) (int, error) {
 	if offset == "" || offset == "-1" {

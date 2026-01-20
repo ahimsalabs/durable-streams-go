@@ -54,8 +54,12 @@ const (
 	LiveModeSSE      = "sse"
 )
 
-// Offset sentinel values.
+// Offset sentinel values (PROTOCOL.md Section 6).
 const (
+	// OffsetStart is the special offset value that indicates the beginning of the stream.
+	// Per spec Section 6: semantically equivalent to omitting the offset parameter.
+	OffsetStart = "-1"
+
 	// OffsetNow is the special offset value that indicates the current tail position.
 	// Per spec Section 6: allows clients to skip historical data and read only future data.
 	OffsetNow = "now"
