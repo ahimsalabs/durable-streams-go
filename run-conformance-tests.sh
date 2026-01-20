@@ -5,7 +5,7 @@
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-ADAPTER_DIR="${SCRIPT_DIR}/cmd/conformance-adapter"
+ADAPTER_DIR="${SCRIPT_DIR}/conformance/adapter"
 ADAPTER_BIN="/tmp/durable-streams-go-conformance-adapter"
 
 # Colors for output
