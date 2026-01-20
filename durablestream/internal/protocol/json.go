@@ -16,7 +16,8 @@ var (
 
 // ProcessJSONAppend validates JSON and flattens one level of arrays.
 // Returns individual messages to store.
-// Per spec Section 7.1: "servers MUST flatten exactly one level of the array"
+// Per Section 7.1: "servers MUST flatten exactly one level of the array"
+// Per Section 7.1: "Servers MUST validate that appended data is valid JSON"
 // Empty arrays are rejected per Section 7.1 (no-op append not allowed).
 func ProcessJSONAppend(data []byte) ([][]byte, error) {
 	return processJSON(data, false)
@@ -62,6 +63,7 @@ func processJSON(data []byte, allowEmptyArray bool) ([][]byte, error) {
 }
 
 // FormatJSONResponse wraps messages in a JSON array for GET responses.
+// Per Section 7.1: "GET responses...MUST return...a JSON array of all messages"
 func FormatJSONResponse(messages [][]byte) []byte {
 	if len(messages) == 0 {
 		return []byte("[]")
@@ -97,6 +99,7 @@ func ContentTypesMatch(a, b string) bool {
 }
 
 // IsSSECompatible returns true if content type supports SSE mode.
+// Per Section 5.7/7: SSE "ONLY valid for streams with content-type: text/* or application/json"
 func IsSSECompatible(contentType string) bool {
 	parts := strings.Split(contentType, ";")
 	mediaType := strings.TrimSpace(parts[0])
