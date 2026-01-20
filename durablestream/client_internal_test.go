@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"io"
+	"net/http"
+	"net/http/httptest"
 	"testing"
 	"time"
 
@@ -395,6 +397,99 @@ func TestHttpStatusToErrorCode(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestClient_RetryOnTransientErrors(t *testing.T) {
+	t.Run("retries on 500 error", func(t *testing.T) {
+		attempts := 0
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			attempts++
+			if r.Method == http.MethodHead && attempts == 1 {
+				// First HEAD request fails with 500
+				w.WriteHeader(http.StatusInternalServerError)
+				return
+			}
+			// Subsequent requests succeed
+			w.Header().Set("Content-Type", "text/plain")
+			w.Header().Set("Stream-Next-Offset", "0_0")
+			w.WriteHeader(http.StatusOK)
+		}))
+		defer server.Close()
+
+		client := NewClient(server.URL, nil)
+		ctx := context.Background()
+
+		// Head should succeed after retry
+		_, err := client.Head(ctx, "/test")
+		if err != nil {
+			t.Fatalf("Head() error = %v, expected success after retry", err)
+		}
+
+		// Verify retry happened (at least 2 attempts)
+		if attempts < 2 {
+			t.Errorf("expected at least 2 attempts, got %d", attempts)
+		}
+	})
+
+	t.Run("retries on 503 error", func(t *testing.T) {
+		attempts := 0
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			attempts++
+			if r.Method == http.MethodPost && attempts == 1 {
+				// First POST request fails with 503
+				w.WriteHeader(http.StatusServiceUnavailable)
+				return
+			}
+			// Subsequent requests succeed
+			w.Header().Set("Content-Type", "text/plain")
+			w.Header().Set("Stream-Next-Offset", "0_5")
+			w.WriteHeader(http.StatusOK)
+		}))
+		defer server.Close()
+
+		client := NewClient(server.URL, nil)
+		ctx := context.Background()
+
+		// Create writer directly for internal testing
+		writer := &StreamWriter{
+			client:      client,
+			ctx:         ctx,
+			path:        "/test",
+			contentType: "text/plain",
+		}
+
+		err := writer.Send([]byte("hello"), nil)
+		if err != nil {
+			t.Fatalf("Send() error = %v, expected success after retry", err)
+		}
+
+		// Verify retry happened (at least 2 attempts)
+		if attempts < 2 {
+			t.Errorf("expected at least 2 attempts, got %d", attempts)
+		}
+	})
+
+	t.Run("does not retry on 400 error", func(t *testing.T) {
+		attempts := 0
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			attempts++
+			w.WriteHeader(http.StatusBadRequest)
+		}))
+		defer server.Close()
+
+		client := NewClient(server.URL, nil)
+		ctx := context.Background()
+
+		_, err := client.Head(ctx, "/test")
+		if err == nil {
+			t.Fatal("expected error for 400 response")
+		}
+
+		// Should not retry 4xx errors
+		if attempts > 1 {
+			t.Errorf("expected 1 attempt (no retry for 4xx), got %d", attempts)
+		}
+	})
 }
 
 func TestClient_Writer_Error(t *testing.T) {
