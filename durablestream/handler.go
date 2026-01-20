@@ -623,12 +623,16 @@ func (h *Handler) handleCatchupRead(w http.ResponseWriter, r *http.Request, stre
 		return
 	}
 
+	// Get cursor parameter for CDN collapsing (Section 8.1)
+	clientCursor := r.URL.Query().Get(protocol.QueryCursor)
+
 	// Handle offset=now sentinel (Section 6)
 	// Returns empty response with current tail offset
 	if offset == Offset(protocol.OffsetNow) {
 		setSecurityHeaders(w)
 		w.Header().Set("Content-Type", info.ContentType)
 		w.Header().Set(protocol.HeaderStreamNextOffset, info.NextOffset.String())
+		w.Header().Set(protocol.HeaderStreamCursor, protocol.GenerateCursor(clientCursor))
 		w.Header().Set(protocol.HeaderStreamUpToDate, "true")
 		// Per spec: SHOULD return Cache-Control: no-store for offset=now
 		w.Header().Set("Cache-Control", "no-store")
@@ -661,6 +665,7 @@ func (h *Handler) handleCatchupRead(w http.ResponseWriter, r *http.Request, stre
 		if etagMatches(ifNoneMatch, etag) {
 			setSecurityHeaders(w)
 			w.Header().Set("ETag", etag)
+			w.Header().Set(protocol.HeaderStreamCursor, protocol.GenerateCursor(clientCursor))
 			w.Header().Set("Cache-Control", "public, max-age=60, stale-while-revalidate=300")
 			w.WriteHeader(http.StatusNotModified)
 			return
@@ -671,6 +676,7 @@ func (h *Handler) handleCatchupRead(w http.ResponseWriter, r *http.Request, stre
 	setSecurityHeaders(w)
 	w.Header().Set("Content-Type", info.ContentType)
 	w.Header().Set(protocol.HeaderStreamNextOffset, result.NextOffset.String())
+	w.Header().Set(protocol.HeaderStreamCursor, protocol.GenerateCursor(clientCursor))
 
 	// Set Cache-Control (Section 8)
 	w.Header().Set("Cache-Control", "public, max-age=60, stale-while-revalidate=300")
