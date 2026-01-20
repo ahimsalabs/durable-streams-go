@@ -74,6 +74,10 @@ type Client struct {
 // NewClient creates a new stream client for the given base URL.
 // Pass nil for cfg to use defaults.
 //
+// The client automatically retries transient failures (5xx errors, rate limits)
+// with exponential backoff. For custom retry behavior or to disable retry,
+// use NewClientWithTransport.
+//
 // For custom transports (testing, middleware composition), use NewClientWithTransport.
 func NewClient(baseURL string, cfg *ClientConfig) *Client {
 	c := &Client{
@@ -93,7 +97,10 @@ func NewClient(baseURL string, cfg *ClientConfig) *Client {
 			Headers: cfg.Headers,
 		}
 	}
-	c.transport = transport.NewHTTPTransport(baseURL, httpCfg)
+
+	// Wrap transport with retry middleware for transient failures (5xx, 429)
+	httpTransport := transport.NewHTTPTransport(baseURL, httpCfg)
+	c.transport = transport.WithRetry(transport.DefaultRetryOptions())(httpTransport)
 
 	return c
 }
