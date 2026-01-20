@@ -1,0 +1,15 @@
+{
+  "name": "durable-streams-go-conformance",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test:server": "vitest run",
+    "test:server:watch": "vitest",
+    "test:client": "client-conformance-tests --run ../cmd/conformance-adapter/adapter"
+  },
+  "dependencies": {
+    "@durable-streams/client-conformance-tests": "^0.1.8",
+    "@durable-streams/server-conformance-tests": "^0.1.8",
+    "vitest": "^4.0.0"
+  }
+}
