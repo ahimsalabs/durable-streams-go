@@ -176,6 +176,16 @@ func (h *Handler) handleCreate(w http.ResponseWriter, r *http.Request, streamID 
 		cfg.ExpiresAt = expiresAt
 	}
 
+	// Parse Stream-Private header (Section 8.1)
+	if privateStr := r.Header.Get(protocol.HeaderStreamPrivate); privateStr != "" {
+		if privateStr == "true" {
+			cfg.IsPrivate = true
+		} else if privateStr != "false" {
+			writeError(w, newError(codeBadRequest, "invalid Stream-Private header (must be 'true' or 'false')"))
+			return
+		}
+	}
+
 	// Create stream
 	created, err := h.storage.Create(r.Context(), streamID, cfg)
 	if err != nil {
@@ -666,7 +676,7 @@ func (h *Handler) handleCatchupRead(w http.ResponseWriter, r *http.Request, stre
 			setSecurityHeaders(w)
 			w.Header().Set("ETag", etag)
 			w.Header().Set(protocol.HeaderStreamCursor, protocol.GenerateCursor(clientCursor))
-			w.Header().Set("Cache-Control", "public, max-age=60, stale-while-revalidate=300")
+			w.Header().Set("Cache-Control", cacheControlHeader(info.IsPrivate))
 			w.WriteHeader(http.StatusNotModified)
 			return
 		}
@@ -678,8 +688,8 @@ func (h *Handler) handleCatchupRead(w http.ResponseWriter, r *http.Request, stre
 	w.Header().Set(protocol.HeaderStreamNextOffset, result.NextOffset.String())
 	w.Header().Set(protocol.HeaderStreamCursor, protocol.GenerateCursor(clientCursor))
 
-	// Set Cache-Control (Section 8)
-	w.Header().Set("Cache-Control", "public, max-age=60, stale-while-revalidate=300")
+	// Set Cache-Control (Section 8.1)
+	w.Header().Set("Cache-Control", cacheControlHeader(info.IsPrivate))
 
 	// Set ETag
 	w.Header().Set("ETag", etag)
@@ -741,7 +751,7 @@ func (h *Handler) handleLongPoll(w http.ResponseWriter, r *http.Request, streamI
 			w.Header().Set("Content-Type", info.ContentType)
 			w.Header().Set(protocol.HeaderStreamNextOffset, result.NextOffset.String())
 			w.Header().Set(protocol.HeaderStreamCursor, protocol.GenerateCursor(clientCursor))
-			w.Header().Set("Cache-Control", "public, max-age=60, stale-while-revalidate=300")
+			w.Header().Set("Cache-Control", cacheControlHeader(info.IsPrivate))
 
 			// Set Stream-Up-To-Date if at tail (per spec Section 5.6)
 			if result.NextOffset.Compare(result.TailOffset) == 0 {
@@ -807,7 +817,7 @@ func (h *Handler) handleLongPoll(w http.ResponseWriter, r *http.Request, streamI
 		w.Header().Set("Content-Type", info.ContentType)
 		w.Header().Set(protocol.HeaderStreamNextOffset, result.NextOffset.String())
 		w.Header().Set(protocol.HeaderStreamCursor, protocol.GenerateCursor(clientCursor))
-		w.Header().Set("Cache-Control", "public, max-age=60, stale-while-revalidate=300")
+		w.Header().Set("Cache-Control", cacheControlHeader(info.IsPrivate))
 
 		// Set Stream-Up-To-Date if at tail (per spec Section 5.6)
 		if result.NextOffset.Compare(result.TailOffset) == 0 {
@@ -1183,6 +1193,17 @@ func etagMatches(ifNoneMatch, etag string) bool {
 	}
 
 	return false
+}
+
+// cacheControlHeader returns the appropriate Cache-Control header value based on stream privacy.
+// Per PROTOCOL.md Section 8.1:
+//   - Shared, non-user-specific streams: "public, max-age=60, stale-while-revalidate=300"
+//   - User-specific or confidential streams: "private, max-age=60, stale-while-revalidate=300"
+func cacheControlHeader(isPrivate bool) string {
+	if isPrivate {
+		return "private, max-age=60, stale-while-revalidate=300"
+	}
+	return "public, max-age=60, stale-while-revalidate=300"
 }
 
 // SanitizeForETag encodes characters that are invalid in HTTP header values.

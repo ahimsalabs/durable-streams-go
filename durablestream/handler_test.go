@@ -1017,6 +1017,78 @@ func TestHandler_CacheControlHeaders(t *testing.T) {
 			t.Errorf("Cache-Control = %q, want no-store", rec.Header().Get("Cache-Control"))
 		}
 	})
+
+	t.Run("public stream has public cache control", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodGet, "/stream?offset=0000000000", nil)
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+
+		cacheControl := rec.Header().Get("Cache-Control")
+		if !strings.Contains(cacheControl, "public") {
+			t.Errorf("Cache-Control = %q, should contain 'public' for non-private stream", cacheControl)
+		}
+	})
+}
+
+func TestHandler_PrivateCacheControl(t *testing.T) {
+	storage := memorystorage.New()
+	handler := durablestream.NewHandler(storage, nil)
+
+	// Create private stream via PUT with Stream-Private header
+	req := httptest.NewRequest(http.MethodPut, "/private-stream", nil)
+	req.Header.Set("Content-Type", "text/plain")
+	req.Header.Set("Stream-Private", "true")
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("PUT status = %d, want %d", rec.Code, http.StatusCreated)
+	}
+
+	// Append some data
+	_, _ = storage.Append(context.Background(), "/private-stream", []byte("secret data"), "")
+
+	t.Run("private stream has private cache control", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodGet, "/private-stream?offset=0000000000", nil)
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusOK {
+			t.Fatalf("GET status = %d, want %d", rec.Code, http.StatusOK)
+		}
+
+		cacheControl := rec.Header().Get("Cache-Control")
+		if !strings.Contains(cacheControl, "private") {
+			t.Errorf("Cache-Control = %q, should contain 'private' for private stream", cacheControl)
+		}
+		if strings.Contains(cacheControl, "public") {
+			t.Errorf("Cache-Control = %q, should not contain 'public' for private stream", cacheControl)
+		}
+	})
+
+	t.Run("invalid Stream-Private header rejected", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodPut, "/bad-private", nil)
+		req.Header.Set("Content-Type", "text/plain")
+		req.Header.Set("Stream-Private", "invalid")
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusBadRequest {
+			t.Errorf("PUT with invalid Stream-Private status = %d, want %d", rec.Code, http.StatusBadRequest)
+		}
+	})
+
+	t.Run("Stream-Private false is valid", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodPut, "/explicit-public", nil)
+		req.Header.Set("Content-Type", "text/plain")
+		req.Header.Set("Stream-Private", "false")
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusCreated {
+			t.Errorf("PUT with Stream-Private: false status = %d, want %d", rec.Code, http.StatusCreated)
+		}
+	})
 }
 
 func TestHandler_GET_ETagAndIfNoneMatch(t *testing.T) {

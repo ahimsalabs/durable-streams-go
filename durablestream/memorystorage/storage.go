@@ -218,6 +218,7 @@ func (m *Storage) Head(ctx context.Context, streamID string) (*durablestream.Str
 		NextOffset:  nextOffset,
 		TTL:         stream.config.TTL,
 		ExpiresAt:   stream.config.ExpiresAt,
+		IsPrivate:   stream.config.IsPrivate,
 	}, nil
 }
 
@@ -314,6 +315,9 @@ func configsMatch(a, b durablestream.StreamConfig) bool {
 	// Only compare ExpiresAt directly when TTL isn't set (i.e., explicit Stream-Expires-At header).
 	// When TTL is set, ExpiresAt is derived from TTL at request time and will differ between requests.
 	if a.TTL == 0 && b.TTL == 0 && !a.ExpiresAt.Equal(b.ExpiresAt) {
+		return false
+	}
+	if a.IsPrivate != b.IsPrivate {
 		return false
 	}
 	return true
