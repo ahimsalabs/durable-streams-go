@@ -11,6 +11,7 @@ type StreamConfig struct {
 	ContentType string
 	TTL         time.Duration // Zero means no TTL
 	ExpiresAt   time.Time     // Zero means no expiry
+	IsPrivate   bool          // If true, use Cache-Control: private (Section 8.1)
 }
 
 // StreamInfo contains metadata about a stream.
@@ -19,6 +20,7 @@ type StreamInfo struct {
 	NextOffset  Offset
 	TTL         time.Duration // Zero means no TTL
 	ExpiresAt   time.Time     // Zero means no expiry
+	IsPrivate   bool          // If true, use Cache-Control: private (Section 8.1)
 }
 
 // StoredMessage represents a single message in a stream.

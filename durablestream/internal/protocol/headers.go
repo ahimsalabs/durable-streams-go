@@ -21,6 +21,10 @@ const (
 
 	// HeaderStreamUpToDate indicates the response includes all data available in the stream.
 	HeaderStreamUpToDate = "Stream-Up-To-Date"
+
+	// HeaderStreamPrivate indicates the stream contains user-specific or confidential data.
+	// Per Section 8.1, private streams use Cache-Control: private instead of public.
+	HeaderStreamPrivate = "Stream-Private"
 )
 
 // Idempotent Producer headers (PROTOCOL.md Section 5.2.1).
