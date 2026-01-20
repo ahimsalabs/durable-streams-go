@@ -6,11 +6,11 @@
 //
 // Run with:
 //
-//	go run ./cmd/conformance-adapter
+//	go run ./conformance/adapter
 //
 // Or build and run:
 //
-//	go build -o adapter ./cmd/conformance-adapter
+//	go build -o adapter ./conformance/adapter
 //	./adapter
 package main
 
