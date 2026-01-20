@@ -706,14 +706,6 @@ func (s *Storage) Delete(ctx context.Context, streamID string) error {
 		return err
 	}
 
-	// Mark deleted and wake any WaitForData callers
-	if state, ok := s.streams.LoadAndDelete(streamID); ok {
-		state.mu.Lock()
-		state.deleted = true
-		close(state.notifyCh)
-		state.mu.Unlock()
-	}
-
 	// Release sequence if exists (lock-free)
 	if seq, ok := s.seqs.LoadAndDelete(streamID); ok {
 		_ = seq.Release()
@@ -752,6 +744,17 @@ func (s *Storage) Delete(ctx context.Context, streamID string) error {
 	}
 	if !found {
 		return durablestream.ErrNotFound
+	}
+
+	// Wake WaitForData callers AFTER Badger commit, so Read() returns
+	// ErrNotFound when they re-check. If we closed notifyCh before the
+	// Badger transaction, waiters could wake, find the config still exists,
+	// and block again on a new channel nobody will close.
+	if state, ok := s.streams.LoadAndDelete(streamID); ok {
+		state.mu.Lock()
+		state.deleted = true
+		close(state.notifyCh)
+		state.mu.Unlock()
 	}
 
 	// Delete messages in batches to avoid transaction size limits

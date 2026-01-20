@@ -9,6 +9,7 @@ Go implementation of [Durable Streams](https://github.com/durable-streams/durabl
 | Suite | Version | Tests | Passed | Failed | Skipped |
 |-------|---------|-------|--------|--------|---------|
 | Server (memorystorage) | v0.1.8 | 195 | 195 | 0 | 0 |
+| Server (badgerstore) | v0.1.8 | 195 | 195 | 0 | 0 |
 | Client | v0.2.0 | 212 | 184 | 13 | 15 |
 
 Client features: `batching`, `sse`, `longPoll`, `streaming`, `dynamicHeaders`
@@ -33,6 +34,9 @@ This ensures lexicographic sortability as required by PROTOCOL.md Section 6.
 | durablestream/storage | 100.0% |
 | durablestream/storage/memorystorage | 95.5% |
 | durablestream/internal/protocol | 98.1% |
+| durablestream/storage/badgerstore | 85.9% |
+
+Badgerstore also has [7 fuzz tests](durablestream/storage/badgerstore/fuzz_test.go) covering stream ID validation, stream operations, sequence ordering, and concurrent operations. Run with `task fuzz` or `task fuzz:quick`.
 
 ## Usage
 

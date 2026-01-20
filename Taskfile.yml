@@ -84,20 +84,36 @@ tasks:
       - ./run-conformance-tests.sh --verbose {{.CLI_ARGS}}
 
   conformance:go:
-    desc: Run server conformance tests against Go server
+    desc: Run server conformance tests against Go server (memorystorage)
     deps: [conformance:go:server]
     dir: conformance
     cmds:
       - CONFORMANCE_TEST_URL=http://localhost:8788 npm run test:server {{.CLI_ARGS}}
 
   conformance:go:server:
-    desc: Start Go server in background for conformance tests
+    desc: Start Go server in background for conformance tests (memorystorage)
     cmds:
       - |
         go build -o /tmp/ds-testserver ./cmd/testserver
         /tmp/ds-testserver -port 8788 &
         sleep 1
-        echo "Go server started on port 8788"
+        echo "Go server started on port 8788 (memorystorage)"
+
+  conformance:go:badger:
+    desc: Run server conformance tests against Go server (badgerstore)
+    deps: [conformance:go:server:badger]
+    dir: conformance
+    cmds:
+      - CONFORMANCE_TEST_URL=http://localhost:8789 npm run test:server {{.CLI_ARGS}}
+
+  conformance:go:server:badger:
+    desc: Start Go server in background for conformance tests (badgerstore)
+    cmds:
+      - |
+        go build -o /tmp/ds-testserver ./cmd/testserver
+        /tmp/ds-testserver -port 8789 -storage badger &
+        sleep 1
+        echo "Go server started on port 8789 (badgerstore)"
 
 
   # ============================================================================
