@@ -309,3 +309,33 @@ func TestSplitBySSELineTerminators(t *testing.T) {
 		})
 	}
 }
+
+func TestSanitizeForETag(t *testing.T) {
+	tests := []struct {
+		name  string
+		input string
+		want  string
+	}{
+		{"empty string", "", ""},
+		{"normal ASCII", "hello/world", "hello/world"},
+		{"with spaces", "hello world", "hello world"},
+		{"null byte", "hello\x00world", "hello%00world"},
+		{"newline", "hello\nworld", "hello%0Aworld"},
+		{"carriage return", "hello\rworld", "hello%0Dworld"},
+		{"tab", "hello\tworld", "hello%09world"},
+		{"high bytes", "hello\x80\xFFworld", "hello%80%FFworld"},
+		{"all control chars", "\x00\x01\x1F", "%00%01%1F"},
+		{"mixed", "/stream/\x00/test\r\n", "/stream/%00/test%0D%0A"},
+		{"DEL char (0x7F)", "hello\x7Fworld", "hello%7Fworld"},
+		{"tilde is ok (0x7E)", "hello~world", "hello~world"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := sanitizeForETag(tt.input)
+			if got != tt.want {
+				t.Errorf("sanitizeForETag(%q) = %q, want %q", tt.input, got, tt.want)
+			}
+		})
+	}
+}

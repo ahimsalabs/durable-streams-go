@@ -22,6 +22,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/http"
 	"os"
 	"strconv"
 	"strings"
@@ -60,6 +61,10 @@ type Command struct {
 	WaitForUpToDate bool   `json:"waitForUpToDate,omitempty"`
 	// Headers
 	Headers map[string]string `json:"headers,omitempty"`
+	// Dynamic header/param fields
+	Name         string `json:"name,omitempty"`
+	ValueType    string `json:"valueType,omitempty"`    // "counter" | "timestamp" | "token"
+	InitialValue string `json:"initialValue,omitempty"` // For token type
 }
 
 // Result types sent back to test runner.
@@ -80,6 +85,12 @@ type Result struct {
 	Message       string      `json:"message,omitempty"`
 	// IdempotentProducer fields
 	Duplicate bool `json:"duplicate,omitempty"`
+	// Dynamic header/param values (for get-dynamic-values)
+	HeaderValues map[string]string `json:"headerValues,omitempty"`
+	ParamValues  map[string]string `json:"paramValues,omitempty"`
+	// Headers/params actually sent in request (for dynamic header testing)
+	HeadersSent map[string]string `json:"headersSent,omitempty"`
+	ParamsSent  map[string]string `json:"paramsSent,omitempty"`
 }
 
 // MarshalJSON ensures Chunks is [] not null for read results.
@@ -114,6 +125,84 @@ var (
 	// Cache content types per stream path for append operations
 	streamContentTypes = make(map[string]string)
 )
+
+// dynamicValue holds state for a dynamic header or param.
+type dynamicValue struct {
+	valueType  string // "counter" | "timestamp" | "token"
+	counter    int
+	tokenValue string
+}
+
+// resolve returns the current value and increments counter if applicable.
+func (d *dynamicValue) resolve() string {
+	switch d.valueType {
+	case "counter":
+		d.counter++
+		return strconv.Itoa(d.counter)
+	case "timestamp":
+		return strconv.FormatInt(time.Now().UnixMilli(), 10)
+	case "token":
+		return d.tokenValue
+	default:
+		return ""
+	}
+}
+
+// peek returns the current value without incrementing.
+func (d *dynamicValue) peek() string {
+	switch d.valueType {
+	case "counter":
+		return strconv.Itoa(d.counter + 1) // What the next resolve() would return
+	case "timestamp":
+		return strconv.FormatInt(time.Now().UnixMilli(), 10)
+	case "token":
+		return d.tokenValue
+	default:
+		return ""
+	}
+}
+
+var (
+	dynamicHeaders = make(map[string]*dynamicValue)
+	dynamicParams  = make(map[string]*dynamicValue)
+	// Track what was sent in the last request
+	lastSentHeaders = make(map[string]string)
+	lastSentParams  = make(map[string]string)
+)
+
+// Context key for resolved dynamic headers
+type ctxKey string
+
+const resolvedHeadersKey ctxKey = "resolvedHeaders"
+
+// withResolvedHeaders resolves dynamic headers/params once and stores them in context.
+// Returns the new context. Also updates lastSentHeaders/lastSentParams for reporting.
+func withResolvedHeaders(ctx context.Context) context.Context {
+	resolved := make(map[string]string)
+	for name, dv := range dynamicHeaders {
+		resolved[name] = dv.resolve()
+	}
+	lastSentHeaders = resolved
+
+	resolvedParams := make(map[string]string)
+	for name, dv := range dynamicParams {
+		resolvedParams[name] = dv.resolve()
+	}
+	lastSentParams = resolvedParams
+
+	return context.WithValue(ctx, resolvedHeadersKey, resolved)
+}
+
+// dynamicHeaderProvider reads resolved headers from context.
+func dynamicHeaderProvider(ctx context.Context) (http.Header, error) {
+	h := make(http.Header)
+	if resolved, ok := ctx.Value(resolvedHeadersKey).(map[string]string); ok {
+		for name, val := range resolved {
+			h.Set(name, val)
+		}
+	}
+	return h, nil
+}
 
 func main() {
 	scanner := bufio.NewScanner(os.Stdin)
@@ -169,6 +258,14 @@ func handleCommand(cmd Command) Result {
 		return handleHead(cmd)
 	case "delete":
 		return handleDelete(cmd)
+	case "set-dynamic-header":
+		return handleSetDynamicHeader(cmd)
+	case "set-dynamic-param":
+		return handleSetDynamicParam(cmd)
+	case "clear-dynamic":
+		return handleClearDynamic(cmd)
+	case "get-dynamic-values":
+		return handleGetDynamicValues(cmd)
 	case "shutdown":
 		return Result{Type: "shutdown", Success: true}
 	default:
@@ -179,10 +276,15 @@ func handleCommand(cmd Command) Result {
 func handleInit(cmd Command) Result {
 	serverURL = cmd.ServerURL
 	streamContentTypes = make(map[string]string)
+	dynamicHeaders = make(map[string]*dynamicValue)
+	dynamicParams = make(map[string]*dynamicValue)
+	lastSentHeaders = make(map[string]string)
+	lastSentParams = make(map[string]string)
 
 	client = durablestream.NewClient(serverURL, &durablestream.ClientConfig{
 		Timeout:  30 * time.Second,
 		ReadMode: durablestream.ReadModeAuto,
+		Headers:  dynamicHeaderProvider,
 	})
 
 	return Result{
@@ -195,7 +297,7 @@ func handleInit(cmd Command) Result {
 			SSE:            true,
 			LongPoll:       true,
 			Streaming:      true,
-			DynamicHeaders: false, // No built-in dynamic header support
+			DynamicHeaders: true,
 		},
 	}
 }
@@ -276,6 +378,9 @@ func handleAppend(cmd Command) Result {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
+	// Resolve dynamic headers once for this operation via context
+	ctx = withResolvedHeaders(ctx)
+
 	// Get data
 	var data []byte
 	if cmd.Binary {
@@ -306,11 +411,14 @@ func handleAppend(cmd Command) Result {
 		return errorResult("append", err)
 	}
 
+	hdrsSent, paramsSent := getSentDynamic()
 	return Result{
-		Type:    "append",
-		Success: true,
-		Status:  200,
-		Offset:  writer.Offset().String(),
+		Type:        "append",
+		Success:     true,
+		Status:      200,
+		Offset:      writer.Offset().String(),
+		HeadersSent: hdrsSent,
+		ParamsSent:  paramsSent,
 	}
 }
 
@@ -486,10 +594,14 @@ func handleRead(cmd Command) Result {
 		}
 	}
 
+	// Resolve dynamic headers once for this operation via context
+	ctx = withResolvedHeaders(ctx)
+
 	// Create a client with the specified read mode for this request
 	readClient := durablestream.NewClient(serverURL, &durablestream.ClientConfig{
 		Timeout:  time.Duration(timeoutMs) * time.Millisecond,
 		ReadMode: readMode,
+		Headers:  dynamicHeaderProvider,
 	})
 
 	reader := readClient.Reader(cmd.Path, offset)
@@ -549,13 +661,16 @@ func handleRead(cmd Command) Result {
 		}
 	}
 
+	hdrsSent, paramsSent := getSentDynamic()
 	return Result{
-		Type:     "read",
-		Success:  true,
-		Status:   status,
-		Chunks:   chunks,
-		Offset:   finalOffset,
-		UpToDate: upToDate,
+		Type:        "read",
+		Success:     true,
+		Status:      status,
+		Chunks:      chunks,
+		Offset:      finalOffset,
+		UpToDate:    upToDate,
+		HeadersSent: hdrsSent,
+		ParamsSent:  paramsSent,
 	}
 }
 
@@ -593,6 +708,74 @@ func handleDelete(cmd Command) Result {
 		Type:    "delete",
 		Success: true,
 		Status:  200,
+	}
+}
+
+// getSentDynamic returns copies of the last sent headers/params, or nil if empty.
+func getSentDynamic() (map[string]string, map[string]string) {
+	var hdrs, params map[string]string
+	if len(lastSentHeaders) > 0 {
+		hdrs = make(map[string]string)
+		for k, v := range lastSentHeaders {
+			hdrs[k] = v
+		}
+	}
+	if len(lastSentParams) > 0 {
+		params = make(map[string]string)
+		for k, v := range lastSentParams {
+			params[k] = v
+		}
+	}
+	return hdrs, params
+}
+
+func handleSetDynamicHeader(cmd Command) Result {
+	dynamicHeaders[cmd.Name] = &dynamicValue{
+		valueType:  cmd.ValueType,
+		counter:    0,
+		tokenValue: cmd.InitialValue,
+	}
+	return Result{
+		Type:    "set-dynamic-header",
+		Success: true,
+	}
+}
+
+func handleSetDynamicParam(cmd Command) Result {
+	dynamicParams[cmd.Name] = &dynamicValue{
+		valueType:  cmd.ValueType,
+		counter:    0,
+		tokenValue: cmd.InitialValue,
+	}
+	return Result{
+		Type:    "set-dynamic-param",
+		Success: true,
+	}
+}
+
+func handleClearDynamic(cmd Command) Result {
+	dynamicHeaders = make(map[string]*dynamicValue)
+	dynamicParams = make(map[string]*dynamicValue)
+	return Result{
+		Type:    "clear-dynamic",
+		Success: true,
+	}
+}
+
+func handleGetDynamicValues(cmd Command) Result {
+	headerValues := make(map[string]string)
+	for name, dv := range dynamicHeaders {
+		headerValues[name] = dv.peek()
+	}
+	paramValues := make(map[string]string)
+	for name, dv := range dynamicParams {
+		paramValues[name] = dv.peek()
+	}
+	return Result{
+		Type:         "get-dynamic-values",
+		Success:      true,
+		HeaderValues: headerValues,
+		ParamValues:  paramValues,
 	}
 }
 

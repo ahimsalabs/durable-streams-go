@@ -666,7 +666,7 @@ func (h *Handler) handleCatchupRead(w http.ResponseWriter, r *http.Request, stre
 	// Format: "{streamID}:{start_offset}:{end_offset}"
 	// ETag must be quoted per HTTP spec (RFC 7232)
 	// Sanitize streamID to ensure no control characters in header value
-	etag := fmt.Sprintf(`"%s:%s:%s"`, SanitizeForETag(streamID), offset, result.NextOffset)
+	etag := fmt.Sprintf(`"%s:%s:%s"`, sanitizeForETag(streamID), offset, result.NextOffset)
 
 	// Check If-None-Match for 304 Not Modified (Section 8.1)
 	// Per spec: "When a client provides a valid If-None-Match header that matches
@@ -1206,10 +1206,10 @@ func cacheControlHeader(isPrivate bool) string {
 	return "public, max-age=60, stale-while-revalidate=300"
 }
 
-// SanitizeForETag encodes characters that are invalid in HTTP header values.
+// sanitizeForETag encodes characters that are invalid in HTTP header values.
 // Per RFC 7230, header values must not contain NUL, CR, or LF characters.
 // We URL-encode any byte < 0x20 (control characters) or > 0x7E to ensure valid HTTP headers.
-func SanitizeForETag(s string) string {
+func sanitizeForETag(s string) string {
 	var needsEncoding bool
 	for i := 0; i < len(s); i++ {
 		if s[i] < 0x20 || s[i] > 0x7E {
