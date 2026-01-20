@@ -1,5 +1,17 @@
+# Built binaries
 testserver
 durablestream.test
-API.md
-coverage.out
 snippet
+conformance-adapter
+
+# Generated docs
+API.md
+
+# Test artifacts
+coverage.out
+
+# Task runner cache
+.task/
+
+# Node.js (if conformance tests are run locally)
+node_modules/

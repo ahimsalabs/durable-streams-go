@@ -2,6 +2,7 @@ package durablestream
 
 import (
 	"context"
+	"errors"
 	"io"
 	"testing"
 	"time"
@@ -171,6 +172,11 @@ func TestConvertTransportError(t *testing.T) {
 			wantIsErr: ErrNotFound,
 		},
 		{
+			name:      "not found empty message returns sentinel directly",
+			inputErr:  &transport.Error{Code: "NOT_FOUND", Message: ""},
+			wantIsErr: ErrNotFound,
+		},
+		{
 			name:      "not found lowercase",
 			inputErr:  &transport.Error{Code: "not_found", Message: "stream not found"},
 			wantIsErr: ErrNotFound,
@@ -234,8 +240,8 @@ func TestConvertTransportError(t *testing.T) {
 			}
 
 			if tt.wantIsErr != nil {
-				if got != tt.wantIsErr {
-					t.Errorf("convertTransportError() = %v, want %v", got, tt.wantIsErr)
+				if !errors.Is(got, tt.wantIsErr) {
+					t.Errorf("convertTransportError() = %v, want errors.Is(%v)", got, tt.wantIsErr)
 				}
 				return
 			}
@@ -252,6 +258,36 @@ func TestConvertTransportError(t *testing.T) {
 		got := convertTransportError(originalErr)
 		if got != originalErr {
 			t.Errorf("expected original error, got %v", got)
+		}
+	})
+}
+
+func TestWrapSentinel(t *testing.T) {
+	t.Run("empty message returns sentinel directly", func(t *testing.T) {
+		got := wrapSentinel("", ErrNotFound)
+		if got != ErrNotFound {
+			t.Errorf("wrapSentinel(\"\", ErrNotFound) = %v, want ErrNotFound", got)
+		}
+	})
+
+	t.Run("non-empty message wraps sentinel", func(t *testing.T) {
+		got := wrapSentinel("stream not found", ErrNotFound)
+		if !errors.Is(got, ErrNotFound) {
+			t.Errorf("errors.Is(wrapSentinel(...), ErrNotFound) = false, want true")
+		}
+		if got.Error() != "stream not found: stream not found" {
+			t.Errorf("wrapSentinel(...).Error() = %q, want %q", got.Error(), "stream not found: stream not found")
+		}
+	})
+
+	t.Run("wrapped error preserves message for inspection", func(t *testing.T) {
+		got := wrapSentinel("sequence regression detected", ErrConflict)
+		if !errors.Is(got, ErrConflict) {
+			t.Errorf("errors.Is(wrapSentinel(...), ErrConflict) = false, want true")
+		}
+		msg := got.Error()
+		if msg != "sequence regression detected: conflict" {
+			t.Errorf("Error() = %q, want %q", msg, "sequence regression detected: conflict")
 		}
 	})
 }

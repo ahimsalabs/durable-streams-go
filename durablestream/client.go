@@ -3,6 +3,7 @@ package durablestream
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"time"
 
@@ -314,6 +315,7 @@ func (c *Client) Reader(path string, offset Offset) *Reader {
 }
 
 // convertTransportError converts transport package errors to durablestream errors.
+// It wraps sentinel errors with the original message so callers can inspect details.
 func convertTransportError(err error) error {
 	if err == nil {
 		return nil
@@ -322,15 +324,18 @@ func convertTransportError(err error) error {
 	// Check if it's a transport error with a code
 	if tErr, ok := err.(*transport.Error); ok {
 		// Check both uppercase (from HTTP status mapping) and lowercase (from JSON response)
+		// Wrap with original message so details are preserved for inspection
 		switch tErr.Code {
 		case "NOT_FOUND", "not_found":
-			return ErrNotFound
+			return wrapSentinel(tErr.Message, ErrNotFound)
+		case "SEQUENCE_CONFLICT", "sequence_conflict":
+			return wrapSentinel(tErr.Message, ErrSequenceConflict)
 		case "CONFLICT", "conflict":
-			return ErrConflict
+			return wrapSentinel(tErr.Message, ErrConflict)
 		case "GONE", "gone":
-			return ErrGone
+			return wrapSentinel(tErr.Message, ErrGone)
 		case "BAD_REQUEST", "bad_request":
-			return ErrBadRequest
+			return wrapSentinel(tErr.Message, ErrBadRequest)
 		case "RATE_LIMITED", "too_many_requests":
 			return newError(codeTooManyRequests, tErr.Message)
 		default:
@@ -340,4 +345,13 @@ func convertTransportError(err error) error {
 	}
 
 	return err
+}
+
+// wrapSentinel wraps a sentinel error with a message.
+// If message is empty, returns the sentinel directly.
+func wrapSentinel(msg string, sentinel error) error {
+	if msg == "" {
+		return sentinel
+	}
+	return fmt.Errorf("%s: %w", msg, sentinel)
 }

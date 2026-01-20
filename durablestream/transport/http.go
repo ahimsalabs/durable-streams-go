@@ -23,6 +23,13 @@ const (
 	headerStreamCursor     = "Stream-Cursor"
 	headerStreamNextOffset = "Stream-Next-Offset"
 	headerStreamUpToDate   = "Stream-Up-To-Date"
+
+	// Idempotent producer headers (Section 5.2.1)
+	headerProducerID          = "Producer-Id"
+	headerProducerEpoch       = "Producer-Epoch"
+	headerProducerSeq         = "Producer-Seq"
+	headerProducerExpectedSeq = "Producer-Expected-Seq"
+	headerProducerReceivedSeq = "Producer-Received-Seq"
 )
 
 // Query parameter names used in stream operations.
@@ -286,6 +293,13 @@ func (t *HTTPTransport) Append(ctx context.Context, req AppendRequest) (*AppendR
 		httpReq.Header.Set(headerStreamSeq, req.Seq)
 	}
 
+	// Idempotent producer headers (Section 5.2.1)
+	if req.HasProducerHeaders {
+		httpReq.Header.Set(headerProducerID, req.ProducerID)
+		httpReq.Header.Set(headerProducerEpoch, strconv.Itoa(req.ProducerEpoch))
+		httpReq.Header.Set(headerProducerSeq, strconv.Itoa(req.ProducerSeq))
+	}
+
 	if err := t.applyHeaders(ctx, httpReq); err != nil {
 		return nil, err
 	}
@@ -296,13 +310,58 @@ func (t *HTTPTransport) Append(ctx context.Context, req AppendRequest) (*AppendR
 	}
 	defer resp.Body.Close()
 
-	if err := checkErrorResponse(resp); err != nil {
-		return nil, err
+	// For idempotent producers, 204 is success (duplicate)
+	// and 200 is success (new data) - Section 5.2.1
+	isDuplicate := resp.StatusCode == http.StatusNoContent
+	if !isDuplicate {
+		if err := checkErrorResponse(resp); err != nil {
+			// For 403/409 producer errors, extract headers and include in error
+			if tErr, ok := err.(*Error); ok {
+				// Extract producer epoch from 403 responses (stale epoch)
+				if resp.StatusCode == http.StatusForbidden {
+					if epochStr := resp.Header.Get(headerProducerEpoch); epochStr != "" {
+						if epoch, parseErr := strconv.Atoi(epochStr); parseErr == nil {
+							tErr.ProducerEpoch = epoch
+						}
+					}
+				}
+				// Extract sequence info from 409 responses (sequence gap)
+				if resp.StatusCode == http.StatusConflict {
+					if expectedStr := resp.Header.Get(headerProducerExpectedSeq); expectedStr != "" {
+						if expected, parseErr := strconv.Atoi(expectedStr); parseErr == nil {
+							tErr.ProducerExpectedSeq = expected
+						}
+					}
+					if receivedStr := resp.Header.Get(headerProducerReceivedSeq); receivedStr != "" {
+						if received, parseErr := strconv.Atoi(receivedStr); parseErr == nil {
+							tErr.ProducerReceivedSeq = received
+						}
+					}
+				}
+			}
+			return nil, err
+		}
 	}
 
-	return &AppendResponse{
+	result := &AppendResponse{
 		NextOffset: resp.Header.Get(headerStreamNextOffset),
-	}, nil
+		Duplicate:  isDuplicate,
+		StatusCode: resp.StatusCode,
+	}
+
+	// Parse producer response headers (Section 5.2.1)
+	if epochStr := resp.Header.Get(headerProducerEpoch); epochStr != "" {
+		if epoch, err := strconv.Atoi(epochStr); err == nil {
+			result.ProducerEpoch = epoch
+		}
+	}
+	if seqStr := resp.Header.Get(headerProducerSeq); seqStr != "" {
+		if seq, err := strconv.Atoi(seqStr); err == nil {
+			result.ProducerSeq = seq
+		}
+	}
+
+	return result, nil
 }
 
 // Create creates a new stream (Section 5.1: Create Stream).
@@ -441,25 +500,42 @@ func checkErrorResponse(resp *http.Response) error {
 		return nil
 	}
 
+	body, _ := io.ReadAll(resp.Body)
+	bodyStr := string(body)
+
 	// Try to parse JSON error response
 	var errResp struct {
 		Code    string `json:"code"`
 		Message string `json:"message"`
 	}
-	if body, err := io.ReadAll(resp.Body); err == nil && len(body) > 0 {
-		if json.Unmarshal(body, &errResp) == nil && errResp.Code != "" {
+	if len(body) > 0 && json.Unmarshal(body, &errResp) == nil && errResp.Code != "" {
+		return &Error{
+			Code:       errResp.Code,
+			Message:    errResp.Message,
+			StatusCode: resp.StatusCode,
+		}
+	}
+
+	// Check for sequence conflict in plain text body (server may return plain text)
+	if resp.StatusCode == http.StatusConflict {
+		lowerBody := strings.ToLower(bodyStr)
+		if strings.Contains(lowerBody, "sequence") {
 			return &Error{
-				Code:       errResp.Code,
-				Message:    errResp.Message,
+				Code:       "SEQUENCE_CONFLICT",
+				Message:    bodyStr,
 				StatusCode: resp.StatusCode,
 			}
 		}
 	}
 
-	// Map HTTP status to error
+	// Map HTTP status to error, include body text as message if available
+	msg := bodyStr
+	if msg == "" {
+		msg = fmt.Sprintf("HTTP %d: %s", resp.StatusCode, resp.Status)
+	}
 	return &Error{
 		Code:       httpStatusToCode(resp.StatusCode),
-		Message:    fmt.Sprintf("HTTP %d: %s", resp.StatusCode, resp.Status),
+		Message:    msg,
 		StatusCode: resp.StatusCode,
 	}
 }
@@ -491,6 +567,16 @@ type Error struct {
 	Code       string
 	Message    string
 	StatusCode int
+
+	// ProducerEpoch is set for 403 (stale epoch) errors (Section 5.2.1).
+	// Contains the server's current epoch for the producer.
+	ProducerEpoch int
+
+	// ProducerExpectedSeq is set for 409 (sequence gap) errors (Section 5.2.1).
+	ProducerExpectedSeq int
+
+	// ProducerReceivedSeq is set for 409 (sequence gap) errors (Section 5.2.1).
+	ProducerReceivedSeq int
 }
 
 func (e *Error) Error() string {

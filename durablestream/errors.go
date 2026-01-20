@@ -17,9 +17,12 @@ var (
 
 	// ErrConflict indicates a conflict occurred:
 	// - Stream exists with different configuration (on create)
-	// - Sequence regression detected (on append with sequence)
 	// - Content type mismatch (on append)
 	ErrConflict = errors.New("conflict")
+
+	// ErrSequenceConflict indicates a sequence number conflict on append.
+	// This occurs when appending with a sequence number <= the last appended sequence.
+	ErrSequenceConflict = errors.New("sequence conflict")
 
 	// ErrClosed indicates the stream or connection has been closed.
 	ErrClosed = errors.New("stream closed")

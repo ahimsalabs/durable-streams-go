@@ -73,13 +73,22 @@ tasks:
     cmds:
       - go run ./cmd/testserver -port {{.PORT | default "8788"}}
 
-  conformance:go:
-    desc: Run TS conformance tests against Go server
-    deps: [conformance:go:server]
+  conformance:client:
+    desc: Run client conformance tests (builds adapter if needed)
     cmds:
-      - cd durable-streams-ts && pnpm --filter @durable-streams/conformance-tests test:go
-    env:
-      CONFORMANCE_URL: http://localhost:8788
+      - ./run-conformance-tests.sh {{.CLI_ARGS}}
+
+  conformance:client:verbose:
+    desc: Run client conformance tests with verbose output
+    cmds:
+      - ./run-conformance-tests.sh --verbose {{.CLI_ARGS}}
+
+  conformance:go:
+    desc: Run server conformance tests against Go server
+    deps: [conformance:go:server]
+    dir: conformance
+    cmds:
+      - CONFORMANCE_TEST_URL=http://localhost:8788 npm run test:server {{.CLI_ARGS}}
 
   conformance:go:server:
     desc: Start Go server in background for conformance tests
@@ -89,6 +98,7 @@ tasks:
         /tmp/ds-testserver -port 8788 &
         sleep 1
         echo "Go server started on port 8788"
+
 
   # ============================================================================
   # Precommit checks (run with: task precommit)

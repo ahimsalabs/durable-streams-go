@@ -829,6 +829,179 @@ func TestHTTPTransport_SSE_Errors(t *testing.T) {
 	})
 }
 
+func TestHTTPTransport_Append_ProducerHeaders(t *testing.T) {
+	t.Run("sends producer headers", func(t *testing.T) {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.Header.Get("Producer-Id") != "my-producer" {
+				t.Errorf("expected Producer-Id header, got %s", r.Header.Get("Producer-Id"))
+			}
+			if r.Header.Get("Producer-Epoch") != "5" {
+				t.Errorf("expected Producer-Epoch 5, got %s", r.Header.Get("Producer-Epoch"))
+			}
+			if r.Header.Get("Producer-Seq") != "3" {
+				t.Errorf("expected Producer-Seq 3, got %s", r.Header.Get("Producer-Seq"))
+			}
+			w.Header().Set("Stream-Next-Offset", "123_789")
+			w.Header().Set("Producer-Epoch", "5")
+			w.Header().Set("Producer-Seq", "3")
+			w.WriteHeader(http.StatusOK)
+		}))
+		defer server.Close()
+
+		tr := NewHTTPTransport(server.URL, nil)
+		resp, err := tr.Append(context.Background(), AppendRequest{
+			Path:               "/test",
+			Data:               []byte("data"),
+			ProducerID:         "my-producer",
+			ProducerEpoch:      5,
+			ProducerSeq:        3,
+			HasProducerHeaders: true,
+		})
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if resp.NextOffset != "123_789" {
+			t.Errorf("expected NextOffset 123_789, got %s", resp.NextOffset)
+		}
+		if resp.ProducerEpoch != 5 {
+			t.Errorf("expected ProducerEpoch 5, got %d", resp.ProducerEpoch)
+		}
+		if resp.ProducerSeq != 3 {
+			t.Errorf("expected ProducerSeq 3, got %d", resp.ProducerSeq)
+		}
+		if resp.StatusCode != 200 {
+			t.Errorf("expected StatusCode 200, got %d", resp.StatusCode)
+		}
+	})
+
+	t.Run("204 treated as duplicate success", func(t *testing.T) {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Stream-Next-Offset", "100_0")
+			w.Header().Set("Producer-Epoch", "1")
+			w.Header().Set("Producer-Seq", "0")
+			w.WriteHeader(http.StatusNoContent)
+		}))
+		defer server.Close()
+
+		tr := NewHTTPTransport(server.URL, nil)
+		resp, err := tr.Append(context.Background(), AppendRequest{
+			Path:               "/test",
+			Data:               []byte("data"),
+			ProducerID:         "my-producer",
+			ProducerEpoch:      1,
+			ProducerSeq:        0,
+			HasProducerHeaders: true,
+		})
+		if err != nil {
+			t.Fatalf("unexpected error for 204: %v", err)
+		}
+		if !resp.Duplicate {
+			t.Error("expected Duplicate to be true for 204")
+		}
+		if resp.StatusCode != 204 {
+			t.Errorf("expected StatusCode 204, got %d", resp.StatusCode)
+		}
+	})
+
+	t.Run("403 stale epoch extracts epoch from error", func(t *testing.T) {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Producer-Epoch", "10")
+			w.WriteHeader(http.StatusForbidden)
+			_, _ = w.Write([]byte(`{"code":"stale_epoch","message":"epoch 5 is stale, current is 10"}`))
+		}))
+		defer server.Close()
+
+		tr := NewHTTPTransport(server.URL, nil)
+		_, err := tr.Append(context.Background(), AppendRequest{
+			Path:               "/test",
+			Data:               []byte("data"),
+			ProducerID:         "my-producer",
+			ProducerEpoch:      5,
+			ProducerSeq:        0,
+			HasProducerHeaders: true,
+		})
+		if err == nil {
+			t.Fatal("expected error for 403")
+		}
+		var tErr *Error
+		if !errors.As(err, &tErr) {
+			t.Fatalf("expected *Error, got %T", err)
+		}
+		if tErr.StatusCode != 403 {
+			t.Errorf("expected status 403, got %d", tErr.StatusCode)
+		}
+		if tErr.ProducerEpoch != 10 {
+			t.Errorf("expected ProducerEpoch 10, got %d", tErr.ProducerEpoch)
+		}
+	})
+
+	t.Run("409 sequence gap extracts sequence info", func(t *testing.T) {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Producer-Expected-Seq", "5")
+			w.Header().Set("Producer-Received-Seq", "10")
+			w.WriteHeader(http.StatusConflict)
+			_, _ = w.Write([]byte(`{"code":"sequence_gap","message":"expected seq 5, got 10"}`))
+		}))
+		defer server.Close()
+
+		tr := NewHTTPTransport(server.URL, nil)
+		_, err := tr.Append(context.Background(), AppendRequest{
+			Path:               "/test",
+			Data:               []byte("data"),
+			ProducerID:         "my-producer",
+			ProducerEpoch:      1,
+			ProducerSeq:        10,
+			HasProducerHeaders: true,
+		})
+		if err == nil {
+			t.Fatal("expected error for 409")
+		}
+		var tErr *Error
+		if !errors.As(err, &tErr) {
+			t.Fatalf("expected *Error, got %T", err)
+		}
+		if tErr.StatusCode != 409 {
+			t.Errorf("expected status 409, got %d", tErr.StatusCode)
+		}
+		if tErr.ProducerExpectedSeq != 5 {
+			t.Errorf("expected ProducerExpectedSeq 5, got %d", tErr.ProducerExpectedSeq)
+		}
+		if tErr.ProducerReceivedSeq != 10 {
+			t.Errorf("expected ProducerReceivedSeq 10, got %d", tErr.ProducerReceivedSeq)
+		}
+	})
+
+	t.Run("producer headers not sent when HasProducerHeaders is false", func(t *testing.T) {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.Header.Get("Producer-Id") != "" {
+				t.Error("Producer-Id should not be set")
+			}
+			if r.Header.Get("Producer-Epoch") != "" {
+				t.Error("Producer-Epoch should not be set")
+			}
+			if r.Header.Get("Producer-Seq") != "" {
+				t.Error("Producer-Seq should not be set")
+			}
+			w.Header().Set("Stream-Next-Offset", "0_0")
+			w.WriteHeader(http.StatusOK)
+		}))
+		defer server.Close()
+
+		tr := NewHTTPTransport(server.URL, nil)
+		_, err := tr.Append(context.Background(), AppendRequest{
+			Path:               "/test",
+			Data:               []byte("data"),
+			ProducerID:         "ignored",
+			ProducerEpoch:      5,
+			ProducerSeq:        3,
+			HasProducerHeaders: false, // Explicitly false
+		})
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+	})
+}
+
 func TestHTTPTransport_Append_Errors(t *testing.T) {
 	t.Run("server error", func(t *testing.T) {
 		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

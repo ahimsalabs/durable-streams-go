@@ -148,12 +148,43 @@ type AppendRequest struct {
 	// Per Section 5.2: "If provided and less than or equal to the last
 	// appended sequence, the server MUST return 409 Conflict."
 	Seq string
+
+	// ProducerID is the client-supplied stable producer identifier (Section 5.2.1).
+	// When set, all three producer fields (ID, Epoch, Seq) must be provided.
+	ProducerID string
+
+	// ProducerEpoch is the client-declared epoch for idempotent producers (Section 5.2.1).
+	// Must be non-negative. Increment on producer restart to establish new session.
+	ProducerEpoch int
+
+	// ProducerSeq is the monotonically increasing sequence number per epoch (Section 5.2.1).
+	// Starts at 0 for each new epoch. Applied per-batch (per HTTP request).
+	ProducerSeq int
+
+	// HasProducerHeaders indicates producer headers should be sent.
+	// Use this to distinguish epoch=0, seq=0 from unset values.
+	HasProducerHeaders bool
 }
 
 // AppendResponse is the response from an Append operation.
 type AppendResponse struct {
 	// NextOffset is the new tail offset after the append (Section 5.2).
 	NextOffset string
+
+	// Duplicate is true when the append was a duplicate (204 response).
+	// For idempotent producers, duplicate appends are success (Section 5.2.1).
+	Duplicate bool
+
+	// ProducerEpoch is the server's current epoch for this producer (Section 5.2.1).
+	// Returned on success and on stale epoch (403) errors.
+	ProducerEpoch int
+
+	// ProducerSeq is the highest accepted sequence for this producer (Section 5.2.1).
+	// Returned on success to confirm pipelined requests.
+	ProducerSeq int
+
+	// StatusCode is the HTTP status code of the response.
+	StatusCode int
 }
 
 // CreateRequest is the request to create a stream (Section 5.1).
