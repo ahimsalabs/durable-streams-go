@@ -733,6 +733,11 @@ func (h *Handler) handleLongPoll(w http.ResponseWriter, r *http.Request, streamI
 			w.Header().Set(protocol.HeaderStreamCursor, protocol.GenerateCursor(clientCursor))
 			w.Header().Set("Cache-Control", "public, max-age=60, stale-while-revalidate=300")
 
+			// Set Stream-Up-To-Date if at tail (per spec Section 5.6)
+			if result.NextOffset.Compare(result.TailOffset) == 0 {
+				w.Header().Set(protocol.HeaderStreamUpToDate, "true")
+			}
+
 			responseBody := formatResponseBody(result.Messages, info.ContentType)
 
 			w.WriteHeader(http.StatusOK)
