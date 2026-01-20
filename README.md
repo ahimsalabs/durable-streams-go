@@ -4,7 +4,25 @@
 
 Go implementation of [Durable Streams](https://github.com/durable-streams/durable-streams).
 
-Passes the durable-streams conformance suite.
+## Conformance
+
+Tested against conformance tests v0.1.8:
+
+| Suite | Tests | Passed | Failed |
+|-------|-------|--------|--------|
+| Server (memorystorage) | 195 | 195 | 0 |
+| Client | 177 | 177 | 0 |
+
+Client features: `batching`, `sse`, `longPoll`, `streaming`, `dynamicHeaders`
+
+## Test Coverage
+
+| Package | Coverage |
+|---------|----------|
+| durablestream | 90.7% |
+| durablestream/transport | 93.1% |
+| durablestream/memorystorage | 96.2% |
+| durablestream/internal/protocol | 98.1% |
 
 ## Usage
 
