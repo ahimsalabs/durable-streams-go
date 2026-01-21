@@ -9,6 +9,7 @@ API.md
 
 # Test artifacts
 coverage.out
+history
 
 # Task runner cache
 .task/

@@ -373,30 +373,29 @@ func (h *Handler) handleAppend(w http.ResponseWriter, r *http.Request, streamID 
 			seq = ""
 		}
 	} else {
-		// Non-JSON mode: stream directly to storage without buffering entire body.
-		// This is critical for large uploads - avoids memory exhaustion.
-		// Use a counting reader to detect empty bodies and enforce size limits.
-		limitedReader := &limitedCountingReader{
-			r:     r.Body,
-			limit: h.maxAppendSize,
-		}
-
-		nextOffset, err = h.storage.AppendFrom(r.Context(), streamID, limitedReader, seq)
+		// Non-JSON mode: read body and append
+		body, err := io.ReadAll(io.LimitReader(r.Body, h.maxAppendSize+1))
 		if err != nil {
-			writeStorageError(w, err)
+			writeError(w, newError(codeBadRequest, "failed to read request body"))
 			return
 		}
 
-		// Check if body was empty (after streaming) - Section 5.2
+		// Check if body was empty - Section 5.2
 		// Per spec: "Servers MUST reject POST requests with an empty body...with 400 Bad Request"
-		if limitedReader.n == 0 {
+		if len(body) == 0 {
 			writeError(w, newError(codeBadRequest, "empty body not allowed"))
 			return
 		}
 
-		// Check if size limit was exceeded
-		if limitedReader.exceeded {
+		// Check size limit
+		if int64(len(body)) > h.maxAppendSize {
 			writeError(w, newError(codePayloadTooLarge, fmt.Sprintf("request body exceeds maximum size of %d bytes", h.maxAppendSize)))
+			return
+		}
+
+		nextOffset, err = h.storage.Append(r.Context(), streamID, body, seq)
+		if err != nil {
+			writeStorageError(w, err)
 			return
 		}
 	}
@@ -717,17 +716,17 @@ func (h *Handler) handleLongPoll(w http.ResponseWriter, r *http.Request, streamI
 	// Get cursor parameter for CDN collapsing (Section 8.1)
 	clientCursor := r.URL.Query().Get(protocol.QueryCursor)
 
+	// Fetch stream info once at the start - needed for offset=now and ContentType/IsPrivate
+	info, err := h.storage.Head(r.Context(), streamID)
+	if err != nil {
+		writeStorageError(w, err)
+		return
+	}
+
 	// Handle offset=now sentinel (Section 6)
 	// For long-poll, immediately begin waiting (no initial empty response)
 	isOffsetNow := offset == Offset(protocol.OffsetNow)
 	if isOffsetNow {
-		// Get the actual tail offset to wait from
-		info, err := h.storage.Head(r.Context(), streamID)
-		if err != nil {
-			writeStorageError(w, err)
-			return
-		}
-		// Replace "now" with actual tail offset for subscription
 		offset = info.NextOffset
 	}
 
@@ -741,12 +740,6 @@ func (h *Handler) handleLongPoll(w http.ResponseWriter, r *http.Request, streamI
 
 		// If messages available, return immediately
 		if len(result.Messages) > 0 {
-			info, err := h.storage.Head(r.Context(), streamID)
-			if err != nil {
-				writeStorageError(w, err)
-				return
-			}
-
 			setSecurityHeaders(w)
 			w.Header().Set("Content-Type", info.ContentType)
 			w.Header().Set(protocol.HeaderStreamNextOffset, result.NextOffset.String())
@@ -766,7 +759,7 @@ func (h *Handler) handleLongPoll(w http.ResponseWriter, r *http.Request, streamI
 		}
 	}
 
-	// No data available, subscribe and wait
+	// No data available, wait for data to arrive
 	// Use the shorter of the request context deadline or longPollTimeout
 	waitCtx := r.Context()
 	deadline, hasDeadline := r.Context().Deadline()
@@ -785,61 +778,38 @@ func (h *Handler) handleLongPoll(w http.ResponseWriter, r *http.Request, streamI
 		defer cancel()
 	}
 
-	notifyCh, err := h.storage.Subscribe(waitCtx, streamID, offset)
+	// Wait for data atomically
+	result, err := h.storage.WaitForData(waitCtx, streamID, offset, h.chunkSize)
 	if err != nil {
+		// Timeout - return 204 No Content (per spec Section 5.6)
+		if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
+			setSecurityHeaders(w)
+			w.Header().Set(protocol.HeaderStreamNextOffset, offset.String())
+			w.Header().Set(protocol.HeaderStreamCursor, protocol.GenerateCursor(clientCursor))
+			w.Header().Set(protocol.HeaderStreamUpToDate, "true")
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		// Other error (e.g., stream deleted/not found)
 		writeStorageError(w, err)
 		return
 	}
 
-	// Wait for data or timeout
-	select {
-	case _, ok := <-notifyCh:
-		if !ok {
-			// Channel closed (stream deleted or error)
-			writeError(w, newError(codeNotFound, "stream not found"))
-			return
-		}
+	setSecurityHeaders(w)
+	w.Header().Set("Content-Type", info.ContentType)
+	w.Header().Set(protocol.HeaderStreamNextOffset, result.NextOffset.String())
+	w.Header().Set(protocol.HeaderStreamCursor, protocol.GenerateCursor(clientCursor))
+	w.Header().Set("Cache-Control", cacheControlHeader(info.IsPrivate))
 
-		// Data arrived, read and return
-		result, err := h.storage.Read(waitCtx, streamID, offset, h.chunkSize)
-		if err != nil {
-			writeStorageError(w, err)
-			return
-		}
-
-		info, err := h.storage.Head(waitCtx, streamID)
-		if err != nil {
-			writeStorageError(w, err)
-			return
-		}
-
-		setSecurityHeaders(w)
-		w.Header().Set("Content-Type", info.ContentType)
-		w.Header().Set(protocol.HeaderStreamNextOffset, result.NextOffset.String())
-		w.Header().Set(protocol.HeaderStreamCursor, protocol.GenerateCursor(clientCursor))
-		w.Header().Set("Cache-Control", cacheControlHeader(info.IsPrivate))
-
-		// Set Stream-Up-To-Date if at tail (per spec Section 5.6)
-		if result.NextOffset.Compare(result.TailOffset) == 0 {
-			w.Header().Set(protocol.HeaderStreamUpToDate, "true")
-		}
-
-		responseBody := formatResponseBody(result.Messages, info.ContentType)
-
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write(responseBody)
-
-	case <-waitCtx.Done():
-		// Timeout - return 204 No Content (per spec Section 5.6)
-		setSecurityHeaders(w)
-		info, err := h.storage.Head(r.Context(), streamID)
-		if err == nil {
-			w.Header().Set(protocol.HeaderStreamNextOffset, info.NextOffset.String())
-		}
-		w.Header().Set(protocol.HeaderStreamCursor, protocol.GenerateCursor(clientCursor))
+	// Set Stream-Up-To-Date if at tail (per spec Section 5.6)
+	if result.NextOffset.Compare(result.TailOffset) == 0 {
 		w.Header().Set(protocol.HeaderStreamUpToDate, "true")
-		w.WriteHeader(http.StatusNoContent)
 	}
+
+	responseBody := formatResponseBody(result.Messages, info.ContentType)
+
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(responseBody)
 }
 
 // handleSSE implements SSE streaming (Section 5.7)
@@ -891,7 +861,8 @@ func (h *Handler) handleSSE(w http.ResponseWriter, r *http.Request, streamID str
 	w.WriteHeader(http.StatusOK)
 	flusher.Flush()
 
-	// Set close timer
+	// Set close deadline and timer
+	closeDeadline := time.Now().Add(h.sseCloseAfter)
 	closeTimer := time.NewTimer(h.sseCloseAfter)
 	defer closeTimer.Stop()
 
@@ -909,32 +880,90 @@ func (h *Handler) handleSSE(w http.ResponseWriter, r *http.Request, streamID str
 	// with upToDate: true even if there's no data.
 	sentInitialControl := isOffsetNow
 
+	// Keepalive interval for sending control events to prevent proxy timeouts
+	const keepaliveInterval = 30 * time.Second
+
 	// Stream loop
 	for {
+		// Check for close/disconnect before blocking
+		select {
+		case <-closeTimer.C:
+			return
+		case <-r.Context().Done():
+			return
+		default:
+		}
+
 		// Try to read data
 		result, err := h.storage.Read(r.Context(), streamID, currentOffset, h.chunkSize)
 		if err != nil {
-			// Connection likely already established, just close
 			return
 		}
 
-		// If messages available, send them
+		// If no messages, wait for data or send keepalive
+		if len(result.Messages) == 0 {
+			// Send initial control if not yet sent (empty stream or starting at tail)
+			if !sentInitialControl {
+				if currentOffset.Compare(result.TailOffset) == 0 || result.NextOffset.Compare(result.TailOffset) == 0 {
+					sentInitialControl = true
+					fmt.Fprintf(w, "event: control\n")
+					fmt.Fprintf(w, "data: {\"streamNextOffset\":\"%s\",\"upToDate\":true,\"streamCursor\":\"%s\"}\n\n", result.NextOffset, protocol.GenerateCursor(clientCursor))
+					flusher.Flush()
+				}
+			}
+
+			// Calculate wait timeout: min of keepalive interval and remaining close time
+			waitTimeout := keepaliveInterval
+			if remaining := time.Until(closeDeadline); remaining < waitTimeout {
+				waitTimeout = remaining
+				if waitTimeout <= 0 {
+					// Close deadline reached
+					return
+				}
+			}
+
+			// Wait for new data - storage handles efficient blocking
+			ctx, cancel := context.WithTimeout(r.Context(), waitTimeout)
+			waitResult, err := h.storage.WaitForData(ctx, streamID, currentOffset, h.chunkSize)
+			cancel()
+
+			if err != nil {
+				// Check if parent context is done (client disconnect)
+				if r.Context().Err() != nil {
+					return
+				}
+				if errors.Is(err, context.DeadlineExceeded) {
+					// Our wait timeout expired - send SSE comment as keepalive to prevent proxy timeout
+					// Per SSE spec, lines starting with ":" are comments and ignored by clients
+					fmt.Fprintf(w, ": keepalive\n\n")
+					flusher.Flush()
+					continue
+				}
+				if errors.Is(err, context.Canceled) {
+					return
+				}
+				// Stream deleted or other error
+				return
+			}
+
+			// Reuse waitResult directly instead of re-reading
+			result = waitResult
+		}
+
+		// If we have messages, send them
 		if len(result.Messages) > 0 {
-			sentInitialControl = true // We're sending events now
+			sentInitialControl = true
 
 			// Send data event
 			fmt.Fprintf(w, "event: data\n")
 
 			if protocol.IsJSONContentType(info.ContentType) {
-				// For JSON, format as single-line array
-				// (SSE joins data: lines with \n which would create invalid JSON)
 				jsonArray := formatResponseBody(result.Messages, info.ContentType)
 				fmt.Fprintf(w, "data: %s\n", string(jsonArray))
 			} else {
 				// For text/*, send concatenated data split by lines.
 				// Per SSE spec, lines can be terminated by CR, LF, or CRLF.
-				// We must split by all terminators to prevent CRLF injection attacks
-				// where embedded CR characters could be interpreted as line terminators.
+				// We must split by all terminators to prevent CRLF injection attacks.
 				data := concatenateMessages(result.Messages)
 				lines := splitBySSELineTerminators(string(data))
 				for _, line := range lines {
@@ -943,8 +972,7 @@ func (h *Handler) handleSSE(w http.ResponseWriter, r *http.Request, streamID str
 			}
 			fmt.Fprintf(w, "\n")
 
-			// Send control event with generated cursor (Section 8.1)
-			// Include upToDate: true if we're at the tail
+			// Send control event with cursor
 			fmt.Fprintf(w, "event: control\n")
 			if result.NextOffset.Compare(result.TailOffset) == 0 {
 				fmt.Fprintf(w, "data: {\"streamNextOffset\":\"%s\",\"upToDate\":true,\"streamCursor\":\"%s\"}\n\n", result.NextOffset, protocol.GenerateCursor(clientCursor))
@@ -953,53 +981,7 @@ func (h *Handler) handleSSE(w http.ResponseWriter, r *http.Request, streamID str
 			}
 
 			flusher.Flush()
-
 			currentOffset = result.NextOffset
-		} else if !sentInitialControl {
-			// No messages and haven't sent initial control yet.
-			// Check if we're at tail (caught up) and send control with upToDate: true.
-			// This handles the case of SSE on an empty stream or starting from tail.
-			if currentOffset.Compare(result.TailOffset) == 0 || result.NextOffset.Compare(result.TailOffset) == 0 {
-				sentInitialControl = true
-				fmt.Fprintf(w, "event: control\n")
-				fmt.Fprintf(w, "data: {\"streamNextOffset\":\"%s\",\"upToDate\":true,\"streamCursor\":\"%s\"}\n\n", result.NextOffset, protocol.GenerateCursor(clientCursor))
-				flusher.Flush()
-			}
-		}
-
-		// Check if we should close
-		select {
-		case <-closeTimer.C:
-			// Close after timeout (Section 5.7)
-			return
-		case <-r.Context().Done():
-			// Client disconnected
-			return
-		default:
-			// Continue, but wait for new data
-			if len(result.Messages) == 0 {
-				// Subscribe and wait for new data
-				ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
-				notifyCh, err := h.storage.Subscribe(ctx, streamID, currentOffset)
-				if err != nil {
-					cancel()
-					return
-				}
-
-				select {
-				case <-notifyCh:
-					// New data available, loop will read it
-				case <-closeTimer.C:
-					cancel()
-					return
-				case <-r.Context().Done():
-					cancel()
-					return
-				case <-ctx.Done():
-					// Short timeout, loop again
-				}
-				cancel()
-			}
 		}
 	}
 }
@@ -1232,24 +1214,6 @@ func sanitizeForETag(s string) string {
 		}
 	}
 	return buf.String()
-}
-
-// limitedCountingReader wraps an io.Reader to count bytes read and enforce a size limit.
-// Unlike io.LimitReader, it tracks whether the limit was exceeded rather than just stopping.
-type limitedCountingReader struct {
-	r        io.Reader
-	limit    int64
-	n        int64 // bytes read so far
-	exceeded bool  // true if limit was exceeded
-}
-
-func (l *limitedCountingReader) Read(p []byte) (n int, err error) {
-	n, err = l.r.Read(p)
-	l.n += int64(n)
-	if l.n > l.limit {
-		l.exceeded = true
-	}
-	return n, err
 }
 
 // validateOffset validates an offset string per protocol Section 6 and 10.2.

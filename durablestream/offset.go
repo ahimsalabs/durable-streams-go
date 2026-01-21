@@ -1,6 +1,11 @@
 // Package durablestream implements the Durable Streams Protocol.
 package durablestream
 
+import (
+	"fmt"
+	"strconv"
+)
+
 // Offset represents an opaque position within a stream.
 // Per spec Section 6: Offsets are opaque tokens that are lexicographically sortable.
 //
@@ -44,4 +49,30 @@ func (o Offset) IsZero() bool {
 // Implements fmt.Stringer interface.
 func (o Offset) String() string {
 	return string(o)
+}
+
+// FormatOffset formats an index as a zero-padded 10-digit string offset.
+// This is a helper for storage implementations that use sequential integer offsets.
+// Uses 10 digits to support up to 9,999,999,999 offsets.
+// Per Section 6: Offsets must be lexicographically sortable and strictly increasing.
+func FormatOffset(idx int64) Offset {
+	return Offset(fmt.Sprintf("%010d", idx))
+}
+
+// ParseOffset parses an offset string back to an index.
+// Returns 0 for empty string or "-1" (stream beginning sentinel).
+// Returns ErrBadRequest for invalid or negative offsets.
+// This is a helper for storage implementations that use sequential integer offsets.
+func ParseOffset(offset Offset) (int64, error) {
+	if offset == "" || offset == "-1" {
+		return 0, nil
+	}
+	idx, err := strconv.ParseInt(string(offset), 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("invalid offset %q: %w", offset, ErrBadRequest)
+	}
+	if idx < 0 {
+		return 0, fmt.Errorf("negative offset %q: %w", offset, ErrBadRequest)
+	}
+	return idx, nil
 }

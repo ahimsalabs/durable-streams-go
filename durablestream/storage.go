@@ -2,7 +2,6 @@ package durablestream
 
 import (
 	"context"
-	"io"
 	"time"
 )
 
@@ -47,26 +46,29 @@ type Storage interface {
 
 	// Append writes data to a stream. Returns the new tail offset.
 	// seq is optional sequence number for coordination (Section 5.2).
+	//
+	// The data slice is only valid for the duration of the call; the caller
+	// may reuse or modify it after Append returns. Implementations that need
+	// to retain the data (e.g., in-memory storage) must copy it.
 	Append(ctx context.Context, streamID string, data []byte, seq string) (Offset, error)
-
-	// AppendFrom streams data from an io.Reader to a stream.
-	// This avoids buffering the entire request body in memory.
-	// The reader is read until EOF or error. Returns the new tail offset.
-	// Implementations MUST ensure atomic writes - either all data is persisted
-	// or none (per protocol atomicity requirements).
-	AppendFrom(ctx context.Context, streamID string, r io.Reader, seq string) (Offset, error)
 
 	// Read returns messages from offset. limit is max total bytes to return.
 	// Returns messages and the next offset to read from (Section 5.5).
 	Read(ctx context.Context, streamID string, offset Offset, limit int) (*ReadResult, error)
 
 	// Head returns stream metadata without reading data (Section 5.4).
+	// Returns ErrNotFound if stream doesn't exist (use for existence checks).
 	Head(ctx context.Context, streamID string) (*StreamInfo, error)
 
 	// Delete removes a stream (Section 5.3).
 	Delete(ctx context.Context, streamID string) error
 
-	// Subscribe returns a channel notified when new data arrives after offset.
-	// The channel receives the new tail offset. Closing the context cancels the subscription.
-	Subscribe(ctx context.Context, streamID string, offset Offset) (<-chan Offset, error)
+	// WaitForData blocks until data is available at offset, then returns it.
+	// Returns immediately if data already exists at offset.
+	// Returns ctx.Err() on timeout/cancellation.
+	// Returns ErrNotFound if stream doesn't exist or is deleted while waiting.
+	WaitForData(ctx context.Context, streamID string, offset Offset, limit int) (*ReadResult, error)
+
+	// Close releases resources. Safe to call multiple times.
+	Close() error
 }
