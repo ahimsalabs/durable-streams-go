@@ -4,10 +4,7 @@ package memorystorage
 import (
 	"context"
 	"fmt"
-	"io"
-	"strings"
 	"sync"
-	"time"
 
 	"github.com/ahimsalabs/durable-streams-go/durablestream"
 	"github.com/go4org/hashtriemap"
@@ -15,11 +12,12 @@ import (
 
 // memoryStream represents a single stream in memory.
 type memoryStream struct {
-	mu          sync.RWMutex // Per-stream lock for mutations
-	config      durablestream.StreamConfig
-	messages    []durablestream.StoredMessage // All messages in order
-	lastSeq     string                        // Last sequence number seen (lexicographic)
-	subscribers []chan durablestream.Offset
+	mu       sync.RWMutex // Per-stream lock for mutations
+	config   durablestream.StreamConfig
+	messages []durablestream.StoredMessage // All messages in order
+	lastSeq  string                        // Last sequence number seen (lexicographic)
+	notifyCh chan struct{}                 // Closed on append, replaced with new channel
+	deleted  bool                          // True if stream has been deleted
 }
 
 // Storage is an in-memory implementation of durablestream.Storage.
@@ -37,22 +35,30 @@ func New() *Storage {
 // Create creates a new stream (Section 5.1).
 func (m *Storage) Create(ctx context.Context, streamID string, cfg durablestream.StreamConfig) (bool, error) {
 	stream := &memoryStream{
-		config:      cfg,
-		messages:    make([]durablestream.StoredMessage, 0),
-		lastSeq:     "",
-		subscribers: make([]chan durablestream.Offset, 0),
+		config:   cfg,
+		messages: make([]durablestream.StoredMessage, 0),
+		lastSeq:  "",
+		notifyCh: make(chan struct{}),
 	}
 
 	existing, loaded := m.streams.LoadOrStore(streamID, stream)
 	if loaded {
 		// Stream already exists - check if it's expired
-		if isExpired(existing.config) {
+		if existing.config.IsExpired() {
+			// Wake any waiters on the old stream before replacing
+			existing.mu.Lock()
+			if !existing.deleted {
+				existing.deleted = true
+				close(existing.notifyCh)
+			}
+			existing.mu.Unlock()
+
 			// Expired stream can be replaced (Section 5.1)
 			m.streams.Store(streamID, stream)
 			return true, nil
 		}
 		// Not expired - check if config matches for idempotency
-		if configsMatch(existing.config, cfg) {
+		if existing.config.Matches(cfg) {
 			return false, nil // Not newly created, but config matches
 		}
 		return false, fmt.Errorf("stream exists with different config: %w", durablestream.ErrConflict)
@@ -76,7 +82,7 @@ func (m *Storage) Append(ctx context.Context, streamID string, data []byte, seq 
 	defer stream.mu.Unlock()
 
 	// Check expiry
-	if isExpired(stream.config) {
+	if stream.config.IsExpired() {
 		return "", durablestream.ErrNotFound
 	}
 
@@ -89,35 +95,22 @@ func (m *Storage) Append(ctx context.Context, streamID string, data []byte, seq 
 	}
 
 	// Create new message with offset
-	offset := formatOffset(len(stream.messages) + 1)
+	// Copy data to ensure durability - caller may reuse/mutate the slice
+	b := make([]byte, len(data))
+	copy(b, data)
+
+	offset := durablestream.FormatOffset(int64(len(stream.messages) + 1))
 	msg := durablestream.StoredMessage{
-		Data:   data,
+		Data:   b,
 		Offset: offset,
 	}
 	stream.messages = append(stream.messages, msg)
 
-	// Notify subscribers (non-blocking)
-	for _, ch := range stream.subscribers {
-		select {
-		case ch <- offset:
-		default:
-		}
-	}
+	// Notify waiters: close current channel to wake all waiters, then replace it
+	close(stream.notifyCh)
+	stream.notifyCh = make(chan struct{})
 
 	return offset, nil
-}
-
-// AppendFrom streams data from an io.Reader to a stream.
-// For Storage, this reads all data into memory then appends.
-// A production storage would stream directly to disk/network.
-func (m *Storage) AppendFrom(ctx context.Context, streamID string, r io.Reader, seq string) (durablestream.Offset, error) {
-	// For memory storage, we still need to read into memory
-	// A real implementation would stream to disk
-	data, err := io.ReadAll(r)
-	if err != nil {
-		return "", fmt.Errorf("failed to read request body: %w", durablestream.ErrBadRequest)
-	}
-	return m.Append(ctx, streamID, data, seq)
 }
 
 // Read returns messages from offset (Section 5.5).
@@ -131,12 +124,12 @@ func (m *Storage) Read(ctx context.Context, streamID string, offset durablestrea
 	defer stream.mu.RUnlock()
 
 	// Check expiry
-	if isExpired(stream.config) {
+	if stream.config.IsExpired() {
 		return nil, durablestream.ErrNotFound
 	}
 
 	// Parse offset to message index
-	offsetIdx, err := parseOffset(offset)
+	offsetIdx, err := durablestream.ParseOffset(offset)
 	if err != nil {
 		return nil, err
 	}
@@ -144,14 +137,14 @@ func (m *Storage) Read(ctx context.Context, streamID string, offset durablestrea
 	// Offset 0 means "start", which maps to first message (index 0)
 	// Offset N means "after message N", so we start reading from index N
 	// If offsetIdx > len(messages), client is ahead of stream (gone)
-	if offsetIdx < 0 || offsetIdx > len(stream.messages) {
+	if offsetIdx > int64(len(stream.messages)) {
 		return nil, durablestream.ErrGone
 	}
 
 	// Collect messages starting from offsetIdx, respecting byte limit
 	var messages []durablestream.StoredMessage
 	totalBytes := 0
-	for i := offsetIdx; i < len(stream.messages); i++ {
+	for i := int(offsetIdx); i < len(stream.messages); i++ {
 		msg := stream.messages[i]
 		if limit > 0 && totalBytes+len(msg.Data) > limit && len(messages) > 0 {
 			// Would exceed limit and we have at least one message
@@ -171,7 +164,7 @@ func (m *Storage) Read(ctx context.Context, streamID string, offset durablestrea
 		// No messages returned, stay at current offset
 		nextOffset = offset
 		if nextOffset == "" || nextOffset == "-1" {
-			nextOffset = formatOffset(0)
+			nextOffset = durablestream.FormatOffset(0)
 		}
 	}
 
@@ -180,7 +173,7 @@ func (m *Storage) Read(ctx context.Context, streamID string, offset durablestrea
 	if len(stream.messages) > 0 {
 		tailOffset = stream.messages[len(stream.messages)-1].Offset
 	} else {
-		tailOffset = formatOffset(0)
+		tailOffset = durablestream.FormatOffset(0)
 	}
 
 	return &durablestream.ReadResult{
@@ -201,7 +194,7 @@ func (m *Storage) Head(ctx context.Context, streamID string) (*durablestream.Str
 	defer stream.mu.RUnlock()
 
 	// Check expiry
-	if isExpired(stream.config) {
+	if stream.config.IsExpired() {
 		return nil, durablestream.ErrNotFound
 	}
 
@@ -210,7 +203,7 @@ func (m *Storage) Head(ctx context.Context, streamID string) (*durablestream.Str
 	if len(stream.messages) > 0 {
 		nextOffset = stream.messages[len(stream.messages)-1].Offset
 	} else {
-		nextOffset = formatOffset(0)
+		nextOffset = durablestream.FormatOffset(0)
 	}
 
 	return &durablestream.StreamInfo{
@@ -229,114 +222,68 @@ func (m *Storage) Delete(ctx context.Context, streamID string) error {
 		return durablestream.ErrNotFound
 	}
 
-	// Close all subscriber channels
+	// Mark as deleted and close notification channel to wake any waiters
 	stream.mu.Lock()
-	for _, ch := range stream.subscribers {
-		close(ch)
-	}
+	stream.deleted = true
+	close(stream.notifyCh)
 	stream.mu.Unlock()
 
 	return nil
 }
 
-// Subscribe returns a channel notified when new data arrives.
-func (m *Storage) Subscribe(ctx context.Context, streamID string, offset durablestream.Offset) (<-chan durablestream.Offset, error) {
-	stream, ok := m.streams.Load(streamID)
-	if !ok {
-		return nil, durablestream.ErrNotFound
-	}
-
-	stream.mu.Lock()
-
-	// Check expiry
-	if isExpired(stream.config) {
-		stream.mu.Unlock()
-		return nil, durablestream.ErrNotFound
-	}
-
-	// Create buffered channel to avoid blocking appends
-	ch := make(chan durablestream.Offset, 10)
-	stream.subscribers = append(stream.subscribers, ch)
-	stream.mu.Unlock()
-
-	// Handle context cancellation
-	go func() {
-		<-ctx.Done()
-
-		// Remove subscriber - stream may have been deleted, so re-check
-		s, ok := m.streams.Load(streamID)
-		if ok {
-			s.mu.Lock()
-			for i, sub := range s.subscribers {
-				if sub == ch {
-					s.subscribers = append(s.subscribers[:i], s.subscribers[i+1:]...)
-					break
-				}
-			}
-			s.mu.Unlock()
+// WaitForData blocks until data is available at offset, then returns it.
+// Returns immediately if data already exists at offset.
+// Returns ctx.Err() on timeout/cancellation.
+// Returns ErrNotFound if stream doesn't exist or is deleted while waiting.
+func (m *Storage) WaitForData(ctx context.Context, streamID string, offset durablestream.Offset, limit int) (*durablestream.ReadResult, error) {
+	for {
+		stream, ok := m.streams.Load(streamID)
+		if !ok {
+			return nil, durablestream.ErrNotFound
 		}
-		close(ch)
-	}()
 
-	return ch, nil
+		stream.mu.RLock()
+
+		// Check if stream is deleted
+		if stream.deleted {
+			stream.mu.RUnlock()
+			return nil, durablestream.ErrNotFound
+		}
+
+		// Check expiry
+		if stream.config.IsExpired() {
+			stream.mu.RUnlock()
+			return nil, durablestream.ErrNotFound
+		}
+
+		// Get notification channel before reading (to avoid race)
+		notifyCh := stream.notifyCh
+
+		stream.mu.RUnlock()
+
+		// Try to read data
+		result, err := m.Read(ctx, streamID, offset, limit)
+		if err != nil {
+			return nil, err
+		}
+
+		// If we have data, return it
+		if len(result.Messages) > 0 {
+			return result, nil
+		}
+
+		// No data available, wait for notification or context cancellation
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-notifyCh:
+			// New data or deletion - loop to re-check
+		}
+	}
 }
 
-// formatOffset formats an offset index as a zero-padded string.
-// Uses 10 digits to support up to 9,999,999,999 offsets.
-// Per Section 6: Offsets must be lexicographically sortable and strictly increasing.
-func formatOffset(idx int) durablestream.Offset {
-	return durablestream.Offset(fmt.Sprintf("%010d", idx))
-}
-
-// parseOffset parses an offset string back to an index.
-// Per Section 6: "-1" is the sentinel value for stream beginning.
-// Special value "-1" is treated as 0 (read from start).
-func parseOffset(offset durablestream.Offset) (int, error) {
-	if offset == "" || offset == "-1" {
-		return 0, nil
-	}
-	var idx int
-	_, err := fmt.Sscanf(string(offset), "%d", &idx)
-	if err != nil {
-		return 0, fmt.Errorf("invalid offset %q: %w", offset, durablestream.ErrBadRequest)
-	}
-	return idx, nil
-}
-
-// configsMatch checks if two StreamConfigs are equivalent for idempotent create.
-func configsMatch(a, b durablestream.StreamConfig) bool {
-	// Content-Type media types are case-insensitive per RFC 2045
-	if !contentTypesMatch(a.ContentType, b.ContentType) {
-		return false
-	}
-	if a.TTL != b.TTL {
-		return false
-	}
-	// Only compare ExpiresAt directly when TTL isn't set (i.e., explicit Stream-Expires-At header).
-	// When TTL is set, ExpiresAt is derived from TTL at request time and will differ between requests.
-	if a.TTL == 0 && b.TTL == 0 && !a.ExpiresAt.Equal(b.ExpiresAt) {
-		return false
-	}
-	if a.IsPrivate != b.IsPrivate {
-		return false
-	}
-	return true
-}
-
-// isExpired checks if a stream has expired based on its config.
-func isExpired(cfg durablestream.StreamConfig) bool {
-	if !cfg.ExpiresAt.IsZero() && time.Now().After(cfg.ExpiresAt) {
-		return true
-	}
-	// TTL is checked at creation time, not on every access in this simple implementation
-	return false
-}
-
-// contentTypesMatch compares two content types case-insensitively for the base media type.
-func contentTypesMatch(a, b string) bool {
-	partsA := strings.Split(a, ";")
-	partsB := strings.Split(b, ";")
-	mediaTypeA := strings.TrimSpace(partsA[0])
-	mediaTypeB := strings.TrimSpace(partsB[0])
-	return strings.EqualFold(mediaTypeA, mediaTypeB)
+// Close releases resources. Safe to call multiple times.
+// For in-memory storage, this is a no-op.
+func (m *Storage) Close() error {
+	return nil
 }

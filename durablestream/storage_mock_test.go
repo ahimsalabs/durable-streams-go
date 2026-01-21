@@ -3,7 +3,6 @@ package durablestream
 import (
 	"context"
 	"fmt"
-	"io"
 	"net/http/httptest"
 	"sync"
 	"time"
@@ -17,9 +16,10 @@ type testStorage struct {
 }
 
 type testStream struct {
-	config      StreamConfig
-	messages    []StoredMessage
-	subscribers []chan Offset
+	config   StreamConfig
+	messages []StoredMessage
+	notifyCh chan struct{} // Closed on append, replaced with new channel
+	deleted  bool
 }
 
 func newTestStorage() *testStorage {
@@ -39,6 +39,7 @@ func (s *testStorage) Create(ctx context.Context, streamID string, cfg StreamCon
 	stream := &testStream{
 		config:   cfg,
 		messages: make([]StoredMessage, 0),
+		notifyCh: make(chan struct{}),
 	}
 
 	s.streams[streamID] = stream
@@ -54,30 +55,22 @@ func (s *testStorage) Append(ctx context.Context, streamID string, data []byte, 
 		return "", ErrNotFound
 	}
 
-	offset := Offset(fmt.Sprintf("%010d", len(stream.messages)+1))
+	// Copy data - caller may reuse the slice (per Storage interface contract)
+	b := make([]byte, len(data))
+	copy(b, data)
+
+	offset := FormatOffset(int64(len(stream.messages) + 1))
 	msg := StoredMessage{
-		Data:   data,
+		Data:   b,
 		Offset: offset,
 	}
 	stream.messages = append(stream.messages, msg)
 
-	// Notify subscribers
-	for _, ch := range stream.subscribers {
-		select {
-		case ch <- offset:
-		default:
-		}
-	}
+	// Notify waiters: close current channel to wake all waiters, then replace it
+	close(stream.notifyCh)
+	stream.notifyCh = make(chan struct{})
 
 	return offset, nil
-}
-
-func (s *testStorage) AppendFrom(ctx context.Context, streamID string, r io.Reader, seq string) (Offset, error) {
-	data, err := io.ReadAll(r)
-	if err != nil {
-		return "", err
-	}
-	return s.Append(ctx, streamID, data, seq)
 }
 
 func (s *testStorage) Read(ctx context.Context, streamID string, offset Offset, limit int) (*ReadResult, error) {
@@ -117,7 +110,7 @@ func (s *testStorage) Read(ctx context.Context, streamID string, offset Offset, 
 	} else {
 		nextOffset = offset
 		if nextOffset == "" || nextOffset == "-1" {
-			nextOffset = Offset(fmt.Sprintf("%010d", 0))
+			nextOffset = FormatOffset(0)
 		}
 	}
 
@@ -126,7 +119,7 @@ func (s *testStorage) Read(ctx context.Context, streamID string, offset Offset, 
 	if len(stream.messages) > 0 {
 		tailOffset = stream.messages[len(stream.messages)-1].Offset
 	} else {
-		tailOffset = Offset(fmt.Sprintf("%010d", 0))
+		tailOffset = FormatOffset(0)
 	}
 
 	return &ReadResult{
@@ -149,7 +142,7 @@ func (s *testStorage) Head(ctx context.Context, streamID string) (*StreamInfo, e
 	if len(stream.messages) > 0 {
 		nextOffset = stream.messages[len(stream.messages)-1].Offset
 	} else {
-		nextOffset = Offset(fmt.Sprintf("%010d", 0))
+		nextOffset = FormatOffset(0)
 	}
 
 	return &StreamInfo{
@@ -169,41 +162,54 @@ func (s *testStorage) Delete(ctx context.Context, streamID string) error {
 		return ErrNotFound
 	}
 
-	for _, ch := range stream.subscribers {
-		close(ch)
-	}
+	// Mark as deleted and close notification channel to wake any waiters
+	stream.deleted = true
+	close(stream.notifyCh)
 	delete(s.streams, streamID)
 	return nil
 }
 
-func (s *testStorage) Subscribe(ctx context.Context, streamID string, offset Offset) (<-chan Offset, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	stream, ok := s.streams[streamID]
-	if !ok {
-		return nil, ErrNotFound
-	}
-
-	ch := make(chan Offset, 10)
-	stream.subscribers = append(stream.subscribers, ch)
-
-	go func() {
-		<-ctx.Done()
-		s.mu.Lock()
-		defer s.mu.Unlock()
-		if st, ok := s.streams[streamID]; ok {
-			for i, sub := range st.subscribers {
-				if sub == ch {
-					st.subscribers = append(st.subscribers[:i], st.subscribers[i+1:]...)
-					break
-				}
-			}
+// WaitForData blocks until data is available at offset, then returns it.
+func (s *testStorage) WaitForData(ctx context.Context, streamID string, offset Offset, limit int) (*ReadResult, error) {
+	for {
+		s.mu.RLock()
+		stream, ok := s.streams[streamID]
+		if !ok {
+			s.mu.RUnlock()
+			return nil, ErrNotFound
 		}
-		close(ch)
-	}()
 
-	return ch, nil
+		if stream.deleted {
+			s.mu.RUnlock()
+			return nil, ErrNotFound
+		}
+
+		notifyCh := stream.notifyCh
+		s.mu.RUnlock()
+
+		// Try to read data
+		result, err := s.Read(ctx, streamID, offset, limit)
+		if err != nil {
+			return nil, err
+		}
+
+		// If we have data, return it
+		if len(result.Messages) > 0 {
+			return result, nil
+		}
+
+		// No data available, wait for notification or context cancellation
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-notifyCh:
+			// New data or deletion - loop to re-check
+		}
+	}
+}
+
+func (s *testStorage) Close() error {
+	return nil
 }
 
 // setupInternalTestServer creates a test HTTP server with testStorage for internal tests.

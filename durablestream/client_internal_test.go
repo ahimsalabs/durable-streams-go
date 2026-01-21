@@ -77,10 +77,6 @@ func (m *mockStorage) Append(_ context.Context, _ string, _ []byte, _ string) (O
 	return "", nil
 }
 
-func (m *mockStorage) AppendFrom(_ context.Context, _ string, _ io.Reader, _ string) (Offset, error) {
-	return "", nil
-}
-
 func (m *mockStorage) Read(_ context.Context, _ string, _ Offset, _ int) (*ReadResult, error) {
 	return &ReadResult{Messages: nil}, nil
 }
@@ -93,8 +89,13 @@ func (m *mockStorage) Delete(_ context.Context, _ string) error {
 	return nil
 }
 
-func (m *mockStorage) Subscribe(_ context.Context, _ string, _ Offset) (<-chan Offset, error) {
-	return nil, nil
+func (m *mockStorage) WaitForData(_ context.Context, _ string, _ Offset, _ int) (*ReadResult, error) {
+	// Mock simply delegates to Read behavior - returns empty result
+	return &ReadResult{Messages: nil}, nil
+}
+
+func (m *mockStorage) Close() error {
+	return nil
 }
 
 func TestHandler_Config(t *testing.T) {

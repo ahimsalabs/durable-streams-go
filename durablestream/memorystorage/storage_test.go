@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"errors"
-	"strings"
 	"testing"
 	"time"
 
@@ -323,70 +322,31 @@ func TestAppend(t *testing.T) {
 		}
 	})
 
-	t.Run("notifies subscribers", func(t *testing.T) {
+	t.Run("notifies waiters via WaitForData", func(t *testing.T) {
 		s := New()
 		_, _ = s.Create(context.Background(), "test", durablestream.StreamConfig{ContentType: "text/plain"})
 
-		ctx, cancel := context.WithCancel(context.Background())
+		ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
 		defer cancel()
 
-		ch, _ := s.Subscribe(ctx, "test", "")
-
-		// Append should notify
+		// Append in background
 		go func() {
 			time.Sleep(10 * time.Millisecond)
 			_, _ = s.Append(context.Background(), "test", []byte("data"), "")
 		}()
 
-		select {
-		case offset := <-ch:
-			if offset != "0000000001" {
-				t.Errorf("expected offset 0000000001, got %s", offset)
-			}
-		case <-time.After(100 * time.Millisecond):
-			t.Error("subscriber not notified")
-		}
-	})
-}
-
-func TestAppendFrom(t *testing.T) {
-	t.Run("appends from reader", func(t *testing.T) {
-		s := New()
-		_, _ = s.Create(context.Background(), "test", durablestream.StreamConfig{ContentType: "text/plain"})
-
-		r := strings.NewReader("hello from reader")
-		offset, err := s.AppendFrom(context.Background(), "test", r, "")
+		// Use WaitForData to wait for notification
+		result, err := s.WaitForData(ctx, "test", "", 0)
 		if err != nil {
-			t.Fatalf("append reader: %v", err)
+			t.Fatalf("WaitForData error: %v", err)
 		}
-		if offset != "0000000001" {
-			t.Errorf("expected offset 0000000001, got %s", offset)
+		if len(result.Messages) != 1 {
+			t.Errorf("expected 1 message, got %d", len(result.Messages))
 		}
-
-		result, _ := s.Read(context.Background(), "test", "0000000000", 0)
-		if string(concatMessages(result)) != "hello from reader" {
-			t.Errorf("unexpected data: %s", concatMessages(result))
+		if string(result.Messages[0].Data) != "data" {
+			t.Errorf("expected 'data', got %s", result.Messages[0].Data)
 		}
 	})
-
-	t.Run("propagates read errors", func(t *testing.T) {
-		s := New()
-		_, _ = s.Create(context.Background(), "test", durablestream.StreamConfig{ContentType: "text/plain"})
-
-		r := &errorReader{err: errors.New("read failed")}
-		_, err := s.AppendFrom(context.Background(), "test", r, "")
-		if !errors.Is(err, durablestream.ErrBadRequest) {
-			t.Errorf("expected ErrBadRequest, got: %v", err)
-		}
-	})
-}
-
-type errorReader struct {
-	err error
-}
-
-func (r *errorReader) Read(p []byte) (int, error) {
-	return 0, r.err
 }
 
 func TestRead(t *testing.T) {
@@ -533,15 +493,16 @@ func TestRead(t *testing.T) {
 		}
 	})
 
-	t.Run("returns gone for negative offset", func(t *testing.T) {
+	t.Run("returns bad request for negative offset", func(t *testing.T) {
 		s := New()
 		_, _ = s.Create(context.Background(), "test", durablestream.StreamConfig{ContentType: "text/plain"})
 		_, _ = s.Append(context.Background(), "test", []byte("data"), "")
 
-		// -2 is not a valid offset (only -1 is special)
+		// -2 is not a valid offset (only -1 is special sentinel for stream start)
+		// Negative offsets are invalid input, not "gone" (client ahead of stream)
 		_, err := s.Read(context.Background(), "test", "-2", 0)
-		if !errors.Is(err, durablestream.ErrGone) {
-			t.Errorf("expected ErrGone for negative offset, got: %v", err)
+		if !errors.Is(err, durablestream.ErrBadRequest) {
+			t.Errorf("expected ErrBadRequest for negative offset, got: %v", err)
 		}
 	})
 }
@@ -624,161 +585,203 @@ func TestDelete(t *testing.T) {
 		}
 	})
 
-	t.Run("closes subscriber channels", func(t *testing.T) {
+	t.Run("wakes WaitForData callers on delete", func(t *testing.T) {
 		s := New()
 		_, _ = s.Create(context.Background(), "test", durablestream.StreamConfig{ContentType: "text/plain"})
 
-		// Use a long timeout to avoid triggering context cancellation during test
-		// (There's a known issue with double-close if context is cancelled after delete)
-		ctx, cancel := context.WithTimeout(context.Background(), time.Hour)
-		_ = cancel // Don't cancel during test
+		ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+		defer cancel()
 
-		ch, _ := s.Subscribe(ctx, "test", "")
+		// Start WaitForData in goroutine
+		waitDone := make(chan error, 1)
+		go func() {
+			_, err := s.WaitForData(ctx, "test", "", 0)
+			waitDone <- err
+		}()
+
+		// Give waiter time to register
+		time.Sleep(10 * time.Millisecond)
 
 		// Delete the stream
 		_ = s.Delete(context.Background(), "test")
 
-		// Channel should be closed
+		// WaitForData should return ErrNotFound
 		select {
-		case _, ok := <-ch:
-			if ok {
-				// We might receive pending data, wait for close
-				_, ok = <-ch
-			}
-			if ok {
-				t.Error("expected channel to be closed after delete")
+		case err := <-waitDone:
+			if !errors.Is(err, durablestream.ErrNotFound) {
+				t.Errorf("expected ErrNotFound, got: %v", err)
 			}
 		case <-time.After(100 * time.Millisecond):
-			t.Error("channel not closed after delete")
+			t.Error("WaitForData did not return after delete")
 		}
 	})
 }
 
-func TestSubscribe(t *testing.T) {
-	t.Run("subscribes successfully", func(t *testing.T) {
+func TestWaitForData(t *testing.T) {
+	t.Run("returns immediately when data exists", func(t *testing.T) {
 		s := New()
 		_, _ = s.Create(context.Background(), "test", durablestream.StreamConfig{ContentType: "text/plain"})
+		_, _ = s.Append(context.Background(), "test", []byte("existing data"), "")
 
-		ctx, cancel := context.WithCancel(context.Background())
-		defer cancel()
-
-		ch, err := s.Subscribe(ctx, "test", "")
+		result, err := s.WaitForData(context.Background(), "test", "", 0)
 		if err != nil {
-			t.Fatalf("subscribe: %v", err)
+			t.Fatalf("WaitForData: %v", err)
 		}
-		if ch == nil {
-			t.Fatal("expected channel, got nil")
+		if len(result.Messages) != 1 {
+			t.Errorf("expected 1 message, got %d", len(result.Messages))
+		}
+		if string(result.Messages[0].Data) != "existing data" {
+			t.Errorf("unexpected data: %s", result.Messages[0].Data)
 		}
 	})
 
-	t.Run("returns not found for non-existent stream", func(t *testing.T) {
+	t.Run("blocks until data arrives", func(t *testing.T) {
+		s := New()
+		_, _ = s.Create(context.Background(), "test", durablestream.StreamConfig{ContentType: "text/plain"})
+
+		ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+		defer cancel()
+
+		// Append in background
+		go func() {
+			time.Sleep(10 * time.Millisecond)
+			_, _ = s.Append(context.Background(), "test", []byte("new data"), "")
+		}()
+
+		result, err := s.WaitForData(ctx, "test", "", 0)
+		if err != nil {
+			t.Fatalf("WaitForData: %v", err)
+		}
+		if len(result.Messages) != 1 {
+			t.Errorf("expected 1 message, got %d", len(result.Messages))
+		}
+		if string(result.Messages[0].Data) != "new data" {
+			t.Errorf("unexpected data: %s", result.Messages[0].Data)
+		}
+	})
+
+	t.Run("returns ctx.Err on timeout", func(t *testing.T) {
+		s := New()
+		_, _ = s.Create(context.Background(), "test", durablestream.StreamConfig{ContentType: "text/plain"})
+
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
+		defer cancel()
+
+		_, err := s.WaitForData(ctx, "test", "", 0)
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Errorf("expected context.DeadlineExceeded, got: %v", err)
+		}
+	})
+
+	t.Run("returns ErrNotFound for non-existent stream", func(t *testing.T) {
 		s := New()
 
-		_, err := s.Subscribe(context.Background(), "nonexistent", "")
+		_, err := s.WaitForData(context.Background(), "nonexistent", "", 0)
 		if !errors.Is(err, durablestream.ErrNotFound) {
 			t.Errorf("expected ErrNotFound, got: %v", err)
 		}
 	})
 
-	t.Run("returns not found for expired stream", func(t *testing.T) {
+	t.Run("returns ErrNotFound for expired stream", func(t *testing.T) {
 		s := New()
 		_, _ = s.Create(context.Background(), "test", durablestream.StreamConfig{
 			ContentType: "text/plain",
 			ExpiresAt:   time.Now().Add(-time.Hour),
 		})
 
-		_, err := s.Subscribe(context.Background(), "test", "")
+		_, err := s.WaitForData(context.Background(), "test", "", 0)
 		if !errors.Is(err, durablestream.ErrNotFound) {
 			t.Errorf("expected ErrNotFound for expired stream, got: %v", err)
 		}
 	})
 
-	t.Run("unsubscribes on context cancellation", func(t *testing.T) {
+	t.Run("returns ErrNotFound when stream deleted while waiting", func(t *testing.T) {
 		s := New()
 		_, _ = s.Create(context.Background(), "test", durablestream.StreamConfig{ContentType: "text/plain"})
 
-		ctx, cancel := context.WithCancel(context.Background())
-		ch, _ := s.Subscribe(ctx, "test", "")
-
-		// Cancel context
-		cancel()
-
-		// Wait a bit for unsubscribe goroutine to run
-		time.Sleep(50 * time.Millisecond)
-
-		// Channel should be closed
-		select {
-		case _, ok := <-ch:
-			if ok {
-				t.Error("expected channel to be closed after context cancellation")
-			}
-		default:
-			// Channel is empty but might not be closed yet, try again
-			time.Sleep(50 * time.Millisecond)
-			select {
-			case _, ok := <-ch:
-				if ok {
-					t.Error("expected channel to be closed after context cancellation")
-				}
-			default:
-				t.Error("channel not closed after context cancellation")
-			}
-		}
-	})
-
-	t.Run("handles stream deletion while subscribed", func(t *testing.T) {
-		// Test that deleting a stream properly cleans up subscribers.
-		// NOTE: There is a known issue if context is cancelled after stream is
-		// deleted (potential double-close panic). This test avoids that by
-		// using a long-lived context.
-		s := New()
-		_, _ = s.Create(context.Background(), "test", durablestream.StreamConfig{ContentType: "text/plain"})
-
-		// Use a timeout context that won't expire during the test
-		ctx, cancel := context.WithTimeout(context.Background(), time.Hour)
-		_ = cancel // Don't cancel during test to avoid double-close
-
-		ch, _ := s.Subscribe(ctx, "test", "")
-
-		// Delete stream - this should close the channel
-		_ = s.Delete(context.Background(), "test")
-
-		// Channel should be closed by delete
-		select {
-		case _, ok := <-ch:
-			if ok {
-				t.Error("expected channel to be closed after delete")
-			}
-		case <-time.After(100 * time.Millisecond):
-			t.Error("channel not closed after delete")
-		}
-	})
-
-	t.Run("non-blocking notification", func(t *testing.T) {
-		s := New()
-		_, _ = s.Create(context.Background(), "test", durablestream.StreamConfig{ContentType: "text/plain"})
-
-		ctx, cancel := context.WithCancel(context.Background())
+		ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
 		defer cancel()
 
-		// Subscribe but don't read from channel
-		_, _ = s.Subscribe(ctx, "test", "")
+		// Start WaitForData in goroutine
+		waitDone := make(chan error, 1)
+		go func() {
+			_, err := s.WaitForData(ctx, "test", "", 0)
+			waitDone <- err
+		}()
 
-		// Fill up the channel buffer (size 10)
-		for i := 0; i < 20; i++ {
-			_, err := s.Append(context.Background(), "test", []byte("data"), "")
-			if err != nil {
-				t.Fatalf("append %d: %v", i, err)
+		// Give waiter time to register
+		time.Sleep(10 * time.Millisecond)
+
+		// Delete stream - should wake waiter with ErrNotFound
+		_ = s.Delete(context.Background(), "test")
+
+		select {
+		case err := <-waitDone:
+			if !errors.Is(err, durablestream.ErrNotFound) {
+				t.Errorf("expected ErrNotFound, got: %v", err)
 			}
+		case <-time.After(100 * time.Millisecond):
+			t.Error("WaitForData did not return after delete")
+		}
+	})
+
+	t.Run("respects limit parameter", func(t *testing.T) {
+		s := New()
+		_, _ = s.Create(context.Background(), "test", durablestream.StreamConfig{ContentType: "text/plain"})
+		_, _ = s.Append(context.Background(), "test", []byte("aaaa"), "")
+		_, _ = s.Append(context.Background(), "test", []byte("bbbb"), "")
+		_, _ = s.Append(context.Background(), "test", []byte("cccc"), "")
+
+		// Limit of 6 should return only first message (4 bytes fits, 8 would exceed)
+		result, err := s.WaitForData(context.Background(), "test", "", 6)
+		if err != nil {
+			t.Fatalf("WaitForData: %v", err)
+		}
+		if len(result.Messages) != 1 {
+			t.Errorf("expected 1 message with limit 6, got %d", len(result.Messages))
+		}
+	})
+
+	t.Run("handles concurrent waiters", func(t *testing.T) {
+		s := New()
+		_, _ = s.Create(context.Background(), "test", durablestream.StreamConfig{ContentType: "text/plain"})
+
+		ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+		defer cancel()
+
+		// Start multiple waiters
+		const numWaiters = 5
+		results := make(chan *durablestream.ReadResult, numWaiters)
+		for i := 0; i < numWaiters; i++ {
+			go func() {
+				result, _ := s.WaitForData(ctx, "test", "", 0)
+				results <- result
+			}()
 		}
 
-		// Should not have blocked
+		// Give waiters time to register
+		time.Sleep(10 * time.Millisecond)
+
+		// Single append should wake all waiters
+		_, _ = s.Append(context.Background(), "test", []byte("data"), "")
+
+		// All waiters should receive the data
+		for i := 0; i < numWaiters; i++ {
+			select {
+			case result := <-results:
+				if result == nil || len(result.Messages) != 1 {
+					t.Errorf("waiter %d: expected 1 message", i)
+				}
+			case <-time.After(100 * time.Millisecond):
+				t.Errorf("waiter %d: did not receive data", i)
+			}
+		}
 	})
 }
 
 func TestFormatOffset(t *testing.T) {
 	tests := []struct {
-		idx  int
+		idx  int64
 		want durablestream.Offset
 	}{
 		{0, "0000000000"},
@@ -788,9 +791,9 @@ func TestFormatOffset(t *testing.T) {
 	}
 
 	for _, tt := range tests {
-		got := formatOffset(tt.idx)
+		got := durablestream.FormatOffset(tt.idx)
 		if got != tt.want {
-			t.Errorf("formatOffset(%d) = %s, want %s", tt.idx, got, tt.want)
+			t.Errorf("FormatOffset(%d) = %s, want %s", tt.idx, got, tt.want)
 		}
 	}
 }
@@ -798,7 +801,7 @@ func TestFormatOffset(t *testing.T) {
 func TestParseOffset(t *testing.T) {
 	tests := []struct {
 		offset  durablestream.Offset
-		want    int
+		want    int64
 		wantErr bool
 	}{
 		{"", 0, false},
@@ -806,52 +809,32 @@ func TestParseOffset(t *testing.T) {
 		{"0000000000", 0, false},
 		{"0000000001", 1, false},
 		{"0000000123", 123, false},
-		{"123", 123, false}, // Without zero-padding
+		{"123", 123, false},  // Without zero-padding
+		{"-5", 0, true},      // Negative offset should error
 		{"invalid", 0, true},
 	}
 
 	for _, tt := range tests {
-		got, err := parseOffset(tt.offset)
+		got, err := durablestream.ParseOffset(tt.offset)
 		if tt.wantErr {
 			if err == nil {
-				t.Errorf("parseOffset(%q) expected error, got nil", tt.offset)
+				t.Errorf("ParseOffset(%q) expected error, got nil", tt.offset)
 			}
 		} else {
 			if err != nil {
-				t.Errorf("parseOffset(%q) unexpected error: %v", tt.offset, err)
+				t.Errorf("ParseOffset(%q) unexpected error: %v", tt.offset, err)
 			}
 			if got != tt.want {
-				t.Errorf("parseOffset(%q) = %d, want %d", tt.offset, got, tt.want)
+				t.Errorf("ParseOffset(%q) = %d, want %d", tt.offset, got, tt.want)
 			}
 		}
 	}
 }
 
-func TestContentTypesMatch(t *testing.T) {
-	tests := []struct {
-		a, b string
-		want bool
-	}{
-		{"text/plain", "text/plain", true},
-		{"TEXT/PLAIN", "text/plain", true},
-		{"application/json", "APPLICATION/JSON", true},
-		{"text/plain; charset=utf-8", "text/plain", true},
-		{"text/plain", "text/html", false},
-		{"application/json", "application/xml", false},
-	}
-
-	for _, tt := range tests {
-		got := contentTypesMatch(tt.a, tt.b)
-		if got != tt.want {
-			t.Errorf("contentTypesMatch(%q, %q) = %v, want %v", tt.a, tt.b, got, tt.want)
-		}
-	}
-}
-
-func TestIsExpired(t *testing.T) {
+func TestStreamConfig_IsExpired(t *testing.T) {
 	t.Run("not expired with zero ExpiresAt", func(t *testing.T) {
 		cfg := durablestream.StreamConfig{}
-		if isExpired(cfg) {
+		if cfg.IsExpired() {
 			t.Error("expected not expired with zero ExpiresAt")
 		}
 	})
@@ -860,7 +843,7 @@ func TestIsExpired(t *testing.T) {
 		cfg := durablestream.StreamConfig{
 			ExpiresAt: time.Now().Add(time.Hour),
 		}
-		if isExpired(cfg) {
+		if cfg.IsExpired() {
 			t.Error("expected not expired with future ExpiresAt")
 		}
 	})
@@ -869,13 +852,13 @@ func TestIsExpired(t *testing.T) {
 		cfg := durablestream.StreamConfig{
 			ExpiresAt: time.Now().Add(-time.Hour),
 		}
-		if !isExpired(cfg) {
+		if !cfg.IsExpired() {
 			t.Error("expected expired with past ExpiresAt")
 		}
 	})
 }
 
-func TestConfigsMatch(t *testing.T) {
+func TestStreamConfig_Matches(t *testing.T) {
 	now := time.Now()
 
 	tests := []struct {
@@ -929,9 +912,9 @@ func TestConfigsMatch(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := configsMatch(tt.a, tt.b)
+			got := tt.a.Matches(tt.b)
 			if got != tt.want {
-				t.Errorf("configsMatch() = %v, want %v", got, tt.want)
+				t.Errorf("Matches() = %v, want %v", got, tt.want)
 			}
 		})
 	}
