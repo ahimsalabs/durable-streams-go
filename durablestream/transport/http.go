@@ -642,7 +642,12 @@ func (s *httpEventStream) Next(ctx context.Context) (*Event, error) {
 		if strings.HasPrefix(line, "event:") {
 			eventType = strings.TrimSpace(line[6:])
 		} else if strings.HasPrefix(line, "data:") {
-			dataLines = append(dataLines, strings.TrimSpace(line[5:]))
+			// Per SSE spec: strip exactly one leading space if present
+			value := line[5:]
+			if len(value) > 0 && value[0] == ' ' {
+				value = value[1:]
+			}
+			dataLines = append(dataLines, value)
 		}
 		// Comment lines (":") and unknown field types are ignored per SSE spec
 	}
@@ -657,16 +662,41 @@ func (s *httpEventStream) buildEvent(eventType string, dataLines []string) (*Eve
 		Data: data,
 	}
 
-	// Extract offset and cursor from control events (Section 5.7)
+	// Extract offset, cursor, and upToDate from control events (Section 5.7)
+	// Control events MUST have valid JSON with required fields - return error if malformed
 	if eventType == "control" {
+		// Control events MUST have data - empty data is an error
+		trimmedData := bytes.TrimSpace(data)
+		if len(trimmedData) == 0 || string(trimmedData) == "{}" {
+			return nil, &Error{
+				Code:    "PARSE_ERROR",
+				Message: "empty control event data",
+			}
+		}
+
 		var control struct {
 			StreamNextOffset string `json:"streamNextOffset"`
 			StreamCursor     string `json:"streamCursor,omitempty"`
+			UpToDate         bool   `json:"upToDate,omitempty"`
 		}
-		if err := json.Unmarshal(data, &control); err == nil {
-			event.NextOffset = control.StreamNextOffset
-			event.Cursor = control.StreamCursor
+		if err := json.Unmarshal(data, &control); err != nil {
+			return nil, &Error{
+				Code:    "PARSE_ERROR",
+				Message: fmt.Sprintf("malformed control event JSON: %v", err),
+			}
 		}
+
+		// streamNextOffset is required for control events
+		if control.StreamNextOffset == "" {
+			return nil, &Error{
+				Code:    "PARSE_ERROR",
+				Message: "control event missing required streamNextOffset field",
+			}
+		}
+
+		event.NextOffset = control.StreamNextOffset
+		event.Cursor = control.StreamCursor
+		event.UpToDate = control.UpToDate
 	}
 
 	return event, nil

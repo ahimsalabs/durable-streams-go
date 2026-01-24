@@ -65,6 +65,16 @@ type Command struct {
 	Name         string `json:"name,omitempty"`
 	ValueType    string `json:"valueType,omitempty"`    // "counter" | "timestamp" | "token"
 	InitialValue string `json:"initialValue,omitempty"` // For token type
+	// Validation fields
+	Target *ValidationTarget `json:"target,omitempty"`
+}
+
+// ValidationTarget specifies what to validate and with what parameters.
+type ValidationTarget struct {
+	Target        string `json:"target"` // "idempotent-producer", "retry-options", etc.
+	ProducerID    string `json:"producerId,omitempty"`
+	Epoch         *int   `json:"epoch,omitempty"`         // Pointer to distinguish 0 from absent
+	MaxBatchBytes *int   `json:"maxBatchBytes,omitempty"` // Pointer to distinguish 0 from absent
 }
 
 // Result types sent back to test runner.
@@ -266,6 +276,8 @@ func handleCommand(cmd Command) Result {
 		return handleClearDynamic(cmd)
 	case "get-dynamic-values":
 		return handleGetDynamicValues(cmd)
+	case "validate":
+		return handleValidate(cmd)
 	case "shutdown":
 		return Result{Type: "shutdown", Success: true}
 	default:
@@ -627,7 +639,10 @@ func handleRead(cmd Command) Result {
 				status = 204
 				break
 			}
-			return errorResult("read", err)
+			// Include reader's offset so test runner knows current position
+			errRes := errorResult("read", err)
+			errRes.Offset = reader.Offset().String()
+			return errRes
 		}
 
 		if len(result.Data) > 0 {
@@ -779,6 +794,59 @@ func handleGetDynamicValues(cmd Command) Result {
 	}
 }
 
+func handleValidate(cmd Command) Result {
+	if cmd.Target == nil {
+		return sendError("validate", "INVALID_ARGUMENT", "target is required")
+	}
+
+	switch cmd.Target.Target {
+	case "idempotent-producer":
+		return validateIdempotentProducer(cmd.Target)
+	case "retry-options":
+		// retry-options validation requires the retryOptions feature
+		// We don't support this feature, so skip (return NOT_SUPPORTED)
+		return sendError("validate", "NOT_SUPPORTED", "retry-options validation not supported")
+	default:
+		return sendError("validate", "NOT_SUPPORTED", fmt.Sprintf("unknown validation target: %s", cmd.Target.Target))
+	}
+}
+
+func validateIdempotentProducer(target *ValidationTarget) Result {
+	// Validate epoch if provided
+	if target.Epoch != nil {
+		if *target.Epoch < 0 {
+			return Result{
+				Type:        "error",
+				Success:     false,
+				CommandType: "validate",
+				ErrorCode:   "INVALID_ARGUMENT",
+				Message:     "epoch must be non-negative",
+			}
+		}
+	}
+
+	// Validate maxBatchBytes if provided
+	if target.MaxBatchBytes != nil {
+		if *target.MaxBatchBytes < 0 {
+			return Result{
+				Type:        "error",
+				Success:     false,
+				CommandType: "validate",
+				ErrorCode:   "INVALID_ARGUMENT",
+				Message:     "maxBatchBytes must be non-negative",
+			}
+		}
+		// Note: zero is allowed in Go (treated as default), so we don't reject it here
+		// unless the strictZeroValidation feature is required
+	}
+
+	// All validations passed
+	return Result{
+		Type:    "validate",
+		Success: true,
+	}
+}
+
 func errorResult(cmdType string, err error) Result {
 	// Check for transport errors
 	var tErr *transport.Error
@@ -845,6 +913,16 @@ func errorResult(cmdType string, err error) Result {
 			Message:     err.Error(),
 		}
 	}
+	if errors.Is(err, durablestream.ErrParseError) {
+		return Result{
+			Type:        "error",
+			Success:     false,
+			CommandType: cmdType,
+			Status:      0, // Client-side error, no HTTP status
+			ErrorCode:   "PARSE_ERROR",
+			Message:     err.Error(),
+		}
+	}
 
 	// Default to internal error
 	return Result{
@@ -878,6 +956,8 @@ func mapTransportErrorCode(err *transport.Error) string {
 		return "INVALID_OFFSET"
 	case "BAD_REQUEST", "bad_request":
 		return "INVALID_OFFSET"
+	case "PARSE_ERROR":
+		return "PARSE_ERROR"
 	default:
 		return "UNEXPECTED_STATUS"
 	}

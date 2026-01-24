@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"iter"
+	"strings"
 
 	"github.com/ahimsalabs/durable-streams-go/durablestream/transport"
 )
@@ -16,16 +17,19 @@ import (
 //
 // See PROTOCOL.md Section 5.5-5.7 for read operation details.
 type Reader struct {
-	client   *Client
-	path     string
-	offset   Offset
-	cursor   string
-	readMode ReadMode
-	catching bool // true while in catch-up phase
-	closed   bool
+	client      *Client
+	path        string
+	offset      Offset
+	cursor      string
+	readMode    ReadMode
+	catching    bool // true while in catch-up phase
+	closed      bool
+	contentType string // cached content type for JSON validation
 
 	// SSE connection state (Section 5.7)
-	sseStream transport.EventStream
+	sseStream      transport.EventStream
+	sseUpToDate    bool             // cached upToDate from last control event
+	ssePendingData *transport.Event // buffered data event if we peeked and found data instead of control
 }
 
 // Read performs a single read operation based on the current state.
@@ -57,15 +61,33 @@ func (r *Reader) Read(ctx context.Context) (*StreamData, error) {
 
 // readCatchUp performs a catch-up read (Section 5.5: Read Stream - Catch-up).
 func (r *Reader) readCatchUp(ctx context.Context) (*StreamData, error) {
+	// Fetch content type on first read if not already cached
+	if r.contentType == "" {
+		info, err := r.client.Head(ctx, r.path)
+		if err != nil {
+			return nil, err
+		}
+		r.contentType = info.ContentType
+	}
+
 	resp, err := r.client.transport.Read(ctx, transport.ReadRequest{
 		Path:   r.path,
 		Offset: r.offset.String(),
 	})
 	if err != nil {
-		return nil, convertTransportError(err)
+		return nil, convertTransportErrorWithPath(err, r.path)
 	}
 
-	// Update state
+	// Validate JSON response BEFORE updating state.
+	// If validation fails, we don't advance the offset, allowing the caller
+	// to retry from the same position after the fault is cleared.
+	if len(resp.Data) > 0 && isJSONContentType(r.contentType) {
+		if err := validateJSON(resp.Data); err != nil {
+			return nil, fmt.Errorf("%w: %v", ErrParseError, err)
+		}
+	}
+
+	// Update state after successful validation
 	r.offset = Offset(resp.NextOffset)
 	r.cursor = resp.Cursor
 
@@ -84,16 +106,34 @@ func (r *Reader) readCatchUp(ctx context.Context) (*StreamData, error) {
 
 // readLongPoll performs a long-poll read (Section 5.6: Read Stream - Live Long-poll).
 func (r *Reader) readLongPoll(ctx context.Context) (*StreamData, error) {
+	// Fetch content type if not already cached (might happen if reader started in long-poll mode)
+	if r.contentType == "" {
+		info, err := r.client.Head(ctx, r.path)
+		if err != nil {
+			return nil, err
+		}
+		r.contentType = info.ContentType
+	}
+
 	resp, err := r.client.transport.LongPoll(ctx, transport.LongPollRequest{
 		Path:   r.path,
 		Offset: r.offset.String(),
 		Cursor: r.cursor,
 	})
 	if err != nil {
-		return nil, convertTransportError(err)
+		return nil, convertTransportErrorWithPath(err, r.path)
 	}
 
-	// Update state
+	// Validate JSON response BEFORE updating state.
+	// If validation fails, we don't advance the offset, allowing the caller
+	// to retry from the same position after the fault is cleared.
+	if len(resp.Data) > 0 && isJSONContentType(r.contentType) {
+		if err := validateJSON(resp.Data); err != nil {
+			return nil, fmt.Errorf("%w: %v", ErrParseError, err)
+		}
+	}
+
+	// Update state after successful validation
 	r.offset = Offset(resp.NextOffset)
 	r.cursor = resp.Cursor
 
@@ -107,25 +147,52 @@ func (r *Reader) readLongPoll(ctx context.Context) (*StreamData, error) {
 
 // readSSE performs a read using Server-Sent Events (Section 5.7: Read Stream - Live SSE).
 func (r *Reader) readSSE(ctx context.Context) (*StreamData, error) {
+	// Fetch content type if not already cached
+	if r.contentType == "" {
+		info, err := r.client.Head(ctx, r.path)
+		if err != nil {
+			return nil, err
+		}
+		r.contentType = info.ContentType
+	}
+
 	// Establish SSE connection if needed
 	if r.sseStream == nil {
+		// SSE requires an offset parameter (Section 5.7)
+		// Default to -1 (stream beginning) if no offset specified
+		offset := r.offset.String()
+		if offset == "" {
+			offset = "-1"
+		}
 		stream, err := r.client.transport.SSE(ctx, transport.SSERequest{
 			Path:   r.path,
-			Offset: r.offset.String(),
+			Offset: offset,
 		})
 		if err != nil {
-			return nil, convertTransportError(err)
+			return nil, convertTransportErrorWithPath(err, r.path)
 		}
 		r.sseStream = stream
 	}
 
-	// Read next event
-	event, err := r.sseStream.Next(ctx)
-	if err != nil {
-		// Close connection on error
-		r.sseStream.Close()
-		r.sseStream = nil
-		return nil, fmt.Errorf("read SSE event: %w", err)
+	// Check if we have a pending data event from a previous peek
+	var event *transport.Event
+	if r.ssePendingData != nil {
+		event = r.ssePendingData
+		r.ssePendingData = nil
+	} else {
+		// Read next event
+		var err error
+		event, err = r.sseStream.Next(ctx)
+		if err != nil {
+			// Close connection on error
+			r.sseStream.Close()
+			r.sseStream = nil
+			// Convert transport PARSE_ERROR to ErrParseError
+			if tErr, ok := err.(*transport.Error); ok && tErr.Code == "PARSE_ERROR" {
+				return nil, fmt.Errorf("%w: %v", ErrParseError, tErr.Message)
+			}
+			return nil, fmt.Errorf("read SSE event: %w", err)
+		}
 	}
 
 	// Handle control events (Section 5.7)
@@ -137,17 +204,73 @@ func (r *Reader) readSSE(ctx context.Context) (*StreamData, error) {
 		if event.Cursor != "" {
 			r.cursor = event.Cursor
 		}
+		r.sseUpToDate = event.UpToDate
 		// Control events don't contain data, read next event
 		return r.readSSE(ctx)
 	}
 
 	// Handle data events
 	if event.Type == "data" {
+		// Validate JSON response for JSON streams
+		if len(event.Data) > 0 && isJSONContentType(r.contentType) {
+			if err := validateJSON(event.Data); err != nil {
+				return nil, fmt.Errorf("%w: %v", ErrParseError, err)
+			}
+		}
+
+		// Try to read the next event to see if it's a control event.
+		// Per SSE protocol, data events may be followed by control events that
+		// provide the offset. We must read it to:
+		// 1. Get the correct offset for this data
+		// 2. Detect malformed control events (see conformance tests)
+		// If there's no more data (EOF), that's OK - just return the data.
+		// Context timeout should be propagated as an error.
+		nextEvent, err := r.sseStream.Next(ctx)
+		if err != nil {
+			// Check if this is a PARSE_ERROR (malformed control event)
+			if tErr, ok := err.(*transport.Error); ok && tErr.Code == "PARSE_ERROR" {
+				r.sseStream.Close()
+				r.sseStream = nil
+				return nil, fmt.Errorf("%w: %v", ErrParseError, tErr.Message)
+			}
+			// Check if context was cancelled - propagate that error
+			if ctx.Err() != nil {
+				r.sseStream.Close()
+				r.sseStream = nil
+				return nil, ctx.Err()
+			}
+			// For other errors (EOF, connection closed), just return the data
+			// The stream will be reconnected on next Read()
+			r.sseStream.Close()
+			r.sseStream = nil
+			return &StreamData{
+				Data:       event.Data,
+				NextOffset: r.offset,
+				Cursor:     r.cursor,
+				UpToDate:   r.sseUpToDate,
+			}, nil
+		}
+
+		// Process control event or buffer data event
+		switch nextEvent.Type {
+		case "control":
+			if nextEvent.NextOffset != "" {
+				r.offset = Offset(nextEvent.NextOffset)
+			}
+			if nextEvent.Cursor != "" {
+				r.cursor = nextEvent.Cursor
+			}
+			r.sseUpToDate = nextEvent.UpToDate
+		case "data":
+			// Buffer the next data event for the next Read() call
+			r.ssePendingData = nextEvent
+		}
+
 		return &StreamData{
 			Data:       event.Data,
 			NextOffset: r.offset,
 			Cursor:     r.cursor,
-			UpToDate:   true,
+			UpToDate:   r.sseUpToDate,
 		}, nil
 	}
 
@@ -168,6 +291,7 @@ func (r *Reader) Seek(offset Offset) *Reader {
 		r.sseStream.Close()
 		r.sseStream = nil
 	}
+	r.ssePendingData = nil // Clear any buffered event
 	r.offset = offset
 	r.cursor = ""     // Clear cursor when seeking
 	r.catching = true // Reset to catch-up mode
@@ -194,6 +318,7 @@ func (r *Reader) Close() error {
 	}
 
 	r.closed = true
+	r.ssePendingData = nil
 
 	if r.sseStream != nil {
 		r.sseStream.Close()
@@ -281,4 +406,30 @@ func parseJSONMessages(data []byte) ([][]byte, error) {
 		messages[i] = r
 	}
 	return messages, nil
+}
+
+// isJSONContentType returns true if the content type indicates JSON.
+func isJSONContentType(contentType string) bool {
+	// Normalize: take media type before semicolon
+	ct := contentType
+	if idx := strings.IndexByte(ct, ';'); idx >= 0 {
+		ct = ct[:idx]
+	}
+	ct = strings.TrimSpace(ct)
+	return strings.EqualFold(ct, "application/json")
+}
+
+// validateJSON validates that data is well-formed JSON.
+// For JSON streams, responses should be valid JSON arrays.
+func validateJSON(data []byte) error {
+	data = bytes.TrimSpace(data)
+	if len(data) == 0 {
+		return nil
+	}
+
+	// Use json.Valid for quick validation
+	if !json.Valid(data) {
+		return fmt.Errorf("invalid JSON")
+	}
+	return nil
 }

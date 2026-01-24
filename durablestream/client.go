@@ -210,7 +210,7 @@ func (c *Client) Create(ctx context.Context, path string, opts *CreateOptions) (
 
 	resp, err := c.transport.Create(ctx, req)
 	if err != nil {
-		return nil, convertTransportError(err)
+		return nil, convertTransportErrorWithPath(err, path)
 	}
 
 	return &StreamInfo{
@@ -223,7 +223,7 @@ func (c *Client) Create(ctx context.Context, path string, opts *CreateOptions) (
 func (c *Client) Head(ctx context.Context, path string) (*StreamInfo, error) {
 	resp, err := c.transport.Head(ctx, transport.HeadRequest{Path: path})
 	if err != nil {
-		return nil, convertTransportError(err)
+		return nil, convertTransportErrorWithPath(err, path)
 	}
 
 	return &StreamInfo{
@@ -236,7 +236,7 @@ func (c *Client) Head(ctx context.Context, path string) (*StreamInfo, error) {
 
 // Delete removes a stream (Section 5.3: Delete Stream).
 func (c *Client) Delete(ctx context.Context, path string) error {
-	return convertTransportError(c.transport.Delete(ctx, transport.DeleteRequest{Path: path}))
+	return convertTransportErrorWithPath(c.transport.Delete(ctx, transport.DeleteRequest{Path: path}), path)
 }
 
 // StreamWriter provides efficient append operations by caching stream metadata.
@@ -288,7 +288,7 @@ func (w *StreamWriter) Send(data []byte, opts *SendOptions) error {
 		Seq:         seq,
 	})
 	if err != nil {
-		return convertTransportError(err)
+		return convertTransportErrorWithPath(err, w.path)
 	}
 
 	w.offset = Offset(resp.NextOffset)
@@ -315,12 +315,19 @@ func (w *StreamWriter) Offset() Offset {
 // When offset is "now" and the read mode is LongPoll or Auto, the reader
 // skips catch-up and goes directly to long-poll mode. Per PROTOCOL.md Section 6:
 // "Servers MUST immediately begin waiting for new data (no initial empty response)"
+//
+// For SSE mode, the reader always uses SSE directly (no catch-up phase) because
+// SSE streams deliver both historical and live data via SSE events.
 func (c *Client) Reader(path string, offset Offset) *Reader {
 	// Per protocol spec Section 6, for offset=now with long-poll:
 	// "Servers MUST immediately begin waiting for new data (no initial empty response)"
 	// Skip catch-up phase for long-poll compatible modes with offset=now
 	catching := true
 	if offset == Offset("now") && (c.readMode == ReadModeAuto || c.readMode == ReadModeLongPoll) {
+		catching = false
+	}
+	// SSE mode delivers all data (historical and live) via SSE events
+	if c.readMode == ReadModeSSE {
 		catching = false
 	}
 
@@ -336,6 +343,12 @@ func (c *Client) Reader(path string, offset Offset) *Reader {
 // convertTransportError converts transport package errors to durablestream errors.
 // It wraps sentinel errors with the original message so callers can inspect details.
 func convertTransportError(err error) error {
+	return convertTransportErrorWithPath(err, "")
+}
+
+// convertTransportErrorWithPath converts transport errors and includes the stream path
+// in the error message for better debugging context.
+func convertTransportErrorWithPath(err error, path string) error {
 	if err == nil {
 		return nil
 	}
@@ -346,16 +359,19 @@ func convertTransportError(err error) error {
 		// Wrap with original message so details are preserved for inspection
 		switch tErr.Code {
 		case "NOT_FOUND", "not_found":
-			return wrapSentinel(tErr.Message, ErrNotFound)
+			return wrapSentinelWithPath(tErr.Message, ErrNotFound, path)
 		case "SEQUENCE_CONFLICT", "sequence_conflict":
-			return wrapSentinel(tErr.Message, ErrSequenceConflict)
+			return wrapSentinelWithPath(tErr.Message, ErrSequenceConflict, path)
 		case "CONFLICT", "conflict":
-			return wrapSentinel(tErr.Message, ErrConflict)
+			return wrapSentinelWithPath(tErr.Message, ErrConflict, path)
 		case "GONE", "gone":
-			return wrapSentinel(tErr.Message, ErrGone)
+			return wrapSentinelWithPath(tErr.Message, ErrGone, path)
 		case "BAD_REQUEST", "bad_request":
-			return wrapSentinel(tErr.Message, ErrBadRequest)
+			return wrapSentinelWithPath(tErr.Message, ErrBadRequest, path)
 		case "RATE_LIMITED", "too_many_requests":
+			if path != "" {
+				return newError(codeTooManyRequests, fmt.Sprintf("[%s] %s", path, tErr.Message))
+			}
 			return newError(codeTooManyRequests, tErr.Message)
 		default:
 			// Return the transport error as-is
@@ -369,8 +385,20 @@ func convertTransportError(err error) error {
 // wrapSentinel wraps a sentinel error with a message.
 // If message is empty, returns the sentinel directly.
 func wrapSentinel(msg string, sentinel error) error {
-	if msg == "" {
-		return sentinel
+	return wrapSentinelWithPath(msg, sentinel, "")
+}
+
+// wrapSentinelWithPath wraps a sentinel error with the stream path and message.
+// The path is included in brackets for easy identification in error messages.
+func wrapSentinelWithPath(msg string, sentinel error, path string) error {
+	if path == "" {
+		if msg == "" {
+			return sentinel
+		}
+		return fmt.Errorf("%s: %w", msg, sentinel)
 	}
-	return fmt.Errorf("%s: %w", msg, sentinel)
+	if msg == "" {
+		return fmt.Errorf("[%s]: %w", path, sentinel)
+	}
+	return fmt.Errorf("[%s] %s: %w", path, msg, sentinel)
 }
