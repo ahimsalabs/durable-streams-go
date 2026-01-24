@@ -84,15 +84,16 @@ func TestReader_OffsetNow_LongPollSkipsCatchup(t *testing.T) {
 		}
 	})
 
-	t.Run("offset=now with SSE mode uses catch-up", func(t *testing.T) {
-		// SSE mode should still use catch-up (SSE handles offset=now differently)
+	t.Run("offset=now with SSE mode skips catch-up", func(t *testing.T) {
+		// SSE mode delivers all data (historical and live) via SSE events,
+		// so it skips catch-up and goes directly to SSE
 		client := NewClient(server.URL, &ClientConfig{ReadMode: ReadModeSSE})
 		reader := client.Reader("/nowtest", Offset("now"))
 		defer reader.Close()
 
-		// Reader SHOULD be in catch-up mode for SSE mode
-		if !reader.catching {
-			t.Error("expected reader to use catch-up for SSE mode with offset=now")
+		// Reader should NOT be in catch-up mode for SSE mode
+		if reader.catching {
+			t.Error("expected reader to skip catch-up for SSE mode")
 		}
 	})
 }
@@ -450,30 +451,19 @@ func TestReader_SSEMode(t *testing.T) {
 	ctx := context.Background()
 
 	t.Run("SSE mode reads data events", func(t *testing.T) {
-		// Create text stream
+		// Create text stream with initial data
 		_, _ = storage.Create(ctx, "/sse-stream", StreamConfig{ContentType: "text/plain"})
 		_, _ = storage.Append(ctx, "/sse-stream", []byte("hello"), "")
 
 		reader := client.Reader("/sse-stream", ZeroOffset)
 		defer reader.Close()
 
-		// First read catches up
-		result, err := reader.Read(ctx)
-		if err != nil {
-			t.Fatalf("catch-up read failed: %v", err)
-		}
-		if !result.UpToDate {
-			t.Error("expected UpToDate after catch-up")
-		}
-
-		// Append more data and read in SSE mode
-		_, _ = storage.Append(ctx, "/sse-stream", []byte("world"), "")
-
-		// Use timeout context to prevent hanging
+		// SSE mode goes directly to SSE (no catch-up phase)
+		// First read should get the existing data via SSE
 		sseCtx, cancel := context.WithTimeout(ctx, 1*time.Second)
 		defer cancel()
 
-		result, err = reader.Read(sseCtx)
+		result, err := reader.Read(sseCtx)
 		if err != nil {
 			t.Fatalf("SSE read failed: %v", err)
 		}

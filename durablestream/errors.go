@@ -29,6 +29,10 @@ var (
 
 	// ErrBadRequest indicates a malformed or invalid request.
 	ErrBadRequest = errors.New("bad request")
+
+	// ErrParseError indicates the server returned malformed/invalid JSON.
+	// This occurs when a JSON stream returns truncated or corrupted JSON responses.
+	ErrParseError = errors.New("parse error: malformed JSON response")
 )
 
 // errorCode represents an internal error code for HTTP status mapping.

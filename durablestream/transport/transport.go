@@ -133,6 +133,10 @@ type Event struct {
 
 	// Cursor is extracted from control events for convenience.
 	Cursor string
+
+	// UpToDate is extracted from control events.
+	// True when the client has caught up with all available data.
+	UpToDate bool
 }
 
 // AppendRequest is the request to append data (Section 5.2).
