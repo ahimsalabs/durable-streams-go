@@ -15,13 +15,22 @@ Tested against conformance tests v0.1.8:
 
 Client features: `batching`, `sse`, `longPoll`, `streaming`, `dynamicHeaders`
 
+## Offset Format
+
+This implementation uses the same offset format as the reference Node.js implementation:
+```
+<readSeq>_<byteOffset>
+```
+Both components are 16-digit zero-padded integers, e.g., `0000000000000000_0000000000000042`.
+This ensures lexicographic sortability as required by PROTOCOL.md Section 6.
+
 ## Test Coverage
 
 | Package | Coverage |
 |---------|----------|
 | durablestream | 90.7% |
 | durablestream/transport | 93.1% |
-| durablestream/memorystorage | 96.2% |
+| durablestream/storage/memorystorage | 96.2% |
 | durablestream/internal/protocol | 98.1% |
 
 ## Usage

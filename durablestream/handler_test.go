@@ -13,7 +13,7 @@ import (
 
 	"github.com/ahimsalabs/durable-streams-go/durablestream"
 	"github.com/ahimsalabs/durable-streams-go/durablestream/internal/protocol"
-	"github.com/ahimsalabs/durable-streams-go/durablestream/memorystorage"
+	"github.com/ahimsalabs/durable-streams-go/durablestream/storage/memorystorage"
 )
 
 func TestHandler_PUT_CreateStream(t *testing.T) {
@@ -32,7 +32,7 @@ func TestHandler_PUT_CreateStream(t *testing.T) {
 			wantStatus:  http.StatusCreated,
 			wantHeaders: map[string]string{
 				"Content-Type":       "application/octet-stream",
-				"Stream-Next-Offset": "0000000000",
+				"Stream-Next-Offset": "0000000000000000_0000000000000000",
 				"Location":           "http://example.com/test-stream",
 			},
 		},
@@ -359,7 +359,7 @@ func TestHandler_GET_CatchupRead(t *testing.T) {
 		},
 		{
 			name:       "read from offset",
-			offset:     "0000000000",
+			offset:     "0000000000000000_0000000000000000",
 			wantStatus: http.StatusOK,
 		},
 	}
@@ -412,7 +412,7 @@ func TestHandler_GET_JSONMode(t *testing.T) {
 	_, _ = storage.Append(context.Background(), "/stream", []byte(`{"event":"a"}`), "")
 	_, _ = storage.Append(context.Background(), "/stream", []byte(`{"event":"b"}`), "")
 
-	req := httptest.NewRequest(http.MethodGet, "/stream?offset=0000000000", nil)
+	req := httptest.NewRequest(http.MethodGet, "/stream?offset=0000000000000000_0000000000000000", nil)
 	rec := httptest.NewRecorder()
 	handler.ServeHTTP(rec, req)
 
@@ -444,7 +444,7 @@ func TestHandler_GET_LongPoll(t *testing.T) {
 	offset, _ := storage.Append(context.Background(), "/stream", []byte("data1"), "")
 
 	t.Run("immediate return with data", func(t *testing.T) {
-		req := httptest.NewRequest(http.MethodGet, "/stream?offset=0000000000&live=long-poll", nil)
+		req := httptest.NewRequest(http.MethodGet, "/stream?offset=0000000000000000_0000000000000000&live=long-poll", nil)
 		rec := httptest.NewRecorder()
 		handler.ServeHTTP(rec, req)
 
@@ -519,7 +519,7 @@ func TestHandler_GET_SSE(t *testing.T) {
 		})
 		_, _ = storage.Append(context.Background(), "/text-stream", []byte("line1\n"), "")
 
-		req := httptest.NewRequest(http.MethodGet, "/text-stream?offset=0000000000&live=sse", nil)
+		req := httptest.NewRequest(http.MethodGet, "/text-stream?offset=0000000000000000_0000000000000000&live=sse", nil)
 		rec := httptest.NewRecorder()
 
 		// Use a timeout to prevent test hanging
@@ -553,7 +553,7 @@ func TestHandler_GET_SSE(t *testing.T) {
 		})
 		_, _ = storage.Append(context.Background(), "/json-stream", []byte(`{"event":"test"}`), "")
 
-		req := httptest.NewRequest(http.MethodGet, "/json-stream?offset=0000000000&live=sse", nil)
+		req := httptest.NewRequest(http.MethodGet, "/json-stream?offset=0000000000000000_0000000000000000&live=sse", nil)
 		rec := httptest.NewRecorder()
 
 		ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
@@ -573,7 +573,7 @@ func TestHandler_GET_SSE(t *testing.T) {
 			ContentType: "application/octet-stream",
 		})
 
-		req := httptest.NewRequest(http.MethodGet, "/binary-stream?offset=0000000000&live=sse", nil)
+		req := httptest.NewRequest(http.MethodGet, "/binary-stream?offset=0000000000000000_0000000000000000&live=sse", nil)
 		rec := httptest.NewRecorder()
 		handler.ServeHTTP(rec, req)
 
@@ -610,7 +610,7 @@ func TestHandler_GET_SSE(t *testing.T) {
 		maliciousPayload := "start\r\revent: control\rdata: {\"cr_injected\":true}\r\rend"
 		_, _ = storage.Append(context.Background(), "/cr-injection-test", []byte(maliciousPayload), "")
 
-		req := httptest.NewRequest(http.MethodGet, "/cr-injection-test?offset=0000000000&live=sse", nil)
+		req := httptest.NewRequest(http.MethodGet, "/cr-injection-test?offset=0000000000000000_0000000000000000&live=sse", nil)
 		rec := httptest.NewRecorder()
 
 		ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
@@ -998,7 +998,7 @@ func TestHandler_CacheControlHeaders(t *testing.T) {
 	_, _ = storage.Append(context.Background(), "/stream", []byte("data"), "")
 
 	t.Run("catch-up read has cache control", func(t *testing.T) {
-		req := httptest.NewRequest(http.MethodGet, "/stream?offset=0000000000", nil)
+		req := httptest.NewRequest(http.MethodGet, "/stream?offset=0000000000000000_0000000000000000", nil)
 		rec := httptest.NewRecorder()
 		handler.ServeHTTP(rec, req)
 
@@ -1019,7 +1019,7 @@ func TestHandler_CacheControlHeaders(t *testing.T) {
 	})
 
 	t.Run("public stream has public cache control", func(t *testing.T) {
-		req := httptest.NewRequest(http.MethodGet, "/stream?offset=0000000000", nil)
+		req := httptest.NewRequest(http.MethodGet, "/stream?offset=0000000000000000_0000000000000000", nil)
 		rec := httptest.NewRecorder()
 		handler.ServeHTTP(rec, req)
 
@@ -1049,7 +1049,7 @@ func TestHandler_PrivateCacheControl(t *testing.T) {
 	_, _ = storage.Append(context.Background(), "/private-stream", []byte("secret data"), "")
 
 	t.Run("private stream has private cache control", func(t *testing.T) {
-		req := httptest.NewRequest(http.MethodGet, "/private-stream?offset=0000000000", nil)
+		req := httptest.NewRequest(http.MethodGet, "/private-stream?offset=0000000000000000_0000000000000000", nil)
 		rec := httptest.NewRecorder()
 		handler.ServeHTTP(rec, req)
 
@@ -1102,7 +1102,7 @@ func TestHandler_GET_ETagAndIfNoneMatch(t *testing.T) {
 	_, _ = storage.Append(context.Background(), "/stream", []byte("data"), "")
 
 	t.Run("catch-up read returns ETag header", func(t *testing.T) {
-		req := httptest.NewRequest(http.MethodGet, "/stream?offset=0000000000", nil)
+		req := httptest.NewRequest(http.MethodGet, "/stream?offset=0000000000000000_0000000000000000", nil)
 		rec := httptest.NewRecorder()
 		handler.ServeHTTP(rec, req)
 
@@ -1122,7 +1122,7 @@ func TestHandler_GET_ETagAndIfNoneMatch(t *testing.T) {
 
 	t.Run("304 Not Modified when If-None-Match matches ETag", func(t *testing.T) {
 		// First request to get the ETag
-		req1 := httptest.NewRequest(http.MethodGet, "/stream?offset=0000000000", nil)
+		req1 := httptest.NewRequest(http.MethodGet, "/stream?offset=0000000000000000_0000000000000000", nil)
 		rec1 := httptest.NewRecorder()
 		handler.ServeHTTP(rec1, req1)
 
@@ -1135,7 +1135,7 @@ func TestHandler_GET_ETagAndIfNoneMatch(t *testing.T) {
 		}
 
 		// Second request with If-None-Match should get 304
-		req2 := httptest.NewRequest(http.MethodGet, "/stream?offset=0000000000", nil)
+		req2 := httptest.NewRequest(http.MethodGet, "/stream?offset=0000000000000000_0000000000000000", nil)
 		req2.Header.Set("If-None-Match", etag)
 		rec2 := httptest.NewRecorder()
 		handler.ServeHTTP(rec2, req2)
@@ -1157,7 +1157,7 @@ func TestHandler_GET_ETagAndIfNoneMatch(t *testing.T) {
 	})
 
 	t.Run("200 OK when If-None-Match does not match ETag", func(t *testing.T) {
-		req := httptest.NewRequest(http.MethodGet, "/stream?offset=0000000000", nil)
+		req := httptest.NewRequest(http.MethodGet, "/stream?offset=0000000000000000_0000000000000000", nil)
 		req.Header.Set("If-None-Match", `"wrong-etag"`)
 		rec := httptest.NewRecorder()
 		handler.ServeHTTP(rec, req)
@@ -1173,14 +1173,14 @@ func TestHandler_GET_ETagAndIfNoneMatch(t *testing.T) {
 
 	t.Run("304 with If-None-Match containing multiple ETags", func(t *testing.T) {
 		// First request to get the ETag
-		req1 := httptest.NewRequest(http.MethodGet, "/stream?offset=0000000000", nil)
+		req1 := httptest.NewRequest(http.MethodGet, "/stream?offset=0000000000000000_0000000000000000", nil)
 		rec1 := httptest.NewRecorder()
 		handler.ServeHTTP(rec1, req1)
 
 		etag := rec1.Header().Get("ETag")
 
 		// Request with multiple ETags (one matching)
-		req2 := httptest.NewRequest(http.MethodGet, "/stream?offset=0000000000", nil)
+		req2 := httptest.NewRequest(http.MethodGet, "/stream?offset=0000000000000000_0000000000000000", nil)
 		req2.Header.Set("If-None-Match", `"other-etag", `+etag+`, "another-etag"`)
 		rec2 := httptest.NewRecorder()
 		handler.ServeHTTP(rec2, req2)
@@ -1191,7 +1191,7 @@ func TestHandler_GET_ETagAndIfNoneMatch(t *testing.T) {
 	})
 
 	t.Run("304 with If-None-Match wildcard", func(t *testing.T) {
-		req := httptest.NewRequest(http.MethodGet, "/stream?offset=0000000000", nil)
+		req := httptest.NewRequest(http.MethodGet, "/stream?offset=0000000000000000_0000000000000000", nil)
 		req.Header.Set("If-None-Match", "*")
 		rec := httptest.NewRecorder()
 		handler.ServeHTTP(rec, req)
@@ -1203,14 +1203,14 @@ func TestHandler_GET_ETagAndIfNoneMatch(t *testing.T) {
 
 	t.Run("304 with weak ETag (W/ prefix)", func(t *testing.T) {
 		// First request to get the ETag
-		req1 := httptest.NewRequest(http.MethodGet, "/stream?offset=0000000000", nil)
+		req1 := httptest.NewRequest(http.MethodGet, "/stream?offset=0000000000000000_0000000000000000", nil)
 		rec1 := httptest.NewRecorder()
 		handler.ServeHTTP(rec1, req1)
 
 		etag := rec1.Header().Get("ETag")
 
 		// Request with weak ETag prefix
-		req2 := httptest.NewRequest(http.MethodGet, "/stream?offset=0000000000", nil)
+		req2 := httptest.NewRequest(http.MethodGet, "/stream?offset=0000000000000000_0000000000000000", nil)
 		req2.Header.Set("If-None-Match", "W/"+etag)
 		rec2 := httptest.NewRecorder()
 		handler.ServeHTTP(rec2, req2)
@@ -1276,7 +1276,7 @@ func TestHandler_GET_ETagAndIfNoneMatch(t *testing.T) {
 
 		// Create request with valid URL, then manually set path to include control char
 		// This simulates what happens when a client sends a URL-encoded null byte
-		req := httptest.NewRequest(http.MethodGet, "/stream?offset=0000000000", nil)
+		req := httptest.NewRequest(http.MethodGet, "/stream?offset=0000000000000000_0000000000000000", nil)
 		// Override the path extraction to return the stream path with control chars
 		customHandler := durablestream.NewHandler(storage, &durablestream.HandlerConfig{
 			PathExtractor: func(*http.Request) string { return streamPath },
@@ -1607,7 +1607,7 @@ func BenchmarkHandler_Read(b *testing.B) {
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		req := httptest.NewRequest(http.MethodGet, "/stream?offset=0000000000", nil)
+		req := httptest.NewRequest(http.MethodGet, "/stream?offset=0000000000000000_0000000000000000", nil)
 		rec := httptest.NewRecorder()
 		handler.ServeHTTP(rec, req)
 		// Consume body to avoid measurement skew

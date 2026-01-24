@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/ahimsalabs/durable-streams-go/durablestream"
+	"github.com/ahimsalabs/durable-streams-go/durablestream/storage"
 )
 
 // concatMessages concatenates all message data from a ReadResult.
@@ -202,7 +203,7 @@ func TestCreate(t *testing.T) {
 			t.Fatalf("append: %v", err)
 		}
 
-		result, err := s.Read(context.Background(), "test", "0000000000", 0)
+		result, err := s.Read(context.Background(), "test", "0000000000000000_0000000000000000", 0)
 		if err != nil {
 			t.Fatalf("read: %v", err)
 		}
@@ -243,7 +244,7 @@ func TestAppend(t *testing.T) {
 		if err != nil {
 			t.Fatalf("append: %v", err)
 		}
-		if offset != "0000000001" {
+		if offset != "0000000000000000_0000000000000001" {
 			t.Errorf("expected offset 0000000001, got %s", offset)
 		}
 	})
@@ -316,7 +317,7 @@ func TestAppend(t *testing.T) {
 		_, _ = s.Append(context.Background(), "test", []byte(`{"a":1}`), "")
 		_, _ = s.Append(context.Background(), "test", []byte(`{"b":2}`), "")
 
-		result, _ := s.Read(context.Background(), "test", "0000000000", 0)
+		result, _ := s.Read(context.Background(), "test", "0000000000000000_0000000000000000", 0)
 		if len(result.Messages) != 2 {
 			t.Errorf("expected 2 messages, got %d", len(result.Messages))
 		}
@@ -407,7 +408,7 @@ func TestRead(t *testing.T) {
 		_, _ = s.Append(context.Background(), "test", []byte("data"), "")
 
 		// Offset beyond current tail
-		_, err := s.Read(context.Background(), "test", "0000000099", 0)
+		_, err := s.Read(context.Background(), "test", "0000000000000000_0000000000000099", 0)
 		if !errors.Is(err, durablestream.ErrGone) {
 			t.Errorf("expected ErrGone, got: %v", err)
 		}
@@ -433,7 +434,7 @@ func TestRead(t *testing.T) {
 		_, _ = s.Append(context.Background(), "test", []byte("extra"), "")
 
 		// Limit of 8 should return first two messages (10 bytes total, but we return whole messages)
-		result, err := s.Read(context.Background(), "test", "0000000000", 8)
+		result, err := s.Read(context.Background(), "test", "0000000000000000_0000000000000000", 8)
 		if err != nil {
 			t.Fatalf("read: %v", err)
 		}
@@ -456,7 +457,7 @@ func TestRead(t *testing.T) {
 		_, _ = s.Append(context.Background(), "test", []byte(`{"b":2}`), "")
 		_, _ = s.Append(context.Background(), "test", []byte(`{"c":3}`), "")
 
-		result, err := s.Read(context.Background(), "test", "0000000000", 0)
+		result, err := s.Read(context.Background(), "test", "0000000000000000_0000000000000000", 0)
 		if err != nil {
 			t.Fatalf("read: %v", err)
 		}
@@ -471,7 +472,7 @@ func TestRead(t *testing.T) {
 		_, _ = s.Append(context.Background(), "test", []byte("msg1"), "")
 		_, _ = s.Append(context.Background(), "test", []byte("msg2"), "")
 
-		result, _ := s.Read(context.Background(), "test", "0000000000", 0)
+		result, _ := s.Read(context.Background(), "test", "0000000000000000_0000000000000000", 0)
 		if result.NextOffset != result.TailOffset {
 			t.Errorf("NextOffset (%s) should equal TailOffset (%s) when at end", result.NextOffset, result.TailOffset)
 		}
@@ -484,7 +485,7 @@ func TestRead(t *testing.T) {
 		_, _ = s.Append(context.Background(), "test", []byte("second"), "")
 
 		// Read from offset 1 (after first message)
-		result, err := s.Read(context.Background(), "test", "0000000001", 0)
+		result, err := s.Read(context.Background(), "test", "0000000000000000_0000000000000001", 0)
 		if err != nil {
 			t.Fatalf("read: %v", err)
 		}
@@ -525,7 +526,7 @@ func TestHead(t *testing.T) {
 		if info.ContentType != "application/json" {
 			t.Errorf("unexpected content type: %s", info.ContentType)
 		}
-		if info.NextOffset != "0000000001" {
+		if info.NextOffset != "0000000000000000_0000000000000001" {
 			t.Errorf("unexpected next offset: %s", info.NextOffset)
 		}
 		if info.TTL != time.Hour {
@@ -779,21 +780,21 @@ func TestWaitForData(t *testing.T) {
 	})
 }
 
-func TestFormatOffset(t *testing.T) {
+func TestFormatSimpleOffset(t *testing.T) {
 	tests := []struct {
 		idx  int64
 		want durablestream.Offset
 	}{
-		{0, "0000000000"},
-		{1, "0000000001"},
-		{123, "0000000123"},
-		{9999999999, "9999999999"},
+		{0, "0000000000000000_0000000000000000"},
+		{1, "0000000000000000_0000000000000001"},
+		{123, "0000000000000000_0000000000000123"},
+		{9999999999, "0000000000000000_0000009999999999"},
 	}
 
 	for _, tt := range tests {
-		got := durablestream.FormatOffset(tt.idx)
+		got := storage.FormatSimpleOffset(tt.idx)
 		if got != tt.want {
-			t.Errorf("FormatOffset(%d) = %s, want %s", tt.idx, got, tt.want)
+			t.Errorf("FormatSimpleOffset(%d) = %s, want %s", tt.idx, got, tt.want)
 		}
 	}
 }
@@ -806,16 +807,16 @@ func TestParseOffset(t *testing.T) {
 	}{
 		{"", 0, false},
 		{"-1", 0, false},
-		{"0000000000", 0, false},
-		{"0000000001", 1, false},
-		{"0000000123", 123, false},
-		{"123", 123, false},  // Without zero-padding
-		{"-5", 0, true},      // Negative offset should error
+		{"0000000000000000_0000000000000000", 0, false},
+		{"0000000000000000_0000000000000001", 1, false},
+		{"0000000000000000_0000000000000123", 123, false},
+		{"0_123", 123, false}, // Without zero-padding
+		{"-5", 0, true},       // Invalid format
 		{"invalid", 0, true},
 	}
 
 	for _, tt := range tests {
-		got, err := durablestream.ParseOffset(tt.offset)
+		_, got, err := storage.ParseOffset(tt.offset)
 		if tt.wantErr {
 			if err == nil {
 				t.Errorf("ParseOffset(%q) expected error, got nil", tt.offset)
@@ -941,7 +942,7 @@ func TestConcurrentAccess(t *testing.T) {
 	for i := 0; i < 5; i++ {
 		go func() {
 			for j := 0; j < 100; j++ {
-				_, _ = s.Read(context.Background(), "test", "0000000000", 0)
+				_, _ = s.Read(context.Background(), "test", "0000000000000000_0000000000000000", 0)
 			}
 			done <- struct{}{}
 		}()
@@ -964,7 +965,7 @@ func TestConcurrentAccess(t *testing.T) {
 
 	// Verify data integrity
 	info, _ := s.Head(context.Background(), "test")
-	if info.NextOffset != "0000001000" {
+	if info.NextOffset != "0000000000000000_0000000000001000" {
 		t.Errorf("expected 1000 appends, got offset %s", info.NextOffset)
 	}
 }
@@ -981,7 +982,7 @@ func TestReadWithPartialLimit(t *testing.T) {
 	// Read from start with limit of 6 bytes
 	// With message-based storage, we return whole messages until limit exceeded
 	// First msg (4 bytes) fits, second msg (4+4=8 > 6) exceeds but we have one, stop
-	result, err := s.Read(context.Background(), "test", "0000000000", 6)
+	result, err := s.Read(context.Background(), "test", "0000000000000000_0000000000000000", 6)
 	if err != nil {
 		t.Fatalf("read: %v", err)
 	}
@@ -1004,7 +1005,7 @@ func TestReadJSONWithMultipleMessages(t *testing.T) {
 	}
 
 	// Read from middle
-	result, err := s.Read(context.Background(), "test", "0000000002", 0)
+	result, err := s.Read(context.Background(), "test", "0000000000000000_0000000000000002", 0)
 	if err != nil {
 		t.Fatalf("read: %v", err)
 	}

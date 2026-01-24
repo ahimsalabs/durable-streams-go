@@ -4,9 +4,31 @@ import (
 	"context"
 	"fmt"
 	"net/http/httptest"
+	"strings"
 	"sync"
 	"time"
 )
+
+// formatTestOffset formats an offset for testing using the reference implementation format.
+// This is a local helper to avoid importing the storage package (which would create a cycle).
+func formatTestOffset(idx int64) Offset {
+	return Offset(fmt.Sprintf("0000000000000000_%016d", idx))
+}
+
+// parseTestOffset parses a test offset to get the byte offset.
+func parseTestOffset(offset Offset) int64 {
+	s := string(offset)
+	if s == "" || s == "-1" {
+		return 0
+	}
+	parts := strings.SplitN(s, "_", 2)
+	if len(parts) != 2 {
+		return 0
+	}
+	var idx int64
+	fmt.Sscanf(parts[1], "%d", &idx)
+	return idx
+}
 
 // testStorage is a minimal storage implementation for internal tests.
 // It provides basic functionality without importing external packages.
@@ -59,7 +81,7 @@ func (s *testStorage) Append(ctx context.Context, streamID string, data []byte, 
 	b := make([]byte, len(data))
 	copy(b, data)
 
-	offset := FormatOffset(int64(len(stream.messages) + 1))
+	offset := formatTestOffset(int64(len(stream.messages) + 1))
 	msg := StoredMessage{
 		Data:   b,
 		Offset: offset,
@@ -82,10 +104,7 @@ func (s *testStorage) Read(ctx context.Context, streamID string, offset Offset, 
 		return nil, ErrNotFound
 	}
 
-	offsetIdx := 0
-	if offset != "" && offset != "-1" {
-		_, _ = fmt.Sscanf(string(offset), "%d", &offsetIdx)
-	}
+	offsetIdx := int(parseTestOffset(offset))
 
 	if offsetIdx > len(stream.messages) {
 		return nil, ErrGone
@@ -110,7 +129,7 @@ func (s *testStorage) Read(ctx context.Context, streamID string, offset Offset, 
 	} else {
 		nextOffset = offset
 		if nextOffset == "" || nextOffset == "-1" {
-			nextOffset = FormatOffset(0)
+			nextOffset = formatTestOffset(0)
 		}
 	}
 
@@ -119,7 +138,7 @@ func (s *testStorage) Read(ctx context.Context, streamID string, offset Offset, 
 	if len(stream.messages) > 0 {
 		tailOffset = stream.messages[len(stream.messages)-1].Offset
 	} else {
-		tailOffset = FormatOffset(0)
+		tailOffset = formatTestOffset(0)
 	}
 
 	return &ReadResult{
@@ -142,7 +161,7 @@ func (s *testStorage) Head(ctx context.Context, streamID string) (*StreamInfo, e
 	if len(stream.messages) > 0 {
 		nextOffset = stream.messages[len(stream.messages)-1].Offset
 	} else {
-		nextOffset = FormatOffset(0)
+		nextOffset = formatTestOffset(0)
 	}
 
 	return &StreamInfo{
