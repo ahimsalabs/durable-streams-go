@@ -1,4 +1,7 @@
-// Package memorystorage provides an in-memory implementation of durablestream.Storage.
+// Package memorystore provides an in-memory implementation of durablestream.Storage.
+//
+// This implementation uses the reference offset format from the official Node.js
+// implementation: "<readSeq>_<byteOffset>" with 16-digit zero-padded integers.
 package memorystorage
 
 import (
@@ -7,6 +10,7 @@ import (
 	"sync"
 
 	"github.com/ahimsalabs/durable-streams-go/durablestream"
+	"github.com/ahimsalabs/durable-streams-go/durablestream/storage"
 	"github.com/go4org/hashtriemap"
 )
 
@@ -22,7 +26,10 @@ type memoryStream struct {
 
 // Storage is an in-memory implementation of durablestream.Storage.
 // Uses hashtriemap for lock-free stream lookups with per-stream locks for mutations.
-// Offsets are zero-padded sequential strings (e.g., "0000000001", "0000000002").
+//
+// Offsets use the reference implementation format: "0000000000000000_0000000000000042"
+// where the first 16 digits are the read sequence (always 0 for this implementation)
+// and the second 16 digits are the cumulative byte offset.
 type Storage struct {
 	streams hashtriemap.HashTrieMap[string, *memoryStream]
 }
@@ -99,7 +106,8 @@ func (m *Storage) Append(ctx context.Context, streamID string, data []byte, seq 
 	b := make([]byte, len(data))
 	copy(b, data)
 
-	offset := durablestream.FormatOffset(int64(len(stream.messages) + 1))
+	// Use message index as offset (matching reference implementation's byte offset concept)
+	offset := storage.FormatSimpleOffset(int64(len(stream.messages) + 1))
 	msg := durablestream.StoredMessage{
 		Data:   b,
 		Offset: offset,
@@ -129,10 +137,11 @@ func (m *Storage) Read(ctx context.Context, streamID string, offset durablestrea
 	}
 
 	// Parse offset to message index
-	offsetIdx, err := durablestream.ParseOffset(offset)
+	_, byteOffset, err := storage.ParseOffset(offset)
 	if err != nil {
 		return nil, err
 	}
+	offsetIdx := byteOffset
 
 	// Offset 0 means "start", which maps to first message (index 0)
 	// Offset N means "after message N", so we start reading from index N
@@ -164,7 +173,7 @@ func (m *Storage) Read(ctx context.Context, streamID string, offset durablestrea
 		// No messages returned, stay at current offset
 		nextOffset = offset
 		if nextOffset == "" || nextOffset == "-1" {
-			nextOffset = durablestream.FormatOffset(0)
+			nextOffset = storage.FormatSimpleOffset(0)
 		}
 	}
 
@@ -173,7 +182,7 @@ func (m *Storage) Read(ctx context.Context, streamID string, offset durablestrea
 	if len(stream.messages) > 0 {
 		tailOffset = stream.messages[len(stream.messages)-1].Offset
 	} else {
-		tailOffset = durablestream.FormatOffset(0)
+		tailOffset = storage.FormatSimpleOffset(0)
 	}
 
 	return &durablestream.ReadResult{
@@ -203,7 +212,7 @@ func (m *Storage) Head(ctx context.Context, streamID string) (*durablestream.Str
 	if len(stream.messages) > 0 {
 		nextOffset = stream.messages[len(stream.messages)-1].Offset
 	} else {
-		nextOffset = durablestream.FormatOffset(0)
+		nextOffset = storage.FormatSimpleOffset(0)
 	}
 
 	return &durablestream.StreamInfo{

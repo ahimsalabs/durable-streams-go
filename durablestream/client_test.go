@@ -8,7 +8,7 @@ import (
 	"time"
 
 	"github.com/ahimsalabs/durable-streams-go/durablestream"
-	"github.com/ahimsalabs/durable-streams-go/durablestream/memorystorage"
+	"github.com/ahimsalabs/durable-streams-go/durablestream/storage/memorystorage"
 )
 
 // setupTestServer creates a test server with a handler and storage.
