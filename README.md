@@ -6,14 +6,14 @@ Go implementation of [Durable Streams](https://github.com/durable-streams/durabl
 
 ## Conformance
 
-Tested against conformance tests v0.1.8:
-
-| Suite | Tests | Passed | Failed |
-|-------|-------|--------|--------|
-| Server (memorystorage) | 195 | 195 | 0 |
-| Client | 177 | 177 | 0 |
+| Suite | Version | Tests | Passed | Failed | Skipped |
+|-------|---------|-------|--------|--------|---------|
+| Server (memorystorage) | v0.1.8 | 195 | 195 | 0 | 0 |
+| Client | v0.2.0 | 212 | 184 | 13 | 15 |
 
 Client features: `batching`, `sse`, `longPoll`, `streaming`, `dynamicHeaders`
+
+Skipped: 6 `auto` mode, 6 `retryOptions`, 3 `strictZeroValidation`/`batchItems`
 
 ## Offset Format
 
@@ -28,9 +28,10 @@ This ensures lexicographic sortability as required by PROTOCOL.md Section 6.
 
 | Package | Coverage |
 |---------|----------|
-| durablestream | 90.7% |
+| durablestream | 90.9% |
 | durablestream/transport | 93.1% |
-| durablestream/storage/memorystorage | 96.2% |
+| durablestream/storage | 100.0% |
+| durablestream/storage/memorystorage | 95.5% |
 | durablestream/internal/protocol | 98.1% |
 
 ## Usage
