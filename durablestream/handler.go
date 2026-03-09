@@ -1145,6 +1145,8 @@ func writeStorageError(w http.ResponseWriter, err error) {
 		writeError(w, newError(codeConflict, err.Error()))
 	case errors.Is(err, ErrBadRequest):
 		writeError(w, newError(codeBadRequest, err.Error()))
+	case errors.Is(err, ErrPayloadTooLarge):
+		writeError(w, newError(codePayloadTooLarge, err.Error()))
 	default:
 		writeError(w, newError(codeInternal, err.Error()))
 	}

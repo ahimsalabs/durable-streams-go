@@ -30,6 +30,9 @@ var (
 	// ErrBadRequest indicates a malformed or invalid request.
 	ErrBadRequest = errors.New("bad request")
 
+	// ErrPayloadTooLarge indicates the request payload exceeds the maximum allowed size.
+	ErrPayloadTooLarge = errors.New("payload too large")
+
 	// ErrParseError indicates the server returned malformed/invalid JSON.
 	// This occurs when a JSON stream returns truncated or corrupted JSON responses.
 	ErrParseError = errors.New("parse error: malformed JSON response")
