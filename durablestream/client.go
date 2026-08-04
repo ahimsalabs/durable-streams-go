@@ -3,6 +3,7 @@ package durablestream
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"time"
@@ -26,10 +27,10 @@ const (
 	// ReadModeAuto catches up, then uses long-poll for live updates (default).
 	ReadModeAuto = transport.ReadModeAuto
 
-	// ReadModeLongPoll uses long-polling for live updates (Section 5.6).
+	// ReadModeLongPoll uses long-polling for live updates (Section 5.7).
 	ReadModeLongPoll = transport.ReadModeLongPoll
 
-	// ReadModeSSE uses Server-Sent Events for live updates (Section 5.7).
+	// ReadModeSSE uses Server-Sent Events for live updates (Section 5.8).
 	ReadModeSSE = transport.ReadModeSSE
 )
 
@@ -42,11 +43,18 @@ const (
 // Zero values are replaced with defaults:
 //   - Timeout: 30s (if zero or negative)
 //   - ReadMode: ReadModeAuto (if zero)
-//   - HTTPClient: http.DefaultClient (if nil)
+//   - HTTPClient: a package-owned client with bounded dial and idle settings (if nil)
+//   - MaxResponseSize: 64 MiB (if zero or negative)
+//   - MaxSSEEventSize: 16 MiB (if zero or negative)
 //   - Headers: none (if nil)
 type ClientConfig struct {
 	// HTTPClient is the underlying HTTP client.
-	// Default: http.DefaultClient.
+	//
+	// Default: a package-owned client with bounded dial, TLS handshake, and
+	// idle-connection settings. Do not set Client.Timeout on a custom client:
+	// it applies to the whole request including body reads and would abort
+	// long-poll and SSE reads. Use Timeout below, which is applied per
+	// operation via the request context.
 	HTTPClient *http.Client
 
 	// Headers provides headers to include in all requests.
@@ -54,11 +62,23 @@ type ClientConfig struct {
 	// This is the primary customization point for authentication.
 	Headers HeaderProvider
 
-	// Timeout is the default timeout for all operations (Create, Head, Delete, etc).
+	// Timeout bounds each non-streaming operation (Create, Head, Delete,
+	// Send, and catch-up reads). It is applied as a context deadline, so it
+	// does not affect long-poll or SSE reads, which have their own deadlines.
 	// Zero or negative values default to 30s.
 	Timeout time.Duration
 
-	// ReadMode specifies how live reads are handled after catch-up (Section 5.6-5.7).
+	// MaxResponseSize bounds the body of a single non-streaming response.
+	// Responses larger than this fail with transport.ErrResponseTooLarge.
+	// Zero or negative values default to 64 MiB.
+	MaxResponseSize int64
+
+	// MaxSSEEventSize bounds the bytes consumed by a single SSE event.
+	// Events larger than this fail with transport.ErrResponseTooLarge.
+	// Zero or negative values default to 16 MiB.
+	MaxSSEEventSize int
+
+	// ReadMode specifies how live reads are handled after catch-up (Section 5.7-5.8).
 	// Zero value defaults to ReadModeAuto (catch-up then long-poll).
 	ReadMode ReadMode
 }
@@ -75,8 +95,12 @@ type Client struct {
 // Pass nil for cfg to use defaults.
 //
 // The client automatically retries transient failures (5xx errors, rate limits)
-// with exponential backoff. For custom retry behavior or to disable retry,
-// use NewClientWithTransport.
+// with exponential backoff for retry-safe operations. Bare appends made by
+// StreamWriter are intentionally not retried because the server cannot
+// deduplicate them; transport-level appends carrying idempotent producer headers
+// are retryable. Deletes are also not retried because the path could be recreated
+// between attempts, causing a retry to delete the replacement. For custom retry
+// behavior or to disable retry, use NewClientWithTransport.
 //
 // For custom transports (testing, middleware composition), use NewClientWithTransport.
 func NewClient(baseURL string, cfg *ClientConfig) *Client {
@@ -93,8 +117,10 @@ func NewClient(baseURL string, cfg *ClientConfig) *Client {
 		c.readMode = cfg.ReadMode
 
 		httpCfg = &transport.HTTPConfig{
-			Client:  cfg.HTTPClient,
-			Headers: cfg.Headers,
+			Client:          cfg.HTTPClient,
+			Headers:         cfg.Headers,
+			MaxResponseSize: cfg.MaxResponseSize,
+			MaxSSEEventSize: cfg.MaxSSEEventSize,
 		}
 	}
 
@@ -136,8 +162,8 @@ func NewClientWithTransport(t transport.Transport, cfg *TransportClientConfig) *
 
 // TransportClientConfig configures a Client created via NewClientWithTransport.
 type TransportClientConfig struct {
-	// Timeout is the default timeout for all operations.
-	// Zero or negative values default to 30s.
+	// Timeout bounds each non-streaming operation, applied as a context
+	// deadline. Zero or negative values default to 30s.
 	Timeout time.Duration
 
 	// ReadMode specifies how live reads are handled after catch-up.
@@ -180,8 +206,9 @@ type CreateOptions struct {
 	// Default: "application/octet-stream"
 	ContentType string
 
-	// TTL sets a relative time-to-live for the stream.
-	// Zero means no TTL. Mutually exclusive with ExpiresAt.
+	// TTL sets a relative time-to-live for the stream. It must be a
+	// non-negative whole number of seconds. Zero means no TTL. Mutually
+	// exclusive with ExpiresAt.
 	TTL time.Duration
 
 	// ExpiresAt sets an absolute expiry time for the stream.
@@ -192,9 +219,23 @@ type CreateOptions struct {
 	InitialData []byte
 }
 
+// withTimeout applies the client's configured operation timeout to ctx.
+//
+// It is used for the non-streaming operations only. Long-poll and SSE reads
+// carry their own, much longer deadlines and must not inherit this one.
+func (c *Client) withTimeout(ctx context.Context) (context.Context, context.CancelFunc) {
+	if c.timeout <= 0 {
+		return context.WithCancel(ctx)
+	}
+	return context.WithTimeout(ctx, c.timeout)
+}
+
 // Create creates a new stream with the given options (Section 5.1: Create Stream).
 // Pass nil for opts to use defaults.
 func (c *Client) Create(ctx context.Context, path string, opts *CreateOptions) (*StreamInfo, error) {
+	ctx, cancel := c.withTimeout(ctx)
+	defer cancel()
+
 	req := transport.CreateRequest{Path: path}
 
 	contentType := "application/octet-stream"
@@ -219,8 +260,11 @@ func (c *Client) Create(ctx context.Context, path string, opts *CreateOptions) (
 	}, nil
 }
 
-// Head queries stream metadata without transferring data (Section 5.4: Stream Metadata).
+// Head queries stream metadata without transferring data (Section 5.5: Stream Metadata).
 func (c *Client) Head(ctx context.Context, path string) (*StreamInfo, error) {
+	ctx, cancel := c.withTimeout(ctx)
+	defer cancel()
+
 	resp, err := c.transport.Head(ctx, transport.HeadRequest{Path: path})
 	if err != nil {
 		return nil, convertTransportErrorWithPath(err, path)
@@ -234,13 +278,21 @@ func (c *Client) Head(ctx context.Context, path string) (*StreamInfo, error) {
 	}, nil
 }
 
-// Delete removes a stream (Section 5.3: Delete Stream).
+// Delete removes a stream (Section 5.4: Delete Stream).
 func (c *Client) Delete(ctx context.Context, path string) error {
+	ctx, cancel := c.withTimeout(ctx)
+	defer cancel()
+
 	return convertTransportErrorWithPath(c.transport.Delete(ctx, transport.DeleteRequest{Path: path}), path)
 }
 
 // StreamWriter provides efficient append operations by caching stream metadata.
 // Create via Client.Writer(). The writer holds no resources requiring cleanup.
+//
+// A StreamWriter is not safe for concurrent use. Give each goroutine its own
+// writer, or serialize access with a mutex: concurrent Send calls would race on
+// the cached offset and interleave appends in an unspecified order.
+//
 // See PROTOCOL.md Section 5.2: Append to Stream.
 type StreamWriter struct {
 	client      *Client
@@ -252,6 +304,11 @@ type StreamWriter struct {
 
 // Writer creates a StreamWriter for append operations.
 // The writer caches stream metadata (content-type) to avoid per-append overhead.
+//
+// Send and SendJSON retain ctx for backward compatibility, including its
+// cancellation and values (for example values consumed by a HeaderProvider).
+// SendContext and SendJSONContext use the context supplied to that call instead.
+// Every append is also bounded by ClientConfig.Timeout.
 func (c *Client) Writer(ctx context.Context, path string) (*StreamWriter, error) {
 	info, err := c.Head(ctx, path)
 	if err != nil {
@@ -275,13 +332,32 @@ type SendOptions struct {
 }
 
 // Send appends raw bytes to the stream (Section 5.2: Append to Stream).
+// It uses the context passed to [Client.Writer] and is also bounded by the
+// client's configured timeout. Use [StreamWriter.SendContext] to supply a
+// different context for one append.
 func (w *StreamWriter) Send(data []byte, opts *SendOptions) error {
+	ctx := w.ctx
+	if ctx == nil {
+		// Keep manually constructed writers inside this package usable in tests.
+		ctx = context.Background()
+	}
+	return w.SendContext(ctx, data, opts)
+}
+
+// SendContext appends raw bytes to the stream using ctx.
+//
+// The append is bounded by the client's configured timeout in addition to any
+// deadline on ctx.
+func (w *StreamWriter) SendContext(ctx context.Context, data []byte, opts *SendOptions) error {
 	var seq string
 	if opts != nil {
 		seq = opts.Seq
 	}
 
-	resp, err := w.client.transport.Append(w.ctx, transport.AppendRequest{
+	ctx, cancel := w.client.withTimeout(ctx)
+	defer cancel()
+
+	resp, err := w.client.transport.Append(ctx, transport.AppendRequest{
 		Path:        w.path,
 		Data:        data,
 		ContentType: w.contentType,
@@ -295,13 +371,24 @@ func (w *StreamWriter) Send(data []byte, opts *SendOptions) error {
 	return nil
 }
 
-// SendJSON marshals v as JSON and appends to the stream.
+// SendJSON marshals v as JSON and appends it using the context passed to
+// [Client.Writer]. Use [StreamWriter.SendJSONContext] to supply a different
+// context for one append.
 func (w *StreamWriter) SendJSON(v any, opts *SendOptions) error {
 	data, err := json.Marshal(v)
 	if err != nil {
 		return err
 	}
 	return w.Send(data, opts)
+}
+
+// SendJSONContext marshals v as JSON and appends it to the stream using ctx.
+func (w *StreamWriter) SendJSONContext(ctx context.Context, v any, opts *SendOptions) error {
+	data, err := json.Marshal(v)
+	if err != nil {
+		return err
+	}
+	return w.SendContext(ctx, data, opts)
 }
 
 // Offset returns the current tail offset after the last successful append.
@@ -313,13 +400,13 @@ func (w *StreamWriter) Offset() Offset {
 // The Reader inherits the client's ReadMode for live tailing behavior.
 //
 // When offset is "now" and the read mode is LongPoll or Auto, the reader
-// skips catch-up and goes directly to long-poll mode. Per PROTOCOL.md Section 6:
+// skips catch-up and goes directly to long-poll mode. Per PROTOCOL.md Section 8:
 // "Servers MUST immediately begin waiting for new data (no initial empty response)"
 //
 // For SSE mode, the reader always uses SSE directly (no catch-up phase) because
 // SSE streams deliver both historical and live data via SSE events.
 func (c *Client) Reader(path string, offset Offset) *Reader {
-	// Per protocol spec Section 6, for offset=now with long-poll:
+	// Per protocol spec Section 8, for offset=now with long-poll:
 	// "Servers MUST immediately begin waiting for new data (no initial empty response)"
 	// Skip catch-up phase for long-poll compatible modes with offset=now
 	catching := true
@@ -353,8 +440,10 @@ func convertTransportErrorWithPath(err error, path string) error {
 		return nil
 	}
 
-	// Check if it's a transport error with a code
-	if tErr, ok := err.(*transport.Error); ok {
+	// Check if it's a transport error with a code. Middleware is allowed to wrap
+	// transport errors, so use errors.As rather than a bare type assertion.
+	var tErr *transport.Error
+	if errors.As(err, &tErr) {
 		// Check both uppercase (from HTTP status mapping) and lowercase (from JSON response)
 		// Wrap with original message so details are preserved for inspection
 		switch tErr.Code {
@@ -368,6 +457,10 @@ func convertTransportErrorWithPath(err error, path string) error {
 			return wrapSentinelWithPath(tErr.Message, ErrGone, path)
 		case "BAD_REQUEST", "bad_request":
 			return wrapSentinelWithPath(tErr.Message, ErrBadRequest, path)
+		case "PAYLOAD_TOO_LARGE", "payload_too_large":
+			return wrapSentinelWithPath(tErr.Message, ErrPayloadTooLarge, path)
+		case "PARSE_ERROR", "parse_error":
+			return wrapSentinelWithPath(tErr.Message, ErrParseError, path)
 		case "RATE_LIMITED", "too_many_requests":
 			if path != "" {
 				return newError(codeTooManyRequests, fmt.Sprintf("[%s] %s", path, tErr.Message))

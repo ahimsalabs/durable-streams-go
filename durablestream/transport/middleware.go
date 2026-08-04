@@ -2,7 +2,10 @@ package transport
 
 import (
 	"context"
+	"errors"
 	"log/slog"
+	"math"
+	"math/rand/v2"
 	"time"
 )
 
@@ -91,7 +94,8 @@ func (t *loggingTransport) log(ctx context.Context, op, path string, start time.
 
 // RetryOptions configures retry behavior.
 type RetryOptions struct {
-	// MaxRetries is the maximum number of retry attempts. Default: 3.
+	// MaxRetries is the maximum number of retry attempts. Zero uses the default
+	// of 3; a negative value disables retries while still making one attempt.
 	MaxRetries int
 
 	// InitialBackoff is the initial backoff duration. Default: 100ms.
@@ -120,30 +124,44 @@ func DefaultRetryOptions() RetryOptions {
 }
 
 func defaultRetryable(err error) bool {
-	if e, ok := err.(*Error); ok {
+	var e *Error
+	if errors.As(err, &e) {
 		// Retry server errors and rate limits
 		return e.StatusCode >= 500 || e.StatusCode == 429
 	}
 	return false
 }
 
-// WithRetry wraps a transport with retry logic and exponential backoff.
+// WithRetry wraps a transport with retry logic and exponential backoff for
+// retry-safe operations. Plain appends and deletes are passed through exactly
+// once: an ambiguous first attempt may already have appended data or deleted an
+// older incarnation, and retrying could duplicate the append or delete a stream
+// recreated at the same path.
 //
 // Example:
 //
 //	transport := WithRetry(DefaultRetryOptions())(baseTransport)
 func WithRetry(opts RetryOptions) Middleware {
-	if opts.MaxRetries == 0 {
+	// A negative retry count means "try once, without retries". Most
+	// importantly, never let an invalid count skip the underlying operation and
+	// return a false nil success.
+	if opts.MaxRetries < 0 {
+		opts.MaxRetries = 0
+	} else if opts.MaxRetries == 0 {
+		// Preserve the established zero-value behavior.
 		opts.MaxRetries = 3
 	}
-	if opts.InitialBackoff == 0 {
+	if opts.InitialBackoff <= 0 {
 		opts.InitialBackoff = 100 * time.Millisecond
 	}
-	if opts.MaxBackoff == 0 {
+	if opts.MaxBackoff <= 0 {
 		opts.MaxBackoff = 10 * time.Second
 	}
-	if opts.Multiplier == 0 {
+	if opts.Multiplier < 1 || math.IsNaN(opts.Multiplier) || math.IsInf(opts.Multiplier, 0) {
 		opts.Multiplier = 2.0
+	}
+	if opts.InitialBackoff > opts.MaxBackoff {
+		opts.InitialBackoff = opts.MaxBackoff
 	}
 	if opts.Retryable == nil {
 		opts.Retryable = defaultRetryable
@@ -189,7 +207,18 @@ func (t *retryTransport) SSE(ctx context.Context, req SSERequest) (EventStream, 
 	return stream, err
 }
 
+// Append retries only when the request carries idempotent producer headers
+// (Section 5.2.1).
+//
+// A plain append is not idempotent: a 502 or 503 from an intermediary can arrive
+// after the origin has already committed the data, so retrying would append the
+// same bytes twice. With producer headers the server deduplicates by
+// (producer, epoch, seq) and the retry is safe.
 func (t *retryTransport) Append(ctx context.Context, req AppendRequest) (*AppendResponse, error) {
+	if !req.HasProducerHeaders {
+		return t.next.Append(ctx, req)
+	}
+
 	var resp *AppendResponse
 	err := t.retry(ctx, func() error {
 		var err error
@@ -209,10 +238,12 @@ func (t *retryTransport) Create(ctx context.Context, req CreateRequest) (*Create
 	return resp, err
 }
 
+// Delete is deliberately not retried. Although deleting one fixed resource is
+// idempotent, a stream path can be recreated after a successful deletion. If an
+// intermediary turns that first success into a retryable response, a later
+// attempt could delete the replacement incarnation.
 func (t *retryTransport) Delete(ctx context.Context, req DeleteRequest) error {
-	return t.retry(ctx, func() error {
-		return t.next.Delete(ctx, req)
-	})
+	return t.next.Delete(ctx, req)
 }
 
 func (t *retryTransport) Head(ctx context.Context, req HeadRequest) (*HeadResponse, error) {
@@ -239,22 +270,35 @@ func (t *retryTransport) retry(ctx context.Context, op func() error) error {
 			return err
 		}
 
-		// Wait with backoff
+		// Wait with backoff, jittered to spread retries from concurrent clients
+		// that failed at the same moment.
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
-		case <-time.After(backoff):
+		case <-time.After(jitter(backoff)):
 		}
 
 		// Increase backoff for next attempt
-		backoff = time.Duration(float64(backoff) * t.opts.Multiplier)
-		if backoff > t.opts.MaxBackoff {
+		nextBackoff := float64(backoff) * t.opts.Multiplier
+		if nextBackoff >= float64(t.opts.MaxBackoff) {
 			backoff = t.opts.MaxBackoff
+		} else {
+			backoff = time.Duration(nextBackoff)
 		}
 	}
 
 	// Unreachable, but compiler needs it
 	return nil
+}
+
+// jitter returns a duration uniformly distributed in [d/2, d].
+// Values of 1ns or less are returned unchanged.
+func jitter(d time.Duration) time.Duration {
+	if d <= 1 {
+		return d
+	}
+	half := d / 2
+	return half + time.Duration(rand.Int64N(int64(d-half)+1))
 }
 
 // Chain combines multiple middleware into a single middleware.

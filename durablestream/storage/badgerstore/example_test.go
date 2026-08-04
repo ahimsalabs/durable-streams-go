@@ -55,13 +55,13 @@ func Example() {
 // [snippet:options]
 func Example_options() {
 	storage, err := badgerstore.New(badgerstore.Options{
-		// Required for persistence (omit for in-memory)
+		// Persistent directory (empty uses an ephemeral directory)
 		Dir: "./data/streams",
 
-		// In-memory mode for tests (no persistence)
+		// Strictly memory-only mode; mutually exclusive with Dir
 		InMemory: false,
 
-		// Maximum message size (default: 10MB)
+		// Maximum message size (default: 10 MiB on disk, just under 1 MiB in memory)
 		MaxMessageSize: 10 * 1024 * 1024,
 
 		// Background value log GC interval (default: 5min, -1 to disable)
@@ -100,7 +100,7 @@ func Example_deduplication() {
 	defer storage.Close()
 
 	ctx := context.Background()
-	storage.Create(ctx, "stream", durablestream.StreamConfig{ContentType: "text/plain"})
+	_, _ = storage.Create(ctx, "stream", durablestream.StreamConfig{ContentType: "text/plain"})
 
 	// First append succeeds
 	_, err := storage.Append(ctx, "stream", []byte("data"), "0001")
@@ -130,13 +130,13 @@ func Example_expiry() {
 	ctx := context.Background()
 
 	// Expire after duration (TTL in seconds)
-	storage.Create(ctx, "temp-ttl", durablestream.StreamConfig{
+	_, _ = storage.Create(ctx, "temp-ttl", durablestream.StreamConfig{
 		ContentType: "text/plain",
 		TTL:         3600, // 1 hour
 	})
 
 	// Expire at specific time
-	storage.Create(ctx, "temp-expires", durablestream.StreamConfig{
+	_, _ = storage.Create(ctx, "temp-expires", durablestream.StreamConfig{
 		ContentType: "text/plain",
 		ExpiresAt:   time.Now().Add(24 * time.Hour),
 	})
@@ -152,10 +152,10 @@ func Example_waitForData() {
 	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
 	defer cancel()
 
-	storage.Create(ctx, "events", durablestream.StreamConfig{ContentType: "text/plain"})
+	_, _ = storage.Create(ctx, "events", durablestream.StreamConfig{ContentType: "text/plain"})
 
 	// Append data so WaitForData returns immediately
-	storage.Append(ctx, "events", []byte("hello"), "")
+	_, _ = storage.Append(ctx, "events", []byte("hello"), "")
 
 	// WaitForData blocks until data is available at the given offset
 	result, err := storage.WaitForData(ctx, "events", "", 0)
@@ -199,13 +199,13 @@ func Example_fullDemo() {
 	client := durablestream.NewClient(server.URL, nil)
 
 	// Create stream
-	client.Create(ctx, "/mystream", &durablestream.CreateOptions{
+	_, _ = client.Create(ctx, "/mystream", &durablestream.CreateOptions{
 		ContentType: "application/json",
 	})
 
 	// Write data
 	writer, _ := client.Writer(ctx, "/mystream")
-	writer.SendJSON(map[string]string{"hello": "world"}, nil)
+	_ = writer.SendJSONContext(ctx, map[string]string{"hello": "world"}, nil)
 
 	// Read back
 	reader := client.Reader("/mystream", durablestream.ZeroOffset)

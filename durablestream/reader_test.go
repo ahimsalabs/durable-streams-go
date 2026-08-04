@@ -1,7 +1,9 @@
 package durablestream
 
 import (
+	"bytes"
 	"context"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -26,7 +28,7 @@ func TestReader_OffsetNow_LongPollSkipsCatchup(t *testing.T) {
 		reader := client.Reader("/nowtest", Offset("now"))
 		defer reader.Close()
 
-		// Per protocol spec Section 6, for offset=now with long-poll:
+		// Per protocol spec Section 8, for offset=now with long-poll:
 		// "Servers MUST immediately begin waiting for new data (no initial empty response)"
 		// Reader should skip catch-up phase and go directly to long-poll
 
@@ -473,23 +475,27 @@ func TestReader_SSEMode(t *testing.T) {
 		}
 	})
 
-	t.Run("SSE rejects binary content type", func(t *testing.T) {
+	t.Run("SSE decodes base64 data for binary streams", func(t *testing.T) {
+		// SSE serves every content type. Binary streams arrive base64-encoded
+		// with Stream-SSE-Data-Encoding: base64, which the client decodes
+		// transparently (Section 5.8).
+		binary := []byte{0x00, 0x01, 0xff, 0xfe, 0x80, 0x0a, 0x0d}
+
 		_, _ = storage.Create(ctx, "/binary-stream", StreamConfig{ContentType: "application/octet-stream"})
-		_, _ = storage.Append(ctx, "/binary-stream", []byte("data"), "")
+		_, _ = storage.Append(ctx, "/binary-stream", binary, "")
 
 		reader := client.Reader("/binary-stream", ZeroOffset)
 		defer reader.Close()
 
-		// Catch up first
-		_, _ = reader.Read(ctx)
-
-		// SSE read should fail for binary content
-		sseCtx, cancel := context.WithTimeout(ctx, 1*time.Second)
+		sseCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 		defer cancel()
 
-		_, err := reader.Read(sseCtx)
-		if err == nil {
-			t.Error("expected error for binary content type with SSE")
+		result, err := reader.Read(sseCtx)
+		if err != nil {
+			t.Fatalf("SSE read failed: %v", err)
+		}
+		if !bytes.Equal(result.Data, binary) {
+			t.Errorf("data = %v, want %v (base64 not decoded round-trip)", result.Data, binary)
 		}
 	})
 }
@@ -514,6 +520,10 @@ func TestReader_SSE_UnknownEventType(t *testing.T) {
 	// Create a mock SSE server that sends an unknown event type
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")
+		if r.Method == http.MethodHead {
+			w.Header().Set("Stream-Next-Offset", "0_0")
+			return
+		}
 		w.WriteHeader(http.StatusOK)
 		flusher, ok := w.(http.Flusher)
 		if !ok {
@@ -537,11 +547,14 @@ func TestReader_SSE_UnknownEventType(t *testing.T) {
 	defer cancel()
 
 	_, err := reader.Read(ctx)
-	if err == nil {
-		t.Error("expected error for unknown event type")
+	if !errors.Is(err, ErrParseError) {
+		t.Fatalf("error = %v, want ErrParseError", err)
 	}
 	if !strings.Contains(err.Error(), "unknown SSE event type") {
 		t.Errorf("error = %v, want 'unknown SSE event type'", err)
+	}
+	if reader.sseStream != nil {
+		t.Error("malformed SSE connection was not cleared")
 	}
 }
 
@@ -549,6 +562,10 @@ func TestReader_SSE_WrongContentType(t *testing.T) {
 	// Create a mock server that returns wrong content type
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/plain") // Wrong!
+		if r.Method == http.MethodHead {
+			w.Header().Set("Stream-Next-Offset", "0_0")
+			return
+		}
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte("not SSE"))
 	}))
@@ -577,6 +594,10 @@ func TestReader_SSE_ControlEvent(t *testing.T) {
 	// Create a mock SSE server that sends control event then data
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")
+		if r.Method == http.MethodHead {
+			w.Header().Set("Stream-Next-Offset", "0_0")
+			return
+		}
 		w.WriteHeader(http.StatusOK)
 		flusher, ok := w.(http.Flusher)
 		if !ok {
@@ -587,8 +608,9 @@ func TestReader_SSE_ControlEvent(t *testing.T) {
 		_, _ = w.Write([]byte("event: control\ndata: {\"streamNextOffset\":\"123_456\",\"streamCursor\":\"abc\"}\n\n"))
 		flusher.Flush()
 
-		// Then send data event
+		// Then send a data event and its required trailing control event.
 		_, _ = w.Write([]byte("event: data\ndata: hello world\n\n"))
+		_, _ = w.Write([]byte("event: control\ndata: {\"streamNextOffset\":\"123_456\",\"streamCursor\":\"abc\"}\n\n"))
 		flusher.Flush()
 	}))
 	defer server.Close()
@@ -623,6 +645,10 @@ func TestReader_SSE_ReadError(t *testing.T) {
 	// Create a mock SSE server that closes connection mid-stream
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")
+		if r.Method == http.MethodHead {
+			w.Header().Set("Stream-Next-Offset", "0_0")
+			return
+		}
 		w.WriteHeader(http.StatusOK)
 		// Don't write anything, just close
 	}))
@@ -653,6 +679,10 @@ func TestReader_Seek_ClearsSSEConnection(t *testing.T) {
 	// Create a mock SSE server
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")
+		if r.Method == http.MethodHead {
+			w.Header().Set("Stream-Next-Offset", "0_0")
+			return
+		}
 		w.WriteHeader(http.StatusOK)
 		w.(http.Flusher).Flush()
 		_, _ = w.Write([]byte("event: data\ndata: hello\n\n"))
@@ -724,6 +754,45 @@ func TestReader_Messages_NonJSONData(t *testing.T) {
 
 	if msgCount < 1 {
 		t.Error("expected at least 1 message")
+	}
+}
+
+func TestReader_Messages_NonJSONArraysStayOpaque(t *testing.T) {
+	for _, tt := range []struct {
+		name        string
+		contentType string
+		data        string
+	}{
+		{name: "text array", contentType: "text/plain", data: `[1,2]`},
+		{name: "text empty array", contentType: "text/plain", data: `[]`},
+		{name: "binary array", contentType: "application/octet-stream", data: `[1,2]`},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			storage := newTestStorage()
+			handler := NewHandler(storage, &HandlerConfig{LongPollTimeout: 50 * time.Millisecond})
+			server := httptest.NewServer(handler)
+			defer server.Close()
+
+			_, _ = storage.Create(t.Context(), "/opaque", StreamConfig{ContentType: tt.contentType})
+			_, _ = storage.Append(t.Context(), "/opaque", []byte(tt.data), "")
+
+			reader := NewClient(server.URL, nil).Reader("/opaque", ZeroOffset)
+			defer reader.Close()
+			ctx, cancel := context.WithTimeout(t.Context(), time.Second)
+			defer cancel()
+
+			var got []string
+			for msg, err := range reader.Messages(ctx) {
+				if err != nil {
+					t.Fatalf("Messages() error = %v", err)
+				}
+				got = append(got, msg.String())
+				break
+			}
+			if len(got) != 1 || got[0] != tt.data {
+				t.Fatalf("messages = %q, want one opaque message %q", got, tt.data)
+			}
+		})
 	}
 }
 

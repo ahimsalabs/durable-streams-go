@@ -30,7 +30,7 @@ func ExampleHandler() {
 func ExampleClient() {
 	ctx := context.Background()
 
-	client := durablestream.NewClient("http://localhost:4437/streams", nil)
+	client := durablestream.NewClient("http://localhost:4437/v1/stream", nil)
 
 	_, err := client.Create(ctx, "events", &durablestream.CreateOptions{
 		ContentType: "application/json",
@@ -46,7 +46,7 @@ func ExampleClient() {
 	}
 
 	event := map[string]any{"type": "user.created", "id": 123}
-	if err := writer.SendJSON(event, nil); err != nil {
+	if err := writer.SendJSONContext(ctx, event, nil); err != nil {
 		log.Fatal(err)
 	}
 	fmt.Println("Appended at offset:", writer.Offset())
@@ -70,7 +70,7 @@ func ExampleClient() {
 func ExampleReader() {
 	ctx := context.Background()
 
-	client := durablestream.NewClient("http://localhost:4437/streams", nil)
+	client := durablestream.NewClient("http://localhost:4437/v1/stream", nil)
 
 	// Create a reader starting from offset 0
 	reader := client.Reader("events", durablestream.ZeroOffset)
@@ -107,7 +107,7 @@ func Example_fullDemo() {
 
 	// Write using Writer
 	writer, _ := client.Writer(ctx, "/mystream")
-	_ = writer.SendJSON(map[string]string{"hello": "world"}, nil)
+	_ = writer.SendJSONContext(ctx, map[string]string{"hello": "world"}, nil)
 
 	// Read using Reader with Messages iterator
 	reader := client.Reader("/mystream", durablestream.ZeroOffset)

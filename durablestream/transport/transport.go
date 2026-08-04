@@ -19,17 +19,17 @@ import (
 // All path parameters are relative paths that the transport combines with
 // its configured base URL.
 type Transport interface {
-	// Read performs a catch-up read (Section 5.5: Read Stream - Catch-up).
+	// Read performs a catch-up read (Section 5.6: Read Stream - Catch-up).
 	// Returns immediately with available data from the given offset.
 	Read(ctx context.Context, req ReadRequest) (*ReadResponse, error)
 
-	// LongPoll performs a long-poll read (Section 5.6: Read Stream - Live Long-poll).
+	// LongPoll performs a long-poll read (Section 5.7: Read Stream - Live Long-poll).
 	// Waits up to the configured timeout for new data if none is available.
 	LongPoll(ctx context.Context, req LongPollRequest) (*ReadResponse, error)
 
-	// SSE opens a Server-Sent Events stream (Section 5.7: Read Stream - Live SSE).
+	// SSE opens a Server-Sent Events stream (Section 5.8: Read Stream - Live SSE).
 	// Returns an EventStream for consuming events. Caller must Close() when done.
-	// Only valid for streams with text/* or application/json content types.
+	// Binary content types are decoded from the protocol's base64 SSE encoding.
 	SSE(ctx context.Context, req SSERequest) (EventStream, error)
 
 	// Append adds data to a stream (Section 5.2: Append to Stream).
@@ -40,20 +40,20 @@ type Transport interface {
 	// Returns conflict error if stream exists with different configuration.
 	Create(ctx context.Context, req CreateRequest) (*CreateResponse, error)
 
-	// Delete removes a stream (Section 5.3: Delete Stream).
+	// Delete removes a stream (Section 5.4: Delete Stream).
 	Delete(ctx context.Context, req DeleteRequest) error
 
-	// Head retrieves stream metadata (Section 5.4: Stream Metadata).
+	// Head retrieves stream metadata (Section 5.5: Stream Metadata).
 	// Returns the canonical way to find tail offset, TTL, and expiry.
 	Head(ctx context.Context, req HeadRequest) (*HeadResponse, error)
 }
 
-// EventStream represents a persistent streaming connection (Section 5.7: SSE).
+// EventStream represents a persistent streaming connection (Section 5.8: SSE).
 // Future implementations may support WebSocket.
 type EventStream interface {
 	// Next blocks until the next event arrives.
 	// Returns io.EOF when the stream is closed normally.
-	// Per Section 5.7: Server SHOULD close connections ~60s for CDN collapsing.
+	// Per Section 5.8: Server SHOULD close connections ~60s for CDN collapsing.
 	Next(ctx context.Context) (*Event, error)
 
 	// Close terminates the stream and releases resources.
@@ -68,59 +68,60 @@ const (
 	// This is the default mode matching typical usage patterns.
 	ReadModeAuto ReadMode = iota
 
-	// ReadModeLongPoll uses long-polling for live updates (Section 5.6).
+	// ReadModeLongPoll uses long-polling for live updates (Section 5.7).
 	// More robust across proxies and CDNs.
 	ReadModeLongPoll
 
-	// ReadModeSSE uses Server-Sent Events for live updates (Section 5.7).
-	// Lower latency but requires text/* or application/json content type.
+	// ReadModeSSE uses Server-Sent Events for live updates (Section 5.8).
+	// Lower latency; binary streams are transported as base64 data events.
 	ReadModeSSE
 )
 
-// ReadRequest is the request for a catch-up read (Section 5.5).
+// ReadRequest is the request for a catch-up read (Section 5.6).
 type ReadRequest struct {
 	Path   string // Stream path (relative to base URL)
-	Offset string // Starting offset; empty means stream start (Section 6)
+	Offset string // Starting offset; empty means stream start (Section 8)
 }
 
-// LongPollRequest is the request for a long-poll read (Section 5.6).
+// LongPollRequest is the request for a long-poll read (Section 5.7).
 type LongPollRequest struct {
 	Path    string        // Stream path
 	Offset  string        // Starting offset (required for long-poll)
-	Cursor  string        // Echo of Stream-Cursor for CDN collapsing (Section 8)
+	Cursor  string        // Echo of Stream-Cursor for CDN collapsing (Section 10.1)
 	Timeout time.Duration // Hint for server wait time
 }
 
-// SSERequest is the request to open an SSE stream (Section 5.7).
+// SSERequest is the request to open an SSE stream (Section 5.8).
 type SSERequest struct {
 	Path   string // Stream path
 	Offset string // Starting offset (required for SSE)
+	Cursor string // Echo of Stream-Cursor when reconnecting (Section 10.1)
 }
 
 // ReadResponse is the response from Read or LongPoll operations.
 type ReadResponse struct {
 	// Data is the raw response bytes.
-	// For JSON streams, this is a JSON array of messages (Section 7.1).
+	// For JSON streams, this is a JSON array of messages (Section 9.1).
 	Data []byte
 
-	// NextOffset is the offset for subsequent reads (Section 6).
+	// NextOffset is the offset for subsequent reads (Section 8).
 	// Per spec: "Clients MUST use the Stream-Next-Offset value returned
 	// in responses for subsequent read requests."
 	NextOffset string
 
-	// Cursor is the opaque cursor for CDN collapsing (Section 8).
-	// Should be echoed in subsequent long-poll requests.
+	// Cursor is the opaque cursor for CDN collapsing (Section 10.1).
+	// Should be echoed in subsequent long-poll and SSE requests.
 	Cursor string
 
-	// UpToDate is true when response includes all available data (Section 5.5).
+	// UpToDate is true when response includes all available data (Section 5.6).
 	// Per spec: "Clients MAY use this header to determine when they have
 	// caught up and can transition to live tailing mode."
 	UpToDate bool
 }
 
-// Event represents an SSE event (Section 5.7).
+// Event represents an SSE event (Section 5.8).
 type Event struct {
-	// Type is "data" or "control" per Section 5.7.
+	// Type is "data" or "control" per Section 5.8.
 	Type string
 
 	// Data is the event payload.
@@ -199,8 +200,9 @@ type CreateRequest struct {
 	// Per spec: "If omitted, the server MAY default to application/octet-stream."
 	ContentType string
 
-	// TTL sets relative time-to-live from creation.
-	// Zero means no TTL. Mutually exclusive with ExpiresAt (Section 5.1).
+	// TTL sets relative time-to-live from creation. It must be a non-negative
+	// whole number of seconds. Zero means no TTL. Mutually exclusive with
+	// ExpiresAt (Section 5.1).
 	TTL time.Duration
 
 	// ExpiresAt sets absolute expiry time.
@@ -217,17 +219,17 @@ type CreateResponse struct {
 	NextOffset string
 }
 
-// DeleteRequest is the request to delete a stream (Section 5.3).
+// DeleteRequest is the request to delete a stream (Section 5.4).
 type DeleteRequest struct {
 	Path string // Stream path
 }
 
-// HeadRequest is the request for stream metadata (Section 5.4).
+// HeadRequest is the request for stream metadata (Section 5.5).
 type HeadRequest struct {
 	Path string // Stream path
 }
 
-// HeadResponse is the response from a Head operation (Section 5.4).
+// HeadResponse is the response from a Head operation (Section 5.5).
 type HeadResponse struct {
 	// ContentType is the stream's content type.
 	ContentType string

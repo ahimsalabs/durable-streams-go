@@ -3,6 +3,7 @@ package transport
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"io"
@@ -83,11 +84,31 @@ func TestNewHTTPTransport(t *testing.T) {
 		if tr.baseURL != "http://example.com" {
 			t.Errorf("expected baseURL http://example.com, got %s", tr.baseURL)
 		}
-		if tr.client != http.DefaultClient {
-			t.Error("expected default client")
+		if tr.client == http.DefaultClient {
+			t.Error("transport must not use http.DefaultClient")
+		}
+		if tr.client == nil {
+			t.Fatal("expected a default client")
+		}
+		// A client-level timeout would abort long-poll and SSE reads.
+		if tr.client.Timeout != 0 {
+			t.Errorf("default client Timeout = %v, want 0", tr.client.Timeout)
+		}
+		defaultTransport, ok := tr.client.Transport.(*http.Transport)
+		if !ok {
+			t.Fatalf("default client transport = %T, want *http.Transport", tr.client.Transport)
+		}
+		if !defaultTransport.ForceAttemptHTTP2 {
+			t.Error("default transport must attempt HTTP/2 when using its custom dialer")
 		}
 		if tr.longPollTimeout != 60*time.Second {
 			t.Errorf("expected 60s timeout, got %v", tr.longPollTimeout)
+		}
+		if tr.maxResponseSize != defaultMaxResponseSize {
+			t.Errorf("maxResponseSize = %d, want %d", tr.maxResponseSize, defaultMaxResponseSize)
+		}
+		if tr.maxSSEEventSize != defaultMaxSSEEventSize {
+			t.Errorf("maxSSEEventSize = %d, want %d", tr.maxSSEEventSize, defaultMaxSSEEventSize)
 		}
 	})
 
@@ -275,6 +296,7 @@ func TestHTTPTransport_LongPoll(t *testing.T) {
 	t.Run("204 no content (timeout)", func(t *testing.T) {
 		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			w.Header().Set("Stream-Next-Offset", "123_456")
+			w.Header().Set("Stream-Cursor", "next-cursor")
 			w.WriteHeader(http.StatusNoContent)
 		}))
 		defer server.Close()
@@ -292,6 +314,9 @@ func TestHTTPTransport_LongPoll(t *testing.T) {
 		}
 		if len(resp.Data) != 0 {
 			t.Errorf("expected empty data, got %s", resp.Data)
+		}
+		if resp.Cursor != "next-cursor" {
+			t.Errorf("expected Cursor next-cursor, got %q", resp.Cursor)
 		}
 	})
 
@@ -320,6 +345,9 @@ func TestHTTPTransport_SSE(t *testing.T) {
 			if r.URL.Query().Get("live") != "sse" {
 				t.Errorf("expected live=sse, got %s", r.URL.Query().Get("live"))
 			}
+			if r.URL.Query().Get("cursor") != "cursor123" {
+				t.Errorf("expected cursor=cursor123, got %s", r.URL.Query().Get("cursor"))
+			}
 			if r.Header.Get("Accept") != "text/event-stream" {
 				t.Errorf("expected Accept header, got %s", r.Header.Get("Accept"))
 			}
@@ -335,6 +363,7 @@ func TestHTTPTransport_SSE(t *testing.T) {
 		stream, err := tr.SSE(context.Background(), SSERequest{
 			Path:   "/test",
 			Offset: "0_0",
+			Cursor: "cursor123",
 		})
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
@@ -424,6 +453,29 @@ func TestHTTPTransport_SSE(t *testing.T) {
 		}
 	})
 
+	t.Run("CR-only line endings", func(t *testing.T) {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Content-Type", "text/event-stream")
+			_, _ = io.WriteString(w, "event: data\rdata: hello\r\r")
+		}))
+		defer server.Close()
+
+		tr := NewHTTPTransport(server.URL, nil)
+		stream, err := tr.SSE(t.Context(), SSERequest{Path: "/test", Offset: "0_0"})
+		if err != nil {
+			t.Fatalf("SSE() error = %v", err)
+		}
+		defer stream.Close()
+
+		event, err := stream.Next(t.Context())
+		if err != nil {
+			t.Fatalf("Next() error = %v", err)
+		}
+		if got, want := string(event.Data), "hello"; got != want {
+			t.Fatalf("event data = %q, want %q", got, want)
+		}
+	})
+
 	t.Run("context already cancelled", func(t *testing.T) {
 		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			w.Header().Set("Content-Type", "text/event-stream")
@@ -447,6 +499,35 @@ func TestHTTPTransport_SSE(t *testing.T) {
 			t.Errorf("expected context.Canceled, got %v", err)
 		}
 	})
+
+	for _, tt := range []struct {
+		name string
+		body string
+	}{
+		{name: "missing event type", body: "data: hello\n\n"},
+		{name: "unknown event type", body: "event: mystery\ndata: hello\n\n"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.Header().Set("Content-Type", "text/event-stream")
+				_, _ = io.WriteString(w, tt.body)
+			}))
+			defer server.Close()
+
+			tr := NewHTTPTransport(server.URL, nil)
+			stream, err := tr.SSE(t.Context(), SSERequest{Path: "/test", Offset: "0_0"})
+			if err != nil {
+				t.Fatalf("SSE() error = %v", err)
+			}
+			defer stream.Close()
+
+			_, err = stream.Next(t.Context())
+			var transportErr *Error
+			if !errors.As(err, &transportErr) || transportErr.Code != "PARSE_ERROR" {
+				t.Fatalf("Next() error = %v, want PARSE_ERROR", err)
+			}
+		})
+	}
 }
 
 func TestHTTPTransport_Append(t *testing.T) {
@@ -576,9 +657,9 @@ func TestHTTPTransport_Create(t *testing.T) {
 	})
 
 	t.Run("with expires at", func(t *testing.T) {
-		expiresAt := time.Date(2025, 12, 31, 23, 59, 59, 0, time.UTC)
+		expiresAt := time.Date(2025, 12, 31, 23, 59, 59, 123456789, time.UTC)
 		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			if r.Header.Get("Stream-Expires-At") != "2025-12-31T23:59:59Z" {
+			if r.Header.Get("Stream-Expires-At") != "2025-12-31T23:59:59.123456789Z" {
 				t.Errorf("expected ExpiresAt, got %s", r.Header.Get("Stream-Expires-At"))
 			}
 			w.Header().Set("Stream-Next-Offset", "0_0")
@@ -619,6 +700,46 @@ func TestHTTPTransport_Create(t *testing.T) {
 			t.Errorf("expected NextOffset 0_7, got %s", resp.NextOffset)
 		}
 	})
+}
+
+func TestHTTPTransport_CreateRejectsInvalidTTL(t *testing.T) {
+	var requests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		requests.Add(1)
+		w.Header().Set("Stream-Next-Offset", "0_0")
+		w.WriteHeader(http.StatusCreated)
+	}))
+	defer server.Close()
+
+	tr := NewHTTPTransport(server.URL, nil)
+	for _, tt := range []struct {
+		name string
+		ttl  time.Duration
+	}{
+		{name: "negative", ttl: -time.Second},
+		{name: "negative fraction", ttl: -time.Nanosecond},
+		{name: "positive fraction", ttl: 1500 * time.Millisecond},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := tr.Create(t.Context(), CreateRequest{Path: "/test", TTL: tt.ttl})
+			var transportErr *Error
+			if !errors.As(err, &transportErr) || transportErr.Code != "BAD_REQUEST" {
+				t.Fatalf("Create() error = %v, want BAD_REQUEST", err)
+			}
+		})
+	}
+	_, err := tr.Create(t.Context(), CreateRequest{
+		Path:      "/test",
+		TTL:       time.Second,
+		ExpiresAt: time.Now().Add(time.Hour),
+	})
+	var transportErr *Error
+	if !errors.As(err, &transportErr) || transportErr.Code != "BAD_REQUEST" {
+		t.Fatalf("Create() with TTL and ExpiresAt error = %v, want BAD_REQUEST", err)
+	}
+	if got := requests.Load(); got != 0 {
+		t.Fatalf("invalid lifetime options sent %d HTTP requests, want 0", got)
+	}
 }
 
 func TestHTTPTransport_Delete(t *testing.T) {
@@ -694,6 +815,7 @@ func TestHTTPTransport_Head(t *testing.T) {
 
 	t.Run("minimal response", func(t *testing.T) {
 		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/octet-stream")
 			w.Header().Set("Stream-Next-Offset", "0_0")
 			w.WriteHeader(http.StatusOK)
 		}))
@@ -711,6 +833,121 @@ func TestHTTPTransport_Head(t *testing.T) {
 			t.Errorf("expected no ExpiresAt, got %v", resp.ExpiresAt)
 		}
 	})
+}
+
+func TestHTTPTransport_HeadRejectsMalformedMetadata(t *testing.T) {
+	for _, tt := range []struct {
+		name    string
+		headers map[string]string
+	}{
+		{name: "missing content type"},
+		{name: "negative TTL", headers: map[string]string{"Content-Type": "text/plain", "Stream-TTL": "-1"}},
+		{name: "fractional TTL", headers: map[string]string{"Content-Type": "text/plain", "Stream-TTL": "1.5"}},
+		{name: "TTL overflows duration", headers: map[string]string{"Content-Type": "text/plain", "Stream-TTL": "9223372037"}},
+		{name: "invalid expiry", headers: map[string]string{"Content-Type": "text/plain", "Stream-Expires-At": "not-a-timestamp"}},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.Header().Set("Stream-Next-Offset", "0_0")
+				for name, value := range tt.headers {
+					w.Header().Set(name, value)
+				}
+			}))
+			defer server.Close()
+
+			_, err := NewHTTPTransport(server.URL, nil).Head(t.Context(), HeadRequest{Path: "/test"})
+			var transportErr *Error
+			if !errors.As(err, &transportErr) || transportErr.Code != "PARSE_ERROR" {
+				t.Fatalf("Head() error = %v, want PARSE_ERROR", err)
+			}
+		})
+	}
+}
+
+func TestHTTPTransport_RequiresNextOffset(t *testing.T) {
+	tests := []struct {
+		name       string
+		statusCode int
+		invoke     func(*HTTPTransport) error
+	}{
+		{
+			name:       "read 200",
+			statusCode: http.StatusOK,
+			invoke: func(tr *HTTPTransport) error {
+				_, err := tr.Read(t.Context(), ReadRequest{Path: "/test"})
+				return err
+			},
+		},
+		{
+			name:       "long-poll 200",
+			statusCode: http.StatusOK,
+			invoke: func(tr *HTTPTransport) error {
+				_, err := tr.LongPoll(t.Context(), LongPollRequest{Path: "/test", Offset: "0_0"})
+				return err
+			},
+		},
+		{
+			name:       "long-poll 204",
+			statusCode: http.StatusNoContent,
+			invoke: func(tr *HTTPTransport) error {
+				_, err := tr.LongPoll(t.Context(), LongPollRequest{Path: "/test", Offset: "0_0"})
+				return err
+			},
+		},
+		{
+			name:       "append 200",
+			statusCode: http.StatusOK,
+			invoke: func(tr *HTTPTransport) error {
+				_, err := tr.Append(t.Context(), AppendRequest{Path: "/test", Data: []byte("x")})
+				return err
+			},
+		},
+		{
+			name:       "append 204",
+			statusCode: http.StatusNoContent,
+			invoke: func(tr *HTTPTransport) error {
+				_, err := tr.Append(t.Context(), AppendRequest{Path: "/test", Data: []byte("x")})
+				return err
+			},
+		},
+		{
+			name:       "create 201",
+			statusCode: http.StatusCreated,
+			invoke: func(tr *HTTPTransport) error {
+				_, err := tr.Create(t.Context(), CreateRequest{Path: "/test"})
+				return err
+			},
+		},
+		{
+			name:       "head 200",
+			statusCode: http.StatusOK,
+			invoke: func(tr *HTTPTransport) error {
+				_, err := tr.Head(t.Context(), HeadRequest{Path: "/test"})
+				return err
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.WriteHeader(tt.statusCode)
+			}))
+			defer server.Close()
+
+			err := tt.invoke(NewHTTPTransport(server.URL, nil))
+			var transportErr *Error
+			if !errors.As(err, &transportErr) || transportErr.Code != "PARSE_ERROR" {
+				t.Fatalf("operation error = %v, want PARSE_ERROR", err)
+			}
+			if transportErr.StatusCode != tt.statusCode {
+				t.Errorf("error status = %d, want %d", transportErr.StatusCode, tt.statusCode)
+			}
+			if !strings.Contains(transportErr.Message, "Stream-Next-Offset") {
+				t.Errorf("error message = %q, want missing header name", transportErr.Message)
+			}
+		})
+	}
 }
 
 func TestHTTPTransport_buildURL(t *testing.T) {
@@ -1013,6 +1250,99 @@ func TestHTTPTransport_Append_ProducerHeaders(t *testing.T) {
 	})
 }
 
+func TestHTTPTransport_Append_ValidatesProducerResponseHeaders(t *testing.T) {
+	tests := []struct {
+		name       string
+		statusCode int
+		headers    map[string]string
+		body       string
+	}{
+		{
+			name:       "success missing epoch",
+			statusCode: http.StatusOK,
+			headers:    map[string]string{"Producer-Seq": "1"},
+		},
+		{
+			name:       "success missing sequence",
+			statusCode: http.StatusOK,
+			headers:    map[string]string{"Producer-Epoch": "1"},
+		},
+		{
+			name:       "negative epoch",
+			statusCode: http.StatusOK,
+			headers:    map[string]string{"Producer-Epoch": "-1", "Producer-Seq": "1"},
+		},
+		{
+			name:       "non-integer sequence",
+			statusCode: http.StatusOK,
+			headers:    map[string]string{"Producer-Epoch": "1", "Producer-Seq": "1.5"},
+		},
+		{
+			name:       "sequence above interoperable range",
+			statusCode: http.StatusOK,
+			headers:    map[string]string{"Producer-Epoch": "1", "Producer-Seq": "9007199254740992"},
+		},
+		{
+			name:       "stale epoch error missing current epoch",
+			statusCode: http.StatusForbidden,
+			body:       `{"code":"stale_epoch","message":"stale producer epoch"}`,
+		},
+		{
+			name:       "sequence gap missing received sequence",
+			statusCode: http.StatusConflict,
+			headers:    map[string]string{"Producer-Expected-Seq": "2"},
+			body:       `{"code":"sequence_gap","message":"sequence gap"}`,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.Header().Set("Stream-Next-Offset", "0_1")
+				for name, value := range tt.headers {
+					w.Header().Set(name, value)
+				}
+				w.WriteHeader(tt.statusCode)
+				_, _ = io.WriteString(w, tt.body)
+			}))
+			defer server.Close()
+
+			tr := NewHTTPTransport(server.URL, nil)
+			_, err := tr.Append(t.Context(), AppendRequest{
+				Path:               "/test",
+				Data:               []byte("x"),
+				ProducerID:         "producer",
+				ProducerEpoch:      1,
+				ProducerSeq:        1,
+				HasProducerHeaders: true,
+			})
+			var transportErr *Error
+			if !errors.As(err, &transportErr) || transportErr.Code != "PARSE_ERROR" {
+				t.Fatalf("Append() error = %v, want PARSE_ERROR", err)
+			}
+		})
+	}
+
+	t.Run("generic conflict does not require producer metadata", func(t *testing.T) {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(http.StatusConflict)
+			_, _ = io.WriteString(w, `{"code":"conflict","message":"content type mismatch"}`)
+		}))
+		defer server.Close()
+
+		tr := NewHTTPTransport(server.URL, nil)
+		_, err := tr.Append(t.Context(), AppendRequest{
+			Path:               "/test",
+			Data:               []byte("x"),
+			HasProducerHeaders: true,
+		})
+		var transportErr *Error
+		if !errors.As(err, &transportErr) || transportErr.Code != "conflict" {
+			t.Fatalf("Append() error = %v, want original conflict", err)
+		}
+	})
+}
+
 func TestHTTPTransport_Append_Errors(t *testing.T) {
 	t.Run("server error", func(t *testing.T) {
 		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -1163,6 +1493,7 @@ func TestHttpStatusToCode(t *testing.T) {
 		{409, "CONFLICT"},
 		{400, "BAD_REQUEST"},
 		{410, "GONE"},
+		{413, "PAYLOAD_TOO_LARGE"},
 		{429, "RATE_LIMITED"},
 		{401, "UNAUTHORIZED"},
 		{403, "FORBIDDEN"},
@@ -1184,8 +1515,8 @@ func TestHttpStatusToCode(t *testing.T) {
 func TestBuildSSEData(t *testing.T) {
 	t.Run("empty", func(t *testing.T) {
 		data := buildSSEData(nil)
-		if string(data) != "{}" {
-			t.Errorf("expected {}, got %s", data)
+		if len(data) != 0 {
+			t.Errorf("expected empty SSE data, got %q", data)
 		}
 	})
 
@@ -1423,7 +1754,7 @@ func TestWithRetry(t *testing.T) {
 	})
 }
 
-func TestWithRetry_AllMethods(t *testing.T) {
+func TestWithRetry_MethodSafety(t *testing.T) {
 	var callCount atomic.Int32
 	serverErr := &Error{StatusCode: 500, Code: "SERVER_ERROR"}
 
@@ -1478,27 +1809,45 @@ func TestWithRetry_AllMethods(t *testing.T) {
 	})(mock)
 	ctx := context.Background()
 
-	// Test each method retries
-	callCount.Store(0)
-	_, _ = retried.Read(ctx, ReadRequest{Path: "/test"})
+	checkCalls := func(name string, want int32, call func()) {
+		t.Helper()
+		t.Run(name, func(t *testing.T) {
+			callCount.Store(0)
+			call()
+			if got := callCount.Load(); got != want {
+				t.Errorf("attempts = %d, want %d", got, want)
+			}
+		})
+	}
 
-	callCount.Store(0)
-	_, _ = retried.LongPoll(ctx, LongPollRequest{Path: "/test"})
-
-	callCount.Store(0)
-	_, _ = retried.SSE(ctx, SSERequest{Path: "/test"})
-
-	callCount.Store(0)
-	_, _ = retried.Append(ctx, AppendRequest{Path: "/test", Data: []byte("x")})
-
-	callCount.Store(0)
-	_, _ = retried.Create(ctx, CreateRequest{Path: "/test"})
-
-	callCount.Store(0)
-	_ = retried.Delete(ctx, DeleteRequest{Path: "/test"})
-
-	callCount.Store(0)
-	_, _ = retried.Head(ctx, HeadRequest{Path: "/test"})
+	checkCalls("read retries", 2, func() {
+		_, _ = retried.Read(ctx, ReadRequest{Path: "/test"})
+	})
+	checkCalls("long poll retries", 2, func() {
+		_, _ = retried.LongPoll(ctx, LongPollRequest{Path: "/test"})
+	})
+	checkCalls("SSE handshake retries", 2, func() {
+		_, _ = retried.SSE(ctx, SSERequest{Path: "/test"})
+	})
+	checkCalls("plain append does not retry", 1, func() {
+		_, _ = retried.Append(ctx, AppendRequest{Path: "/test", Data: []byte("x")})
+	})
+	checkCalls("idempotent append retries", 2, func() {
+		_, _ = retried.Append(ctx, AppendRequest{
+			Path:               "/test",
+			Data:               []byte("x"),
+			HasProducerHeaders: true,
+		})
+	})
+	checkCalls("create retries", 2, func() {
+		_, _ = retried.Create(ctx, CreateRequest{Path: "/test"})
+	})
+	checkCalls("delete does not retry", 1, func() {
+		_ = retried.Delete(ctx, DeleteRequest{Path: "/test"})
+	})
+	checkCalls("head retries", 2, func() {
+		_, _ = retried.Head(ctx, HeadRequest{Path: "/test"})
+	})
 }
 
 func TestWithRetry_ZeroOptions(t *testing.T) {
@@ -1690,5 +2039,492 @@ func TestWithRetry_BackoffCapping(t *testing.T) {
 	// Without capping, would take 1 + 10 + 100 + 1000 + 10000 = 11111ms
 	if elapsed > 100*time.Millisecond {
 		t.Errorf("backoff capping not working, took %v", elapsed)
+	}
+}
+
+// --- SSE base64 data encoding (Section 5.8) ---
+
+// sseServer returns a server that writes body once with the given headers.
+func sseServer(t *testing.T, encoding string, body string) *httptest.Server {
+	t.Helper()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		if encoding != "" {
+			w.Header().Set("Stream-SSE-Data-Encoding", encoding)
+		}
+		_, _ = io.WriteString(w, body)
+	}))
+	t.Cleanup(server.Close)
+	return server
+}
+
+func TestHTTPTransport_SSE_Base64Data(t *testing.T) {
+	binary := []byte{0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a}
+
+	tests := []struct {
+		name string
+		body string
+		want []byte
+	}{
+		{
+			name: "single line",
+			body: "event: data\ndata: " + base64.StdEncoding.EncodeToString(binary) + "\n\n",
+			want: binary,
+		},
+		{
+			name: "split across data lines",
+			// Servers MAY split base64 text across lines; clients join them and
+			// strip the inserted newlines before decoding.
+			body: "event: data\ndata: AQIDBAUG\ndata: BwgJCg==\n\n",
+			want: binary,
+		},
+		{
+			name: "empty payload",
+			body: "event: data\ndata: \n\n",
+			want: nil,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			server := sseServer(t, "base64", tt.body)
+			tr := NewHTTPTransport(server.URL, nil)
+			stream, err := tr.SSE(context.Background(), SSERequest{Path: "/test", Offset: "0_0"})
+			if err != nil {
+				t.Fatalf("SSE() error = %v", err)
+			}
+			defer stream.Close()
+
+			event, err := stream.Next(context.Background())
+			if err != nil {
+				t.Fatalf("Next() error = %v", err)
+			}
+			if event.Type != "data" {
+				t.Errorf("event type = %q, want data", event.Type)
+			}
+			if !bytes.Equal(event.Data, tt.want) {
+				t.Errorf("data = %v, want %v", event.Data, tt.want)
+			}
+		})
+	}
+}
+
+func TestHTTPTransport_SSE_DefaultLimitAllowsBase64Expansion(t *testing.T) {
+	// The default server may return a full 1 MiB chunk. Its base64 wire form is
+	// larger than 1 MiB, so the client's event bound must apply to the encoded
+	// event with enough headroom rather than rejecting a valid server response.
+	binary := bytes.Repeat([]byte{0xab}, 1<<20)
+	body := "event: data\ndata: " + base64.StdEncoding.EncodeToString(binary) + "\n\n"
+	server := sseServer(t, "base64", body)
+
+	tr := NewHTTPTransport(server.URL, nil)
+	stream, err := tr.SSE(context.Background(), SSERequest{Path: "/test", Offset: "0_0"})
+	if err != nil {
+		t.Fatalf("SSE() error = %v", err)
+	}
+	defer stream.Close()
+
+	event, err := stream.Next(context.Background())
+	if err != nil {
+		t.Fatalf("Next() error = %v", err)
+	}
+	if !bytes.Equal(event.Data, binary) {
+		t.Fatalf("decoded data length = %d, want %d", len(event.Data), len(binary))
+	}
+}
+
+func TestHTTPTransport_SSE_ContentTypeParameters(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "Text/Event-Stream; charset=utf-8")
+		_, _ = io.WriteString(w, "event: data\ndata: hello\n\n")
+	}))
+	defer server.Close()
+
+	tr := NewHTTPTransport(server.URL, nil)
+	stream, err := tr.SSE(context.Background(), SSERequest{Path: "/test", Offset: "0_0"})
+	if err != nil {
+		t.Fatalf("SSE() error = %v", err)
+	}
+	defer stream.Close()
+
+	event, err := stream.Next(context.Background())
+	if err != nil {
+		t.Fatalf("Next() error = %v", err)
+	}
+	if string(event.Data) != "hello" {
+		t.Fatalf("data = %q, want hello", event.Data)
+	}
+}
+
+func TestHTTPTransport_SSE_Base64Errors(t *testing.T) {
+	tests := []struct {
+		name string
+		body string
+	}{
+		{
+			name: "length not a multiple of 4",
+			body: "event: data\ndata: AQIDBAU\n\n",
+		},
+		{
+			name: "invalid alphabet",
+			body: "event: data\ndata: !!!!\n\n",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			server := sseServer(t, "base64", tt.body)
+			tr := NewHTTPTransport(server.URL, nil)
+			stream, err := tr.SSE(context.Background(), SSERequest{Path: "/test", Offset: "0_0"})
+			if err != nil {
+				t.Fatalf("SSE() error = %v", err)
+			}
+			defer stream.Close()
+
+			_, err = stream.Next(context.Background())
+			var tErr *Error
+			if !errors.As(err, &tErr) || tErr.Code != "PARSE_ERROR" {
+				t.Fatalf("Next() error = %v, want PARSE_ERROR", err)
+			}
+		})
+	}
+}
+
+func TestHTTPTransport_SSE_Base64ControlEventNotDecoded(t *testing.T) {
+	// Control events stay JSON even when data events are base64 (Section 5.8).
+	body := "event: control\ndata: {\"streamNextOffset\":\"123_456\",\"streamCursor\":\"abc\"}\n\n"
+	server := sseServer(t, "base64", body)
+
+	tr := NewHTTPTransport(server.URL, nil)
+	stream, err := tr.SSE(context.Background(), SSERequest{Path: "/test", Offset: "0_0"})
+	if err != nil {
+		t.Fatalf("SSE() error = %v", err)
+	}
+	defer stream.Close()
+
+	event, err := stream.Next(context.Background())
+	if err != nil {
+		t.Fatalf("Next() error = %v", err)
+	}
+	if event.NextOffset != "123_456" {
+		t.Errorf("NextOffset = %q, want 123_456", event.NextOffset)
+	}
+	if event.Cursor != "abc" {
+		t.Errorf("Cursor = %q, want abc", event.Cursor)
+	}
+}
+
+func TestHTTPTransport_SSE_UnsupportedEncoding(t *testing.T) {
+	server := sseServer(t, "gzip", "event: data\ndata: x\n\n")
+
+	tr := NewHTTPTransport(server.URL, nil)
+	_, err := tr.SSE(context.Background(), SSERequest{Path: "/test", Offset: "0_0"})
+	if err == nil {
+		t.Fatal("SSE() = nil error, want error for unsupported encoding")
+	}
+	if !strings.Contains(err.Error(), "gzip") {
+		t.Errorf("error = %v, want it to mention the unsupported encoding", err)
+	}
+}
+
+// --- SSE bounds and cancellation ---
+
+func TestHTTPTransport_SSE_EventTooLarge(t *testing.T) {
+	t.Run("single oversized line", func(t *testing.T) {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "text/event-stream")
+			_, _ = io.WriteString(w, "event: data\ndata: ")
+			// One line far longer than the configured limit, never terminated.
+			line := strings.Repeat("x", 4096)
+			for range 64 {
+				if _, err := io.WriteString(w, line); err != nil {
+					return
+				}
+			}
+		}))
+		defer server.Close()
+
+		tr := NewHTTPTransport(server.URL, &HTTPConfig{MaxSSEEventSize: 8 << 10})
+		stream, err := tr.SSE(context.Background(), SSERequest{Path: "/test", Offset: "0_0"})
+		if err != nil {
+			t.Fatalf("SSE() error = %v", err)
+		}
+		defer stream.Close()
+
+		_, err = stream.Next(context.Background())
+		if !errors.Is(err, ErrResponseTooLarge) {
+			t.Fatalf("Next() error = %v, want ErrResponseTooLarge", err)
+		}
+	})
+
+	t.Run("many lines in one event", func(t *testing.T) {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "text/event-stream")
+			_, _ = io.WriteString(w, "event: data\n")
+			// Thousands of short lines with no event terminator.
+			for range 10000 {
+				if _, err := io.WriteString(w, "data: filler\n"); err != nil {
+					return
+				}
+			}
+		}))
+		defer server.Close()
+
+		tr := NewHTTPTransport(server.URL, &HTTPConfig{MaxSSEEventSize: 4 << 10})
+		stream, err := tr.SSE(context.Background(), SSERequest{Path: "/test", Offset: "0_0"})
+		if err != nil {
+			t.Fatalf("SSE() error = %v", err)
+		}
+		defer stream.Close()
+
+		_, err = stream.Next(context.Background())
+		if !errors.Is(err, ErrResponseTooLarge) {
+			t.Fatalf("Next() error = %v, want ErrResponseTooLarge", err)
+		}
+	})
+
+	t.Run("many CR-only lines in one event", func(t *testing.T) {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Content-Type", "text/event-stream")
+			_, _ = io.WriteString(w, "event: data\r")
+			for range 10000 {
+				if _, err := io.WriteString(w, "data: filler\r"); err != nil {
+					return
+				}
+			}
+		}))
+		defer server.Close()
+
+		tr := NewHTTPTransport(server.URL, &HTTPConfig{MaxSSEEventSize: 4 << 10})
+		stream, err := tr.SSE(t.Context(), SSERequest{Path: "/test", Offset: "0_0"})
+		if err != nil {
+			t.Fatalf("SSE() error = %v", err)
+		}
+		defer stream.Close()
+
+		_, err = stream.Next(t.Context())
+		if !errors.Is(err, ErrResponseTooLarge) {
+			t.Fatalf("Next() error = %v, want ErrResponseTooLarge", err)
+		}
+	})
+}
+
+func TestHTTPTransport_SSE_NextCancelsWhileBlocked(t *testing.T) {
+	// The server sends one event and then holds the connection open without
+	// sending anything, so the second Next blocks on the network.
+	holding := make(chan struct{})
+	release := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, "event: data\ndata: hello\n\n")
+		w.(http.Flusher).Flush()
+		close(holding)
+		<-release
+	}))
+	defer server.Close()
+	defer close(release)
+
+	tr := NewHTTPTransport(server.URL, nil)
+	stream, err := tr.SSE(context.Background(), SSERequest{Path: "/test", Offset: "0_0"})
+	if err != nil {
+		t.Fatalf("SSE() error = %v", err)
+	}
+	defer stream.Close()
+
+	if _, err := stream.Next(context.Background()); err != nil {
+		t.Fatalf("first Next() error = %v", err)
+	}
+	<-holding // server is now holding the connection open
+
+	ctx, cancel := context.WithCancel(context.Background())
+	errc := make(chan error, 1)
+	go func() {
+		_, err := stream.Next(ctx)
+		errc <- err
+	}()
+
+	cancel()
+
+	select {
+	case err := <-errc:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("Next() error = %v, want context.Canceled", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("Next() did not return after context cancellation")
+	}
+}
+
+// --- Response size bounds ---
+
+func TestHTTPTransport_Read_ResponseTooLarge(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Stream-Next-Offset", "0_100")
+		_, _ = w.Write(bytes.Repeat([]byte("x"), 4096))
+	}))
+	defer server.Close()
+
+	tr := NewHTTPTransport(server.URL, &HTTPConfig{MaxResponseSize: 1024})
+	_, err := tr.Read(context.Background(), ReadRequest{Path: "/test"})
+	if !errors.Is(err, ErrResponseTooLarge) {
+		t.Fatalf("Read() error = %v, want ErrResponseTooLarge", err)
+	}
+}
+
+func TestCheckErrorResponse_BoundsErrorBody(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+		_, _ = w.Write(bytes.Repeat([]byte("e"), 1<<20))
+	}))
+	defer server.Close()
+
+	tr := NewHTTPTransport(server.URL, nil)
+	_, err := tr.Read(context.Background(), ReadRequest{Path: "/test"})
+	var tErr *Error
+	if !errors.As(err, &tErr) {
+		t.Fatalf("Read() error = %v, want *Error", err)
+	}
+	if len(tErr.Message) > maxErrorBodySize {
+		t.Errorf("error message length = %d, want <= %d", len(tErr.Message), maxErrorBodySize)
+	}
+}
+
+// --- Append duplicate semantics (Section 5.2.1) ---
+
+func TestHTTPTransport_Append_DuplicateRequiresProducerHeaders(t *testing.T) {
+	tests := []struct {
+		name               string
+		hasProducerHeaders bool
+		wantDuplicate      bool
+	}{
+		// Servers answer 204 to every append that carries no producer headers,
+		// where it says nothing about deduplication.
+		{name: "plain append", hasProducerHeaders: false, wantDuplicate: false},
+		{name: "idempotent producer", hasProducerHeaders: true, wantDuplicate: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Stream-Next-Offset", "100_0")
+				if tt.hasProducerHeaders {
+					w.Header().Set("Producer-Epoch", "0")
+					w.Header().Set("Producer-Seq", "0")
+				}
+				w.WriteHeader(http.StatusNoContent)
+			}))
+			defer server.Close()
+
+			tr := NewHTTPTransport(server.URL, nil)
+			resp, err := tr.Append(context.Background(), AppendRequest{
+				Path:               "/test",
+				Data:               []byte("data"),
+				ProducerID:         "p1",
+				HasProducerHeaders: tt.hasProducerHeaders,
+			})
+			if err != nil {
+				t.Fatalf("Append() error = %v", err)
+			}
+			if resp.Duplicate != tt.wantDuplicate {
+				t.Errorf("Duplicate = %v, want %v", resp.Duplicate, tt.wantDuplicate)
+			}
+		})
+	}
+}
+
+// --- Retry safety ---
+
+func TestWithRetry_AppendIdempotency(t *testing.T) {
+	tests := []struct {
+		name               string
+		hasProducerHeaders bool
+		wantCalls          int32
+	}{
+		// Without producer headers the server cannot deduplicate, so a retry
+		// after a proxy 503 would append the same bytes twice.
+		{name: "plain append is not retried", hasProducerHeaders: false, wantCalls: 1},
+		{name: "idempotent append is retried", hasProducerHeaders: true, wantCalls: 3},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var calls atomic.Int32
+			mock := &mockTransport{
+				appendFunc: func(ctx context.Context, req AppendRequest) (*AppendResponse, error) {
+					calls.Add(1)
+					return nil, &Error{StatusCode: 503, Code: "UNAVAILABLE"}
+				},
+			}
+
+			retried := WithRetry(RetryOptions{
+				MaxRetries:     2,
+				InitialBackoff: time.Millisecond,
+			})(mock)
+
+			_, err := retried.Append(context.Background(), AppendRequest{
+				Path:               "/test",
+				Data:               []byte("x"),
+				HasProducerHeaders: tt.hasProducerHeaders,
+			})
+			if err == nil {
+				t.Fatal("Append() = nil error, want error")
+			}
+			if got := calls.Load(); got != tt.wantCalls {
+				t.Errorf("append attempts = %d, want %d", got, tt.wantCalls)
+			}
+		})
+	}
+}
+
+func TestWithRetry_DeleteIncarnationSafety(t *testing.T) {
+	// A 503 can be generated by an intermediary after the origin committed the
+	// delete. The path may then be recreated during backoff, so a second DELETE
+	// would target a different stream incarnation.
+	var calls atomic.Int32
+	mock := &mockTransport{
+		deleteFunc: func(context.Context, DeleteRequest) error {
+			calls.Add(1)
+			return &Error{StatusCode: 503, Code: "UNAVAILABLE"}
+		},
+	}
+
+	retried := WithRetry(RetryOptions{
+		MaxRetries:     2,
+		InitialBackoff: time.Millisecond,
+	})(mock)
+
+	err := retried.Delete(context.Background(), DeleteRequest{Path: "/test"})
+	if err == nil {
+		t.Fatal("Delete() = nil error, want error")
+	}
+	if got := calls.Load(); got != 1 {
+		t.Errorf("delete attempts = %d, want 1", got)
+	}
+}
+
+func TestDefaultRetryable_WrappedError(t *testing.T) {
+	// Errors from middleware or the caller may arrive wrapped.
+	wrapped := fmt.Errorf("append: %w", &Error{StatusCode: 503})
+	if !defaultRetryable(wrapped) {
+		t.Error("defaultRetryable(wrapped 503) = false, want true")
+	}
+	wrapped404 := fmt.Errorf("append: %w", &Error{StatusCode: 404})
+	if defaultRetryable(wrapped404) {
+		t.Error("defaultRetryable(wrapped 404) = true, want false")
+	}
+}
+
+func TestJitter(t *testing.T) {
+	const d = 100 * time.Millisecond
+	distinct := make(map[time.Duration]struct{})
+	for range 100 {
+		got := jitter(d)
+		if got < d/2 || got > d {
+			t.Fatalf("jitter(%v) = %v, want within [%v, %v]", d, got, d/2, d)
+		}
+		distinct[got] = struct{}{}
+	}
+	if len(distinct) < 2 {
+		t.Error("jitter produced a single value; backoff is not jittered")
 	}
 }
