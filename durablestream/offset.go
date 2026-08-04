@@ -2,9 +2,9 @@
 package durablestream
 
 // Offset represents an opaque position within a stream.
-// Per spec Section 6: Offsets are opaque tokens that are lexicographically sortable.
+// Per spec Section 8: Offsets are opaque tokens that are lexicographically sortable.
 //
-// From PROTOCOL.md Section 6:
+// From PROTOCOL.md Section 8:
 //  1. Opaque: Clients MUST NOT interpret offset structure or meaning
 //  2. Lexicographically Sortable: For any two valid offsets for the same stream,
 //     a lexicographic comparison determines their relative position in the stream.

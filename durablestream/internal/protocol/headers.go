@@ -2,7 +2,7 @@
 package protocol
 
 // HTTP header names defined by the Durable Streams Protocol.
-// See PROTOCOL.md Section 11: IANA Considerations.
+// See PROTOCOL.md Section 13: IANA Considerations.
 const (
 	// HeaderStreamTTL sets or returns the relative time-to-live for a stream in seconds.
 	HeaderStreamTTL = "Stream-TTL"
@@ -22,8 +22,16 @@ const (
 	// HeaderStreamUpToDate indicates the response includes all data available in the stream.
 	HeaderStreamUpToDate = "Stream-Up-To-Date"
 
+	// HeaderStreamSSEDataEncoding declares the encoding applied to SSE data events.
+	// Per Section 5.8, servers set this to "base64" for streams whose content type is
+	// neither text/* nor application/json.
+	HeaderStreamSSEDataEncoding = "Stream-SSE-Data-Encoding"
+
+	// SSEDataEncodingBase64 is the only defined value for HeaderStreamSSEDataEncoding.
+	SSEDataEncodingBase64 = "base64"
+
 	// HeaderStreamPrivate indicates the stream contains user-specific or confidential data.
-	// Per Section 8.1, private streams use Cache-Control: private instead of public.
+	// Per Section 10.1, private streams use Cache-Control: private instead of public.
 	HeaderStreamPrivate = "Stream-Private"
 )
 
@@ -58,13 +66,13 @@ const (
 	LiveModeSSE      = "sse"
 )
 
-// Offset sentinel values (PROTOCOL.md Section 6).
+// Offset sentinel values (PROTOCOL.md Section 8).
 const (
 	// OffsetStart is the special offset value that indicates the beginning of the stream.
-	// Per spec Section 6: semantically equivalent to omitting the offset parameter.
+	// Per spec Section 8: semantically equivalent to omitting the offset parameter.
 	OffsetStart = "-1"
 
 	// OffsetNow is the special offset value that indicates the current tail position.
-	// Per spec Section 6: allows clients to skip historical data and read only future data.
+	// Per spec Section 8: allows clients to skip historical data and read only future data.
 	OffsetNow = "now"
 )

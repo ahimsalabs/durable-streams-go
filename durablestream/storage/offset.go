@@ -6,7 +6,7 @@
 //
 // The reference implementation uses the format: <readSeq>_<byteOffset>
 // where both components are 16-digit zero-padded integers. This format ensures
-// offsets are lexicographically sortable as required by PROTOCOL.md Section 6.
+// offsets are lexicographically sortable as required by PROTOCOL.md Section 8.
 package storage
 
 import (

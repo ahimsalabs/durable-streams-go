@@ -196,7 +196,7 @@ func TestProcessJSONCreate(t *testing.T) {
 }
 
 // TestProcessJSONAppendVsCreate verifies the semantic difference between Append and Create.
-// Per PROTOCOL.md Section 7.1:
+// Per PROTOCOL.md Section 9.1:
 // - POST with []: MUST reject with 400 (no-op append)
 // - PUT with []: valid, creates empty stream
 func TestProcessJSONAppendVsCreate(t *testing.T) {
@@ -449,5 +449,104 @@ func TestHeaderConstants(t *testing.T) {
 	}
 	if LiveModeSSE != "sse" {
 		t.Errorf("LiveModeSSE = %q, want 'sse'", LiveModeSSE)
+	}
+}
+
+// TestProcessJSON_PreservesRawBytes covers the round-trip through interface{} that
+// used to rewrite payloads: integers beyond 2^53 lost precision, 1.0 became 1, and
+// object keys were reordered. Stream data is opaque and MUST survive byte for byte.
+func TestProcessJSON_PreservesRawBytes(t *testing.T) {
+	element := `{"id":12345678901234567890,"big":9007199254740993,"f":1.0,"z":"z","a":"a"}`
+
+	tests := []struct {
+		name  string
+		input string
+		want  []string
+	}{
+		{
+			name:  "batch element",
+			input: "[" + element + "]",
+			want:  []string{element},
+		},
+		{
+			name:  "multi element batch",
+			input: "[" + element + ",[1.0,2],\"s\"]",
+			want:  []string{element, "[1.0,2]", `"s"`},
+		},
+		{
+			name:  "single value is stored verbatim",
+			input: element,
+			want:  []string{element},
+		},
+		{
+			name:  "whitespace before array is still an array",
+			input: " \n\t[1.0]",
+			want:  []string{"1.0"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := ProcessJSONAppend([]byte(tt.input))
+			if err != nil {
+				t.Fatalf("ProcessJSONAppend(%s) error = %v", tt.input, err)
+			}
+			if len(got) != len(tt.want) {
+				t.Fatalf("got %d messages, want %d", len(got), len(tt.want))
+			}
+			for i := range got {
+				if string(got[i]) != tt.want[i] {
+					t.Errorf("message %d = %s, want %s", i, got[i], tt.want[i])
+				}
+			}
+		})
+	}
+}
+
+// TestProcessJSON_RejectsInvalid covers validation of both array elements and
+// single values (Section 9.1.4).
+func TestProcessJSON_RejectsInvalid(t *testing.T) {
+	for _, input := range []string{"", "  ", "{", "[1,]", "[1 2]", "not json", `{"a":}`, "[[1,]]"} {
+		if _, err := ProcessJSONAppend([]byte(input)); err == nil {
+			t.Errorf("ProcessJSONAppend(%q) = nil error, want invalid JSON", input)
+		}
+	}
+}
+
+// TestProcessJSON_DoesNotAliasInput verifies returned messages are copies: the
+// caller may reuse the request buffer after the call.
+func TestProcessJSON_DoesNotAliasInput(t *testing.T) {
+	input := []byte(`["abc","def"]`)
+	got, err := ProcessJSONAppend(input)
+	if err != nil {
+		t.Fatalf("ProcessJSONAppend: %v", err)
+	}
+	for i := range input {
+		input[i] = 'X'
+	}
+	if string(got[0]) != `"abc"` {
+		t.Errorf("message aliased the input buffer: got %s", got[0])
+	}
+}
+
+// TestSSERequiresBase64 covers the Section 5.8 rule that SSE serves all content
+// types, base64-encoding everything that is not text/* or application/json.
+func TestSSERequiresBase64(t *testing.T) {
+	tests := []struct {
+		contentType string
+		want        bool
+	}{
+		{"application/octet-stream", true},
+		{"application/protobuf", true},
+		{"image/png", true},
+		{"text/plain", false},
+		{"text/plain; charset=utf-8", false},
+		{"application/json", false},
+		{"APPLICATION/JSON", false},
+	}
+	for _, tt := range tests {
+		if got := SSERequiresBase64(tt.contentType); got != tt.want {
+			t.Errorf("SSERequiresBase64(%q) = %v, want %v", tt.contentType, got, tt.want)
+		}
 	}
 }

@@ -1,7 +1,9 @@
 package protocol
 
 import (
+	"math/big"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 )
@@ -76,6 +78,13 @@ func TestGenerateCursorAt(t *testing.T) {
 		}
 	})
 
+	t.Run("bounds oversized client cursor", func(t *testing.T) {
+		cursor := GenerateCursorAt(testTime, strings.Repeat("9", maxCursorDigits+1))
+		if cursor != "2" {
+			t.Errorf("expected cursor '2' for oversized client cursor, got %q", cursor)
+		}
+	})
+
 	t.Run("handles negative client cursor", func(t *testing.T) {
 		// Negative cursor is less than current, so no jitter
 		cursor := GenerateCursorAt(testTime, "-5")
@@ -91,6 +100,61 @@ func TestGenerateCursor(t *testing.T) {
 	_, err := strconv.ParseInt(cursor, 10, 64)
 	if err != nil {
 		t.Errorf("GenerateCursor should return numeric string, got '%s': %v", cursor, err)
+	}
+}
+
+func TestValidCursor(t *testing.T) {
+	for _, tt := range []struct {
+		cursor string
+		want   bool
+	}{
+		{cursor: "0", want: true},
+		{cursor: strings.Repeat("9", maxCursorDigits), want: true},
+		{cursor: "", want: false},
+		{cursor: "-1", want: false},
+		{cursor: "not-a-number", want: false},
+		{cursor: strings.Repeat("9", maxCursorDigits+1), want: false},
+	} {
+		if got := ValidCursor(tt.cursor); got != tt.want {
+			t.Errorf("ValidCursor(%q) = %v, want %v", tt.cursor, got, tt.want)
+		}
+	}
+}
+
+// Section 10.1 requires a strictly greater cursor whenever the client echoes one
+// at or beyond the current interval. Jitter below one interval length used to
+// truncate to zero and hand the client its own cursor back.
+func TestGenerateCursorAt_EchoedCursor_AlwaysAdvances(t *testing.T) {
+	testTime := cursorEpoch.Add(40 * time.Second) // interval 2
+
+	for i := 0; i < 10000; i++ {
+		cursor := GenerateCursorAt(testTime, "2")
+		cursorInt, err := strconv.ParseInt(cursor, 10, 64)
+		if err != nil {
+			t.Fatalf("cursor should be numeric: %v", err)
+		}
+		if cursorInt <= 2 {
+			t.Fatalf("cursor %d did not advance past the echoed cursor 2", cursorInt)
+		}
+	}
+}
+
+func TestGenerateCursorAt_EchoedCursor_DoesNotOverflow(t *testing.T) {
+	testTime := cursorEpoch.Add(40 * time.Second)
+
+	for _, client := range []string{
+		"9223372036854775807",              // math.MaxInt64
+		"99999999999999999999999999999999", // beyond int64
+	} {
+		got := GenerateCursorAt(testTime, client)
+		gotInt, ok := new(big.Int).SetString(got, 10)
+		if !ok {
+			t.Fatalf("GenerateCursorAt(_, %q) = %q, want a decimal integer", client, got)
+		}
+		clientInt, _ := new(big.Int).SetString(client, 10)
+		if gotInt.Cmp(clientInt) <= 0 {
+			t.Errorf("GenerateCursorAt(_, %q) = %q, want a strictly greater cursor", client, got)
+		}
 	}
 }
 
