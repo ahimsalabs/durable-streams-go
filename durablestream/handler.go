@@ -2,14 +2,17 @@ package durablestream
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/base64"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/ahimsalabs/durable-streams-go/durablestream/internal/protocol"
@@ -21,9 +24,61 @@ const (
 	defaultLongPollTimeout = 30 * time.Second
 	defaultSSECloseAfter   = 60 * time.Second
 
-	// Security headers per protocol Section 10.7
+	// Security headers per protocol Section 12.7
 	headerXContentTypeOptions       = "X-Content-Type-Options"
 	headerCrossOriginResourcePolicy = "Cross-Origin-Resource-Policy"
+
+	headerAccessControlAllowOrigin   = "Access-Control-Allow-Origin"
+	headerAccessControlAllowMethods  = "Access-Control-Allow-Methods"
+	headerAccessControlAllowHeaders  = "Access-Control-Allow-Headers"
+	headerAccessControlExposeHeaders = "Access-Control-Expose-Headers"
+	headerAccessControlMaxAge        = "Access-Control-Max-Age"
+
+	// corsMaxAgeSeconds caps how long a browser may reuse a preflight result.
+	// One day is the practical ceiling browsers honor, and the policy below is
+	// static, so there is nothing to invalidate sooner.
+	corsMaxAgeSeconds = "86400"
+)
+
+// CORS policy for browser clients. The protocol defines no CORS requirements of
+// its own, so these lists are derived from what the protocol actually puts on
+// the wire: every method this handler routes, every request header a client may
+// send, and every response header a client must be able to read.
+var (
+	corsAllowMethods = strings.Join([]string{
+		http.MethodGet, http.MethodHead, http.MethodPost,
+		http.MethodPut, http.MethodDelete, http.MethodOptions,
+	}, ", ")
+
+	corsAllowHeaders = strings.Join([]string{
+		"Authorization",
+		"Content-Type",
+		"Cache-Control",
+		// Conditional read of a catch-up response (Section 10.1).
+		"If-None-Match",
+		protocol.HeaderStreamTTL,
+		protocol.HeaderStreamExpiresAt,
+		protocol.HeaderStreamSeq,
+		protocol.HeaderStreamPrivate,
+		protocol.HeaderProducerID,
+		protocol.HeaderProducerEpoch,
+		protocol.HeaderProducerSeq,
+	}, ", ")
+
+	corsExposeHeaders = strings.Join([]string{
+		"ETag",
+		"Location",
+		protocol.HeaderStreamNextOffset,
+		protocol.HeaderStreamCursor,
+		protocol.HeaderStreamUpToDate,
+		protocol.HeaderStreamTTL,
+		protocol.HeaderStreamExpiresAt,
+		protocol.HeaderStreamSSEDataEncoding,
+		protocol.HeaderProducerEpoch,
+		protocol.HeaderProducerSeq,
+		protocol.HeaderProducerExpectedSeq,
+		protocol.HeaderProducerReceivedSeq,
+	}, ", ")
 )
 
 // HandlerConfig configures a Handler.
@@ -45,23 +100,40 @@ type HandlerConfig struct {
 	// When a read would return more data than this limit, results are paginated.
 	// Default: 1MB.
 	ChunkSize int
-}
 
-// producerState tracks the state for a single producer on a single stream.
-// Per PROTOCOL.md Section 5.2.1.
-type producerState struct {
-	epoch   int64 // Current epoch for this producer
-	lastSeq int64 // Highest accepted sequence number in current epoch
-}
+	// MaxProducers bounds committed (stream, producer) idempotency states plus
+	// first appends currently in flight. At capacity, a new producer receives
+	// 429; existing non-expired producers remain available. Producer state is
+	// process-local: it is not persisted by Storage and does not survive a Handler
+	// restart. Default: 10000.
+	MaxProducers int
 
-// producerKey uniquely identifies a producer on a stream.
-type producerKey struct {
-	streamID   string
-	producerID string
+	// ProducerStateTTL is how long an idle process-local idempotent-producer state
+	// is retained. Once it expires, an old retry can be accepted as new data and a
+	// stale epoch is no longer fenced. Values <= 0 use the protocol-recommended
+	// in-memory default of seven days.
+	ProducerStateTTL time.Duration
+
+	// EnableCORS installs a permissive, credential-free browser policy that
+	// allows every stream method and protocol header from any origin. Leave it
+	// false when an outer authentication/CORS layer owns browser access.
+	// Default: false.
+	EnableCORS bool
 }
 
 // Handler implements http.Handler for serving durable streams.
 // Per spec Section 5: routes requests based on HTTP method.
+//
+// Producer state and per-stream lifecycle locks are process-local. Use one
+// Handler instance for all HTTP mutations of a Storage when relying on
+// idempotent-producer guarantees; mutating the same Storage directly or through
+// another Handler bypasses those safeguards. The built-in Storage
+// implementations additionally expose incarnation identity so in-flight reads
+// can reject a cross-Handler replacement; a custom Storage that leaves
+// IncarnationID empty cannot provide that cross-Handler protection. Initial
+// content and multi-message JSON appends require [AtomicBatchStorage]; a custom
+// backend without that optional capability receives 501 for those requests
+// rather than exposing a partial commit.
 type Handler struct {
 	storage         Storage
 	pathExtractor   func(*http.Request) string
@@ -69,15 +141,23 @@ type Handler struct {
 	sseCloseAfter   time.Duration
 	maxAppendSize   int64
 	chunkSize       int
+	enableCORS      bool
+
+	// mutations binds create, append, delete, and producer-state changes to one
+	// stream incarnation. It is process-local, like the producer registry; use a
+	// single Handler for all mutations of a Storage when relying on idempotent
+	// producer guarantees.
+	mutations keyedMutex
 
 	// Producer state tracking (PROTOCOL.md Section 5.2.1)
-	producersMu sync.Mutex
-	producers   map[producerKey]*producerState
+	producers *producerRegistry
 }
 
 // NewHandler creates a new stream handler with the given storage.
 // Pass nil for cfg to use defaults.
 func NewHandler(storage Storage, cfg *HandlerConfig) *Handler {
+	maxProducers := defaultMaxProducers
+	producerStateTTL := defaultProducerStateTTL
 	h := &Handler{
 		storage:         storage,
 		pathExtractor:   func(r *http.Request) string { return r.URL.Path },
@@ -85,7 +165,6 @@ func NewHandler(storage Storage, cfg *HandlerConfig) *Handler {
 		sseCloseAfter:   defaultSSECloseAfter,
 		maxAppendSize:   defaultMaxAppendSize,
 		chunkSize:       defaultChunkSize,
-		producers:       make(map[producerKey]*producerState),
 	}
 
 	if cfg != nil {
@@ -104,7 +183,15 @@ func NewHandler(storage Storage, cfg *HandlerConfig) *Handler {
 		if cfg.ChunkSize > 0 {
 			h.chunkSize = cfg.ChunkSize
 		}
+		if cfg.MaxProducers > 0 {
+			maxProducers = cfg.MaxProducers
+		}
+		if cfg.ProducerStateTTL > 0 {
+			producerStateTTL = cfg.ProducerStateTTL
+		}
+		h.enableCORS = cfg.EnableCORS
 	}
+	h.producers = newProducerRegistry(maxProducers, producerStateTTL)
 
 	return h
 }
@@ -112,6 +199,30 @@ func NewHandler(storage Storage, cfg *HandlerConfig) *Handler {
 // ServeHTTP routes to appropriate handler based on method.
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	streamID := h.pathExtractor(r)
+
+	// Browser clients read protocol headers off every response and send
+	// If-None-Match and the Stream-*/Producer-* request headers, none of which
+	// are CORS-safelisted. Advertise them on every response, errors included, so
+	// a cross-origin fetch behaves the same as a same-origin one.
+	h.setCORSHeaders(w)
+
+	// The __ds prefix is reserved for Durable Streams control APIs (spec Section 6),
+	// which this handler does not implement. Reject it before any stream operation so
+	// application streams cannot squat on the namespace: allowing them would make
+	// adding subscription support later a breaking change. 404 is used because
+	// nothing is served at these paths — for any method, including PUT.
+	if hasReservedSegment(streamID) {
+		writeError(w, newError(codeNotFound, "path segment \"__ds\" is reserved"))
+		return
+	}
+
+	if r.Method == http.MethodOptions {
+		// Preflight is answered without consulting storage: the browser asks
+		// about the request it is allowed to make, not about the resource, and
+		// the stream need not exist yet (a PUT may be what follows).
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
 
 	switch r.Method {
 	case http.MethodPut:
@@ -127,6 +238,24 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	default:
 		writeError(w, newError(codeBadRequest, "method not allowed"))
 	}
+}
+
+// touch restarts a stream's sliding TTL window because this request counts as
+// activity on it (Section 5.1).
+//
+// Which requests count is a decision only the handler can make, so every reset
+// in this file is one of these calls: reads and writes that reach the origin
+// reset the countdown, HEAD does not, and for the live modes the reset happens
+// when the server begins processing rather than when data is delivered. Callers
+// therefore touch before doing their work, not after — a long-poll that waits
+// and returns nothing has still kept its stream alive.
+//
+// A failed renewal is a failed request, not best-effort bookkeeping. Returning
+// success while the durable expiry was not moved tells a client its activity
+// kept the stream alive when it did not. Pre-response callers map the error to an
+// HTTP response; an SSE stream whose response is already committed terminates.
+func (h *Handler) touch(r *http.Request, streamID string) error {
+	return h.storage.Touch(r.Context(), streamID)
 }
 
 // handleCreate implements PUT (Create Stream) - Section 5.1
@@ -159,12 +288,11 @@ func (h *Handler) handleCreate(w http.ResponseWriter, r *http.Request, streamID 
 			return
 		}
 		ttlSec, err := strconv.ParseInt(ttlStr, 10, 64)
-		if err != nil || ttlSec < 0 {
+		if err != nil || ttlSec < 0 || ttlSec > math.MaxInt64/int64(time.Second) {
 			writeError(w, newError(codeBadRequest, "invalid Stream-TTL header"))
 			return
 		}
 		cfg.TTL = time.Duration(ttlSec) * time.Second
-		cfg.ExpiresAt = time.Now().Add(cfg.TTL)
 	}
 
 	if hasExpiresAt {
@@ -176,7 +304,7 @@ func (h *Handler) handleCreate(w http.ResponseWriter, r *http.Request, streamID 
 		cfg.ExpiresAt = expiresAt
 	}
 
-	// Parse Stream-Private header (Section 8.1)
+	// Parse Stream-Private header (Section 10.1)
 	if privateStr := r.Header.Get(protocol.HeaderStreamPrivate); privateStr != "" {
 		if privateStr == "true" {
 			cfg.IsPrivate = true
@@ -186,55 +314,90 @@ func (h *Handler) handleCreate(w http.ResponseWriter, r *http.Request, streamID 
 		}
 	}
 
-	// Create stream
-	created, err := h.storage.Create(r.Context(), streamID, cfg)
+	// Read the initial body before creating anything, so an oversized body is
+	// rejected without leaving an empty stream behind.
+	body, protoErr := h.readBoundedBody(r)
+	if protoErr != nil {
+		writeError(w, protoErr)
+		return
+	}
+
+	// Validate and split JSON before creating anything. A malformed PUT must not
+	// return 400 after leaving an empty stream behind.
+	var initialMessages [][]byte
+	if len(body) > 0 {
+		if protocol.IsJSONContentType(contentType) {
+			messages, err := protocol.ProcessJSONCreate(body)
+			if err != nil {
+				writeError(w, newError(codeBadRequest, err.Error()))
+				return
+			}
+			initialMessages = messages
+		} else {
+			initialMessages = [][]byte{body}
+		}
+	}
+
+	// Creating a stream with initial data must be one storage mutation: if an
+	// append failed after Create, an idempotent retry would see the empty stream
+	// and skip its initial body. Custom Storage implementations can continue to
+	// serve empty PUTs, but must opt into AtomicBatchStorage for non-empty ones.
+	batchStorage, hasAtomicBatch := h.storage.(AtomicBatchStorage)
+	if len(initialMessages) > 0 && !hasAtomicBatch {
+		writeError(w, newError(codeNotImplemented, "storage does not support atomic stream creation with initial content"))
+		return
+	}
+	// From the Create commit through producer-state reset and initial appends,
+	// no POST or DELETE handled by this Handler may cross stream incarnations.
+	unlock := h.mutations.lock(streamID)
+	defer unlock()
+	// Start the relative window at the actual serialized create attempt, not
+	// before a potentially slow request body read or wait for another mutation.
+	if hasTTL {
+		cfg.ExpiresAt = time.Now().Add(cfg.TTL)
+	}
+
+	var (
+		created    bool
+		nextOffset Offset
+		err        error
+	)
+	if len(initialMessages) > 0 {
+		created, nextOffset, err = batchStorage.CreateWithMessages(r.Context(), streamID, cfg, initialMessages)
+	} else {
+		created, err = h.storage.Create(r.Context(), streamID, cfg)
+	}
 	if err != nil {
 		writeStorageError(w, err)
 		return
 	}
 
-	// Get the tail offset (which will be 0 for a new empty stream)
-	info, err := h.storage.Head(r.Context(), streamID)
-	if err != nil {
-		writeStorageError(w, err)
-		return
-	}
-	nextOffset := info.NextOffset
-
-	// Handle initial body content if provided
-	if r.ContentLength > 0 || r.TransferEncoding != nil {
-		body, err := io.ReadAll(r.Body)
-		if err != nil {
-			writeError(w, newError(codeBadRequest, "failed to read request body"))
+	if created {
+		// Invalidate live reads of the absent/expired predecessor before any
+		// initial content becomes visible in this new incarnation.
+		h.mutations.bump(streamID)
+		// A newly created stream shares no history with any stream that previously
+		// used this ID. Stale producer state would make a restarted producer's first
+		// append look like a duplicate and silently drop its data (Section 5.2.1).
+		h.producers.forget(streamID)
+	} else {
+		// Idempotent replay against a live stream: the window it was created with
+		// is unchanged, but this PUT is still a write that reached the origin.
+		if err := h.touch(r, streamID); err != nil {
+			writeStorageError(w, err)
 			return
 		}
+	}
 
-		if len(body) > 0 {
-			// For JSON mode, process the body
-			if protocol.IsJSONContentType(contentType) {
-				// Use ProcessJSONCreate for PUT - allows empty arrays per Section 7.1
-				messages, err := protocol.ProcessJSONCreate(body)
-				if err != nil {
-					writeError(w, newError(codeBadRequest, err.Error()))
-					return
-				}
-				// Append each message (may be empty for [] body)
-				for _, msg := range messages {
-					nextOffset, err = h.storage.Append(r.Context(), streamID, msg, "")
-					if err != nil {
-						writeStorageError(w, err)
-						return
-					}
-				}
-			} else {
-				// Non-JSON: append as-is
-				nextOffset, err = h.storage.Append(r.Context(), streamID, body, "")
-				if err != nil {
-					writeStorageError(w, err)
-					return
-				}
-			}
+	// CreateWithMessages already returned the exact tail. Empty creates use the
+	// base Storage API, so read their (or an idempotent predecessor's) tail now.
+	if len(initialMessages) == 0 {
+		info, err := h.storage.Head(r.Context(), streamID)
+		if err != nil {
+			writeStorageError(w, err)
+			return
 		}
+		nextOffset = info.NextOffset
 	}
 
 	// Return success headers
@@ -243,6 +406,12 @@ func (h *Handler) handleCreate(w http.ResponseWriter, r *http.Request, streamID 
 	// Set Location header on 201 Created (Section 5.1)
 	// Use r.RequestURI which preserves the original path (before StripPrefix etc.)
 	// Location must be absolute URL per RFC 7231
+	//
+	// TRUST ASSUMPTION: the authority and scheme come from the client-supplied Host
+	// header and X-Forwarded-Proto. That is correct behind a reverse proxy that
+	// rewrites both, and forgeable by any client when the handler is exposed
+	// directly. Deployments that treat Location as trusted must run behind a proxy
+	// that overwrites these headers.
 	if created {
 		scheme := "http"
 		if r.TLS != nil || r.Header.Get("X-Forwarded-Proto") == "https" {
@@ -267,142 +436,195 @@ func (h *Handler) handleCreate(w http.ResponseWriter, r *http.Request, streamID 
 	}
 }
 
-// producerResult represents the outcome of producer validation.
-type producerResult struct {
-	isDuplicate bool  // True if this is a duplicate request (return 204)
-	isNew       bool  // True if this is a new request (return 200)
-	epoch       int64 // Epoch to echo in response
-	highestSeq  int64 // Highest seq to echo in response
+// readBoundedBody reads the request body, refusing to buffer more than
+// maxAppendSize bytes. Both the declared Content-Length and the bytes actually
+// delivered are checked: a chunked request declares no length, and a lying
+// Content-Length must not be trusted either.
+func (h *Handler) readBoundedBody(r *http.Request) ([]byte, *protoError) {
+	tooLarge := newError(codePayloadTooLarge, fmt.Sprintf("request body exceeds maximum size of %d bytes", h.maxAppendSize))
+
+	if r.ContentLength > h.maxAppendSize {
+		return nil, tooLarge
+	}
+
+	body, err := io.ReadAll(io.LimitReader(r.Body, h.maxAppendSize+1))
+	if err != nil {
+		return nil, newError(codeBadRequest, "failed to read request body")
+	}
+	if int64(len(body)) > h.maxAppendSize {
+		return nil, tooLarge
+	}
+	return body, nil
+}
+
+// writeProducerRejection writes the response for a producer decision that is not
+// producerAccept, per the response codes in Section 5.2.1. tailOffset is the stream's
+// current tail, echoed on the idempotent-duplicate path.
+func writeProducerRejection(w http.ResponseWriter, decision producerDecision, tailOffset Offset) {
+	setSecurityHeaders(w)
+
+	switch decision.outcome {
+	case producerDuplicate:
+		// Already accepted: idempotent success, no data written.
+		w.Header().Set(protocol.HeaderStreamNextOffset, tailOffset.String())
+		w.Header().Set(protocol.HeaderProducerEpoch, strconv.FormatInt(decision.epoch, 10))
+		w.Header().Set(protocol.HeaderProducerSeq, strconv.FormatInt(decision.seq, 10))
+		w.WriteHeader(http.StatusNoContent)
+	case producerStaleEpoch:
+		// Zombie fencing: report the epoch that fenced this request.
+		w.Header().Set(protocol.HeaderProducerEpoch, strconv.FormatInt(decision.epoch, 10))
+		writeError(w, newError(codeForbidden, "stale producer epoch"))
+	case producerEpochRestart:
+		writeError(w, newError(codeBadRequest, "new epoch must start at seq=0"))
+	case producerGap:
+		w.Header().Set(protocol.HeaderProducerExpectedSeq, strconv.FormatInt(decision.expectedSeq, 10))
+		w.Header().Set(protocol.HeaderProducerReceivedSeq, strconv.FormatInt(decision.receivedSeq, 10))
+		writeError(w, newError(codeConflict, fmt.Sprintf("sequence gap: expected %d", decision.expectedSeq)))
+	case producerAccept:
+		// Not a rejection; callers must not reach this.
+		writeError(w, newError(codeInternal, "internal error"))
+	}
 }
 
 // handleAppend implements POST (Append) - Section 5.2
 func (h *Handler) handleAppend(w http.ResponseWriter, r *http.Request, streamID string) {
-	// Get stream info to validate content type
+	// Validate request-local metadata and buffer the bounded body before taking
+	// the per-stream mutation lock. A client that uploads slowly must not block
+	// DELETE, PUT, or another POST for the stream. Once the body is ready, the
+	// metadata snapshot, producer decision, and append are serialized together.
+	contentType := r.Header.Get("Content-Type")
+
+	// Parse and validate producer headers (Section 5.2.1)
+	producerID, producerEpoch, producerSeq, hasProducer, producerErr := h.parseProducerHeaders(r)
+	producerKeyTooLarge := producerErr == nil && hasProducer && len(streamID) > maxProducerKeyBytes-len(producerID)
+
+	// Get Stream-Seq if provided (separate from producer seq).
+	seq := r.Header.Get(protocol.HeaderStreamSeq)
+
+	body, protoErr := h.readBoundedBody(r)
+
+	// Parse and flatten JSON before entering the mutation critical section so a
+	// large request does not monopolize the stream lock. Defer reporting the
+	// error until after Head/Touch below: an origin write still resets sliding
+	// TTL even when the handler ultimately rejects its payload.
+	var messages [][]byte
+	var jsonErr error
+	if protoErr == nil && len(body) > 0 {
+		if protocol.IsJSONContentType(contentType) {
+			messages, jsonErr = protocol.ProcessJSONAppend(body)
+		} else {
+			messages = [][]byte{body}
+		}
+	}
+
+	// Keep the metadata snapshot, producer decision, and append bound to the
+	// same stream incarnation. Storage methods are keyed only by stream ID, so
+	// DELETE+PUT must not interleave this sequence.
+	unlock := h.mutations.lock(streamID)
+	defer unlock()
+
+	// Get stream info to validate content type.
 	info, err := h.storage.Head(r.Context(), streamID)
 	if err != nil {
 		writeStorageError(w, err)
 		return
 	}
 
-	// Validate Content-Type is present and matches stream (Section 5.2)
-	// Per spec: "MUST match the stream's existing content type"
-	// Per spec: "MUST return 409 Conflict when the content type is valid but does not match"
-	contentType := r.Header.Get("Content-Type")
+	// The stream exists and a write request has reached the origin, which is what
+	// resets the window — including for an append this handler goes on to reject,
+	// and for a POST that closes the stream without appending anything.
+	if err := h.touch(r, streamID); err != nil {
+		writeStorageError(w, err)
+		return
+	}
+
 	if contentType == "" {
 		writeError(w, newError(codeBadRequest, "Content-Type header required"))
 		return
 	}
+
+	// Per Section 5.2, Content-Type must match the existing stream. A valid but
+	// mismatched type receives 409 Conflict.
 	if !protocol.ContentTypesMatch(contentType, info.ContentType) {
 		writeError(w, newError(codeConflict, "content type mismatch"))
 		return
 	}
-
-	// Check Content-Length if provided (known size)
-	if r.ContentLength > h.maxAppendSize {
-		writeError(w, newError(codePayloadTooLarge, fmt.Sprintf("request body exceeds maximum size of %d bytes", h.maxAppendSize)))
+	if producerErr != nil {
+		writeError(w, newError(codeBadRequest, producerErr.Error()))
+		return
+	}
+	if producerKeyTooLarge {
+		writeError(w, newError(codeBadRequest, "stream and producer IDs exceed maximum combined size"))
+		return
+	}
+	if protoErr != nil {
+		writeError(w, protoErr)
+		return
+	}
+	if len(body) == 0 {
+		writeError(w, newError(codeBadRequest, "empty body not allowed"))
+		return
+	}
+	if jsonErr != nil {
+		writeError(w, newError(codeBadRequest, jsonErr.Error()))
 		return
 	}
 
-	// Parse and validate producer headers (Section 5.2.1)
-	producerID, producerEpoch, producerSeq, hasProducer, err := h.parseProducerHeaders(r)
-	if err != nil {
-		writeError(w, newError(codeBadRequest, err.Error()))
+	batchStorage, hasAtomicBatch := h.storage.(AtomicBatchStorage)
+	if len(messages) > 1 && !hasAtomicBatch {
+		writeError(w, newError(codeNotImplemented, "storage does not support atomic multi-message appends"))
 		return
 	}
 
-	// Validate producer state BEFORE reading body (for deduplication efficiency)
-	var producerRes *producerResult
+	// Per Section 5.2.1 "Concurrency Requirements", validation, append, and the state
+	// update MUST be serialized per (stream, producerId). The entry lock acquired here
+	// is therefore held for the remainder of the request: releasing it between
+	// validation and commit lets a pipelined seq=N+1 validate against state that
+	// seq=N has not yet committed, which reports a spurious sequence gap and wedges
+	// the producer for good.
+	var entry *producerEntry
 	if hasProducer {
-		producerRes, err = h.validateProducer(w, streamID, producerID, producerEpoch, producerSeq)
-		if err != nil {
-			// Error already written to response
+		entry = h.producers.acquire(producerKey{streamID: streamID, producerID: producerID})
+		if entry == nil {
+			writeError(w, newError(codeTooManyRequests, "producer state capacity reached"))
 			return
 		}
-		// If duplicate, return 204 immediately without reading body
-		if producerRes.isDuplicate {
-			setSecurityHeaders(w)
-			w.Header().Set(protocol.HeaderStreamNextOffset, info.NextOffset.String())
-			w.Header().Set(protocol.HeaderProducerEpoch, strconv.FormatInt(producerRes.epoch, 10))
-			w.Header().Set(protocol.HeaderProducerSeq, strconv.FormatInt(producerRes.highestSeq, 10))
-			w.WriteHeader(http.StatusNoContent)
+		defer h.producers.release(entry)
+
+		decision := entry.validate(producerEpoch, producerSeq)
+		if decision.outcome != producerAccept {
+			tailOffset := info.NextOffset
+			if decision.outcome == producerDuplicate {
+				// The initial Head happened before waiting for this producer's
+				// in-flight append. Refresh it so an idempotent retry cannot report
+				// the pre-append tail.
+				current, err := h.storage.Head(r.Context(), streamID)
+				if err != nil {
+					writeStorageError(w, err)
+					return
+				}
+				tailOffset = current.NextOffset
+			}
+			writeProducerRejection(w, decision, tailOffset)
 			return
 		}
 	}
-
-	// Get Stream-Seq if provided (separate from producer seq)
-	seq := r.Header.Get(protocol.HeaderStreamSeq)
 
 	var nextOffset Offset
 
-	// For JSON mode, we must buffer to parse/flatten arrays (Section 7.1)
-	if protocol.IsJSONContentType(contentType) {
-		// Buffer body for JSON parsing
-		body, err := io.ReadAll(io.LimitReader(r.Body, h.maxAppendSize+1))
-		if err != nil {
-			writeError(w, newError(codeBadRequest, "failed to read request body"))
-			return
-		}
-
-		// Reject empty body (Section 5.2)
-		// Per spec: "Servers MUST reject POST requests with an empty body...with 400 Bad Request"
-		if len(body) == 0 {
-			writeError(w, newError(codeBadRequest, "empty body not allowed"))
-			return
-		}
-
-		// Check size after reading (for chunked transfers without Content-Length)
-		if int64(len(body)) > h.maxAppendSize {
-			writeError(w, newError(codePayloadTooLarge, fmt.Sprintf("request body exceeds maximum size of %d bytes", h.maxAppendSize)))
-			return
-		}
-
-		messages, err := protocol.ProcessJSONAppend(body)
-		if err != nil {
-			writeError(w, newError(codeBadRequest, err.Error()))
-			return
-		}
-
-		// Append each message
-		for _, msg := range messages {
-			nextOffset, err = h.storage.Append(r.Context(), streamID, msg, seq)
-			if err != nil {
-				writeStorageError(w, err)
-				return
-			}
-			// Only use seq for first message to avoid multiple seq validations
-			seq = ""
-		}
+	if len(messages) > 1 {
+		nextOffset, err = batchStorage.AppendBatch(r.Context(), streamID, messages, seq)
 	} else {
-		// Non-JSON mode: read body and append
-		body, err := io.ReadAll(io.LimitReader(r.Body, h.maxAppendSize+1))
-		if err != nil {
-			writeError(w, newError(codeBadRequest, "failed to read request body"))
-			return
-		}
-
-		// Check if body was empty - Section 5.2
-		// Per spec: "Servers MUST reject POST requests with an empty body...with 400 Bad Request"
-		if len(body) == 0 {
-			writeError(w, newError(codeBadRequest, "empty body not allowed"))
-			return
-		}
-
-		// Check size limit
-		if int64(len(body)) > h.maxAppendSize {
-			writeError(w, newError(codePayloadTooLarge, fmt.Sprintf("request body exceeds maximum size of %d bytes", h.maxAppendSize)))
-			return
-		}
-
-		nextOffset, err = h.storage.Append(r.Context(), streamID, body, seq)
-		if err != nil {
-			writeStorageError(w, err)
-			return
-		}
+		nextOffset, err = h.storage.Append(r.Context(), streamID, messages[0], seq)
+	}
+	if err != nil {
+		writeStorageError(w, err)
+		return
 	}
 
 	// Commit producer state after successful append
 	if hasProducer {
-		h.commitProducerState(streamID, producerID, producerEpoch, producerSeq)
+		entry.commit(producerEpoch, producerSeq)
 	}
 
 	// Return success
@@ -453,6 +675,9 @@ func (h *Handler) parseProducerHeaders(r *http.Request) (producerID string, epoc
 
 	// Validate Producer-Id is non-empty (already checked above with hasID)
 	producerID = idStr
+	if len(producerID) > maxProducerIDBytes {
+		return "", 0, 0, false, fmt.Errorf("invalid Producer-Id: exceeds maximum size of %d bytes", maxProducerIDBytes)
+	}
 
 	// Parse and validate epoch (must be non-negative integer ≤ 2^53-1)
 	epoch, err = parseProducerInt(epochStr, "Producer-Epoch")
@@ -506,79 +731,7 @@ func parseProducerInt(s string, headerName string) (int64, error) {
 	return val, nil
 }
 
-// validateProducer implements the validation logic from Section 5.2.1.
-// Returns a producerResult or writes an error response and returns an error.
-func (h *Handler) validateProducer(w http.ResponseWriter, streamID, producerID string, epoch, seq int64) (*producerResult, error) {
-	h.producersMu.Lock()
-	defer h.producersMu.Unlock()
-
-	key := producerKey{streamID: streamID, producerID: producerID}
-	state := h.producers[key]
-
-	// New producer - validate seq starts at 0
-	if state == nil {
-		if seq != 0 {
-			setSecurityHeaders(w)
-			w.Header().Set(protocol.HeaderProducerExpectedSeq, "0")
-			w.Header().Set(protocol.HeaderProducerReceivedSeq, strconv.FormatInt(seq, 10))
-			writeError(w, newError(codeConflict, "sequence gap: expected 0"))
-			return nil, errors.New("sequence gap")
-		}
-		// Will be committed after successful append
-		return &producerResult{isNew: true, epoch: epoch, highestSeq: seq}, nil
-	}
-
-	// Epoch validation (client-declared, server-validated)
-	if epoch < state.epoch {
-		// Stale epoch - zombie fencing (403 Forbidden)
-		setSecurityHeaders(w)
-		w.Header().Set(protocol.HeaderProducerEpoch, strconv.FormatInt(state.epoch, 10))
-		writeError(w, newError(codeForbidden, "stale producer epoch"))
-		return nil, errors.New("stale epoch")
-	}
-
-	if epoch > state.epoch {
-		// New epoch - must start at seq=0
-		if seq != 0 {
-			writeError(w, newError(codeBadRequest, "new epoch must start at seq=0"))
-			return nil, errors.New("new epoch must start at seq=0")
-		}
-		// Will be committed after successful append
-		return &producerResult{isNew: true, epoch: epoch, highestSeq: seq}, nil
-	}
-
-	// Same epoch - sequence validation
-	if seq <= state.lastSeq {
-		// Duplicate (idempotent success)
-		return &producerResult{isDuplicate: true, epoch: state.epoch, highestSeq: state.lastSeq}, nil
-	}
-
-	if seq == state.lastSeq+1 {
-		// Valid next sequence - will be committed after successful append
-		return &producerResult{isNew: true, epoch: epoch, highestSeq: seq}, nil
-	}
-
-	// Sequence gap (seq > lastSeq + 1)
-	setSecurityHeaders(w)
-	w.Header().Set(protocol.HeaderProducerExpectedSeq, strconv.FormatInt(state.lastSeq+1, 10))
-	w.Header().Set(protocol.HeaderProducerReceivedSeq, strconv.FormatInt(seq, 10))
-	writeError(w, newError(codeConflict, "sequence gap"))
-	return nil, errors.New("sequence gap")
-}
-
-// commitProducerState updates the producer state after a successful append.
-func (h *Handler) commitProducerState(streamID, producerID string, epoch, seq int64) {
-	h.producersMu.Lock()
-	defer h.producersMu.Unlock()
-
-	key := producerKey{streamID: streamID, producerID: producerID}
-	h.producers[key] = &producerState{
-		epoch:   epoch,
-		lastSeq: seq,
-	}
-}
-
-// handleRead implements GET (Read) - Sections 5.5, 5.6, 5.7
+// handleRead implements GET (Read) - Sections 5.6, 5.7, 5.8
 func (h *Handler) handleRead(w http.ResponseWriter, r *http.Request, streamID string) {
 	// Reject duplicate query parameters
 	query := r.URL.Query()
@@ -590,6 +743,10 @@ func (h *Handler) handleRead(w http.ResponseWriter, r *http.Request, streamID st
 		writeError(w, newError(codeBadRequest, "duplicate live parameter"))
 		return
 	}
+	if len(query[protocol.QueryCursor]) > 1 {
+		writeError(w, newError(codeBadRequest, "duplicate cursor parameter"))
+		return
+	}
 
 	// Parse and validate offset query parameter
 	offsetStr := query.Get(protocol.QueryOffset)
@@ -598,33 +755,54 @@ func (h *Handler) handleRead(w http.ResponseWriter, r *http.Request, streamID st
 		writeError(w, newError(codeBadRequest, "offset cannot be empty"))
 		return
 	}
-	// Reject invalid offsets per spec Sections 6 and 10.2
+	// Reject invalid offsets per protocol Section 8.
 	if err := validateOffset(offsetStr); err != nil {
 		writeError(w, newError(codeBadRequest, err.Error()))
 		return
 	}
 	offset := Offset(offsetStr)
 
+	// Cursors generated by this server are bounded decimal interval numbers.
+	// Silently ignoring an oversized echoed cursor could return a smaller value
+	// and violate the monotonicity guarantee in Section 10.1, so reject it.
+	if cursor := query.Get(protocol.QueryCursor); cursor != "" && !protocol.ValidCursor(cursor) {
+		writeError(w, newError(codeBadRequest, "invalid cursor"))
+		return
+	}
+
 	// Route based on live query parameter
 	liveMode := query.Get(protocol.QueryLive)
 
 	switch liveMode {
 	case "":
-		// Catch-up read (Section 5.5)
+		// Catch-up read (Section 5.6)
 		h.handleCatchupRead(w, r, streamID, offset)
 	case protocol.LiveModeLongPoll:
-		// Long-poll read (Section 5.6)
+		// Long-poll read (Section 5.7)
 		h.handleLongPoll(w, r, streamID, offset)
 	case protocol.LiveModeSSE:
-		// SSE streaming (Section 5.7)
+		// SSE streaming (Section 5.8)
 		h.handleSSE(w, r, streamID, offset)
 	default:
 		writeError(w, newError(codeBadRequest, "invalid live parameter"))
 	}
 }
 
-// handleCatchupRead implements catch-up reads (Section 5.5)
+// handleCatchupRead implements catch-up reads (Section 5.6)
 func (h *Handler) handleCatchupRead(w http.ResponseWriter, r *http.Request, streamID string, offset Offset) {
+	// Bind the metadata (especially Content-Type), TTL renewal, and bytes to one
+	// incarnation. This is a short catch-up read, so holding the mutation lock does
+	// not prevent a writer needed to complete the request.
+	unlock := h.mutations.lock(streamID)
+	locked := true
+	releaseMutation := func() {
+		if locked {
+			unlock()
+			locked = false
+		}
+	}
+	defer releaseMutation()
+
 	// Get stream info for content type
 	info, err := h.storage.Head(r.Context(), streamID)
 	if err != nil {
@@ -632,12 +810,19 @@ func (h *Handler) handleCatchupRead(w http.ResponseWriter, r *http.Request, stre
 		return
 	}
 
-	// Get cursor parameter for CDN collapsing (Section 8.1)
+	// A catch-up read that reaches the origin resets the window; one served from
+	// a CDN never gets here, and per Section 5.1 must not reset it.
+	if err := h.touch(r, streamID); err != nil {
+		writeStorageError(w, err)
+		return
+	}
+	// Get cursor parameter for CDN collapsing (Section 10.1)
 	clientCursor := r.URL.Query().Get(protocol.QueryCursor)
 
-	// Handle offset=now sentinel (Section 6)
+	// Handle offset=now sentinel (Section 8)
 	// Returns empty response with current tail offset
 	if offset == Offset(protocol.OffsetNow) {
+		releaseMutation()
 		setSecurityHeaders(w)
 		w.Header().Set("Content-Type", info.ContentType)
 		w.Header().Set(protocol.HeaderStreamNextOffset, info.NextOffset.String())
@@ -660,17 +845,22 @@ func (h *Handler) handleCatchupRead(w http.ResponseWriter, r *http.Request, stre
 		writeStorageError(w, err)
 		return
 	}
+	if !incarnationMatches(info.IncarnationID, result.IncarnationID) {
+		writeStorageError(w, ErrNotFound)
+		return
+	}
+	releaseMutation()
 
-	// Compute ETag (Section 5.5)
-	// Format: "{streamID}:{start_offset}:{end_offset}"
-	// ETag must be quoted per HTTP spec (RFC 7232)
-	// Sanitize streamID to ensure no control characters in header value
-	etag := fmt.Sprintf(`"%s:%s:%s"`, sanitizeForETag(streamID), offset, result.NextOffset)
+	// Incarnation identity keeps a validator for a deleted stream from matching a
+	// replacement that happens to have the same offsets. Custom Storage
+	// implementations may omit identity; in that case no safe validator exists,
+	// so omit ETag and ignore If-None-Match rather than risk a false 304.
+	etag := makeETag(info.IncarnationID, offset, result.NextOffset)
 
-	// Check If-None-Match for 304 Not Modified (Section 8.1)
+	// Check If-None-Match for 304 Not Modified (Section 10.1)
 	// Per spec: "When a client provides a valid If-None-Match header that matches
 	// the current ETag, servers MUST respond with 304 Not Modified"
-	if ifNoneMatch := r.Header.Get("If-None-Match"); ifNoneMatch != "" {
+	if ifNoneMatch := r.Header.Get("If-None-Match"); etag != "" && ifNoneMatch != "" {
 		if etagMatches(ifNoneMatch, etag) {
 			setSecurityHeaders(w)
 			w.Header().Set("ETag", etag)
@@ -687,13 +877,14 @@ func (h *Handler) handleCatchupRead(w http.ResponseWriter, r *http.Request, stre
 	w.Header().Set(protocol.HeaderStreamNextOffset, result.NextOffset.String())
 	w.Header().Set(protocol.HeaderStreamCursor, protocol.GenerateCursor(clientCursor))
 
-	// Set Cache-Control (Section 8.1)
+	// Set Cache-Control (Section 10.1)
 	w.Header().Set("Cache-Control", cacheControlHeader(info.IsPrivate))
 
-	// Set ETag
-	w.Header().Set("ETag", etag)
+	if etag != "" {
+		w.Header().Set("ETag", etag)
+	}
 
-	// Set Stream-Up-To-Date if at tail (Section 5.5)
+	// Set Stream-Up-To-Date if at tail (Section 5.6)
 	if result.NextOffset.Compare(result.TailOffset) == 0 {
 		w.Header().Set(protocol.HeaderStreamUpToDate, "true")
 	}
@@ -705,7 +896,7 @@ func (h *Handler) handleCatchupRead(w http.ResponseWriter, r *http.Request, stre
 	_, _ = w.Write(responseBody)
 }
 
-// handleLongPoll implements long-poll reads (Section 5.6)
+// handleLongPoll implements long-poll reads (Section 5.7)
 func (h *Handler) handleLongPoll(w http.ResponseWriter, r *http.Request, streamID string, offset Offset) {
 	// Offset is required for long-poll
 	if offset.IsZero() {
@@ -713,8 +904,20 @@ func (h *Handler) handleLongPoll(w http.ResponseWriter, r *http.Request, streamI
 		return
 	}
 
-	// Get cursor parameter for CDN collapsing (Section 8.1)
+	// Get cursor parameter for CDN collapsing (Section 10.1)
 	clientCursor := r.URL.Query().Get(protocol.QueryCursor)
+	// Snapshot metadata and perform the initial read under the lifecycle lock.
+	// Before blocking, pin that incarnation and release the lock so POST can
+	// append the data this request is waiting for.
+	unlock := h.mutations.lock(streamID)
+	locked := true
+	releaseMutation := func() {
+		if locked {
+			unlock()
+			locked = false
+		}
+	}
+	defer releaseMutation()
 
 	// Fetch stream info once at the start - needed for offset=now and ContentType/IsPrivate
 	info, err := h.storage.Head(r.Context(), streamID)
@@ -723,7 +926,15 @@ func (h *Handler) handleLongPoll(w http.ResponseWriter, r *http.Request, streamI
 		return
 	}
 
-	// Handle offset=now sentinel (Section 6)
+	// Reset the window now that processing has begun, so a poll that waits and
+	// returns no data still counts as activity (Section 5.1).
+	if err := h.touch(r, streamID); err != nil {
+		writeStorageError(w, err)
+		return
+	}
+	timeoutOffset := info.NextOffset
+
+	// Handle offset=now sentinel (Section 8)
 	// For long-poll, immediately begin waiting (no initial empty response)
 	isOffsetNow := offset == Offset(protocol.OffsetNow)
 	if isOffsetNow {
@@ -737,16 +948,22 @@ func (h *Handler) handleLongPoll(w http.ResponseWriter, r *http.Request, streamI
 			writeStorageError(w, err)
 			return
 		}
+		if !incarnationMatches(info.IncarnationID, result.IncarnationID) {
+			writeStorageError(w, ErrNotFound)
+			return
+		}
+		timeoutOffset = result.TailOffset
 
 		// If messages available, return immediately
 		if len(result.Messages) > 0 {
+			releaseMutation()
 			setSecurityHeaders(w)
 			w.Header().Set("Content-Type", info.ContentType)
 			w.Header().Set(protocol.HeaderStreamNextOffset, result.NextOffset.String())
 			w.Header().Set(protocol.HeaderStreamCursor, protocol.GenerateCursor(clientCursor))
 			w.Header().Set("Cache-Control", cacheControlHeader(info.IsPrivate))
 
-			// Set Stream-Up-To-Date if at tail (per spec Section 5.6)
+			// Set Stream-Up-To-Date if at tail (per spec Section 5.7)
 			if result.NextOffset.Compare(result.TailOffset) == 0 {
 				w.Header().Set(protocol.HeaderStreamUpToDate, "true")
 			}
@@ -759,11 +976,29 @@ func (h *Handler) handleLongPoll(w http.ResponseWriter, r *http.Request, streamI
 		}
 	}
 
+	epoch := h.mutations.pin(streamID)
+	releaseMutation()
+	defer epoch.release()
+	liveCtx, cancelLive := epoch.context(r.Context())
+	defer cancelLive()
+
 	// No data available, wait for data to arrive
-	// Use the shorter of the request context deadline or longPollTimeout
-	waitCtx := r.Context()
-	deadline, hasDeadline := r.Context().Deadline()
+	// Use the shorter of the request context deadline, longPollTimeout, or half
+	// the sliding TTL. A live reader must not remain blocked until Storage expires
+	// the stream underneath it. Returning 204 early lets the client reconnect and
+	// renew the next window while leaving ample scheduling margin.
+	waitCtx := liveCtx
+	deadline, hasDeadline := liveCtx.Deadline()
 	timeout := h.longPollTimeout
+	if info.TTL > 0 {
+		ttlWake := info.TTL / 2
+		if ttlWake <= 0 {
+			ttlWake = info.TTL
+		}
+		if ttlWake < timeout {
+			timeout = ttlWake
+		}
+	}
 
 	if hasDeadline {
 		remaining := time.Until(deadline)
@@ -774,17 +1009,48 @@ func (h *Handler) handleLongPoll(w http.ResponseWriter, r *http.Request, streamI
 
 	if timeout > 0 {
 		var cancel context.CancelFunc
-		waitCtx, cancel = context.WithTimeout(r.Context(), timeout)
+		waitCtx, cancel = context.WithTimeout(liveCtx, timeout)
 		defer cancel()
 	}
 
 	// Wait for data atomically
 	result, err := h.storage.WaitForData(waitCtx, streamID, offset, h.chunkSize)
 	if err != nil {
-		// Timeout - return 204 No Content (per spec Section 5.6)
+		if epoch.invalidated() {
+			writeStorageError(w, ErrNotFound)
+			return
+		}
+		// Timeout - return 204 No Content (per spec Section 5.7)
 		if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
+			// A client-constructed future offset can remain ahead of newly appended
+			// data, so WaitForData may wake and continue waiting while the tail moves.
+			// Refresh after our own timeout to report the actual current tail. When
+			// the request context itself is canceled, no further storage operation is
+			// possible (and the client cannot receive the response), so retain the
+			// last known tail.
+			if r.Context().Err() == nil {
+				refreshUnlock := h.mutations.lock(streamID)
+				if epoch.invalidated() {
+					refreshUnlock()
+					writeStorageError(w, ErrNotFound)
+					return
+				}
+				current, headErr := h.storage.Head(r.Context(), streamID)
+				refreshUnlock()
+				if headErr != nil {
+					writeStorageError(w, headErr)
+					return
+				}
+				if !incarnationMatches(info.IncarnationID, current.IncarnationID) {
+					writeStorageError(w, ErrNotFound)
+					return
+				}
+				timeoutOffset = current.NextOffset
+			}
 			setSecurityHeaders(w)
-			w.Header().Set(protocol.HeaderStreamNextOffset, offset.String())
+			// A timeout reports the current tail, never the request's -1/now
+			// sentinel or a client-constructed future offset (Sections 5.7 and 8).
+			w.Header().Set(protocol.HeaderStreamNextOffset, timeoutOffset.String())
 			w.Header().Set(protocol.HeaderStreamCursor, protocol.GenerateCursor(clientCursor))
 			w.Header().Set(protocol.HeaderStreamUpToDate, "true")
 			w.WriteHeader(http.StatusNoContent)
@@ -794,6 +1060,14 @@ func (h *Handler) handleLongPoll(w http.ResponseWriter, r *http.Request, streamI
 		writeStorageError(w, err)
 		return
 	}
+	if epoch.invalidated() {
+		writeStorageError(w, ErrNotFound)
+		return
+	}
+	if !incarnationMatches(info.IncarnationID, result.IncarnationID) {
+		writeStorageError(w, ErrNotFound)
+		return
+	}
 
 	setSecurityHeaders(w)
 	w.Header().Set("Content-Type", info.ContentType)
@@ -801,7 +1075,7 @@ func (h *Handler) handleLongPoll(w http.ResponseWriter, r *http.Request, streamI
 	w.Header().Set(protocol.HeaderStreamCursor, protocol.GenerateCursor(clientCursor))
 	w.Header().Set("Cache-Control", cacheControlHeader(info.IsPrivate))
 
-	// Set Stream-Up-To-Date if at tail (per spec Section 5.6)
+	// Set Stream-Up-To-Date if at tail (per spec Section 5.7)
 	if result.NextOffset.Compare(result.TailOffset) == 0 {
 		w.Header().Set(protocol.HeaderStreamUpToDate, "true")
 	}
@@ -812,7 +1086,7 @@ func (h *Handler) handleLongPoll(w http.ResponseWriter, r *http.Request, streamI
 	_, _ = w.Write(responseBody)
 }
 
-// handleSSE implements SSE streaming (Section 5.7)
+// handleSSE implements SSE streaming (Section 5.8)
 func (h *Handler) handleSSE(w http.ResponseWriter, r *http.Request, streamID string, offset Offset) {
 	// Offset is required for SSE
 	if offset.IsZero() {
@@ -820,8 +1094,21 @@ func (h *Handler) handleSSE(w http.ResponseWriter, r *http.Request, streamID str
 		return
 	}
 
-	// Get cursor parameter for CDN collapsing (Section 8.1)
+	// Get cursor parameter for CDN collapsing (Section 10.1)
 	clientCursor := r.URL.Query().Get(protocol.QueryCursor)
+	// Capture metadata and validate the initial offset against one incarnation.
+	// The epoch token keeps that identity after the mutation lock is released,
+	// allowing appends while ensuring a DELETE+PUT replacement terminates rather
+	// than being decoded with the predecessor's Content-Type.
+	unlock := h.mutations.lock(streamID)
+	locked := true
+	releaseMutation := func() {
+		if locked {
+			unlock()
+			locked = false
+		}
+	}
+	defer releaseMutation()
 
 	// Get stream info
 	info, err := h.storage.Head(r.Context(), streamID)
@@ -830,14 +1117,19 @@ func (h *Handler) handleSSE(w http.ResponseWriter, r *http.Request, streamID str
 		return
 	}
 
-	// Validate content type supports SSE (Section 5.7, Section 7)
-	// Per spec: "ONLY valid for streams with content-type: text/* or application/json"
-	if !protocol.IsSSECompatible(info.ContentType) {
-		writeError(w, newError(codeBadRequest, "content type not compatible with SSE (must be text/* or application/json)"))
+	// SSE serves every content type (Section 5.8). text/* and application/json are
+	// carried as UTF-8 text; anything else is base64-encoded and announced with the
+	// Stream-SSE-Data-Encoding response header so clients know to decode it.
+	base64Data := protocol.SSERequiresBase64(info.ContentType)
+
+	// Renew before committing the streaming response. Once the headers have been
+	// flushed, a Touch failure can only be represented by terminating the stream.
+	if err := h.touch(r, streamID); err != nil {
+		writeStorageError(w, err)
 		return
 	}
 
-	// Handle offset=now sentinel (Section 6)
+	// Handle offset=now sentinel (Section 8)
 	// Start from tail position, sending initial control event with upToDate
 	isOffsetNow := offset == Offset(protocol.OffsetNow)
 	if isOffsetNow {
@@ -845,11 +1137,40 @@ func (h *Handler) handleSSE(w http.ResponseWriter, r *http.Request, streamID str
 		offset = info.NextOffset
 	}
 
+	// Let Storage validate its opaque offset before the 200 response is flushed.
+	// Generic URL validation cannot know a backend's offset syntax; without this
+	// read, values such as "bogus" produced a successful but immediately closed
+	// SSE stream instead of a 400 response.
+	var pendingResult *ReadResult
+	if !isOffsetNow {
+		pendingResult, err = h.storage.Read(r.Context(), streamID, offset, h.chunkSize)
+		if err != nil {
+			writeStorageError(w, err)
+			return
+		}
+		if !incarnationMatches(info.IncarnationID, pendingResult.IncarnationID) {
+			writeStorageError(w, ErrNotFound)
+			return
+		}
+	}
+	epoch := h.mutations.pin(streamID)
+	releaseMutation()
+	defer epoch.release()
+	liveCtx, cancelLive := epoch.context(r.Context())
+	defer cancelLive()
+	if epoch.invalidated() {
+		writeStorageError(w, ErrNotFound)
+		return
+	}
+
 	// Set SSE headers
 	setSecurityHeaders(w)
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
+	if base64Data {
+		w.Header().Set(protocol.HeaderStreamSSEDataEncoding, protocol.SSEDataEncodingBase64)
+	}
 
 	// Get flusher for streaming
 	flusher, ok := w.(http.Flusher)
@@ -868,10 +1189,9 @@ func (h *Handler) handleSSE(w http.ResponseWriter, r *http.Request, streamID str
 
 	currentOffset := offset
 
-	// For offset=now, send initial control event with upToDate: true (per spec Section 6)
+	// For offset=now, send initial control event with upToDate: true (per spec Section 8)
 	if isOffsetNow {
-		fmt.Fprintf(w, "event: control\n")
-		fmt.Fprintf(w, "data: {\"streamNextOffset\":\"%s\",\"upToDate\":true,\"streamCursor\":\"%s\"}\n\n", currentOffset, protocol.GenerateCursor(clientCursor))
+		writeSSEControlEvent(w, currentOffset.String(), true, protocol.GenerateCursor(clientCursor))
 		flusher.Flush()
 	}
 
@@ -889,14 +1209,34 @@ func (h *Handler) handleSSE(w http.ResponseWriter, r *http.Request, streamID str
 		select {
 		case <-closeTimer.C:
 			return
-		case <-r.Context().Done():
+		case <-liveCtx.Done():
 			return
 		default:
 		}
 
-		// Try to read data
-		result, err := h.storage.Read(r.Context(), streamID, currentOffset, h.chunkSize)
-		if err != nil {
+		var result *ReadResult
+		if pendingResult != nil {
+			result = pendingResult
+			pendingResult = nil
+		} else {
+			// An SSE connection can outlive several TTL windows, so it resets the
+			// countdown on every pass rather than only when processing began: a
+			// stream with a live reader attached must not expire underneath it
+			// (Section 5.1). The response is already committed, so failure closes it.
+			if err := h.storage.Touch(liveCtx, streamID); err != nil {
+				return
+			}
+
+			// Try to read data.
+			result, err = h.storage.Read(liveCtx, streamID, currentOffset, h.chunkSize)
+			if err != nil {
+				return
+			}
+		}
+		if epoch.invalidated() {
+			return
+		}
+		if !incarnationMatches(info.IncarnationID, result.IncarnationID) {
 			return
 		}
 
@@ -906,14 +1246,20 @@ func (h *Handler) handleSSE(w http.ResponseWriter, r *http.Request, streamID str
 			if !sentInitialControl {
 				if currentOffset.Compare(result.TailOffset) == 0 || result.NextOffset.Compare(result.TailOffset) == 0 {
 					sentInitialControl = true
-					fmt.Fprintf(w, "event: control\n")
-					fmt.Fprintf(w, "data: {\"streamNextOffset\":\"%s\",\"upToDate\":true,\"streamCursor\":\"%s\"}\n\n", result.NextOffset, protocol.GenerateCursor(clientCursor))
+					writeSSEControlEvent(w, result.NextOffset.String(), true, protocol.GenerateCursor(clientCursor))
 					flusher.Flush()
 				}
 			}
 
 			// Calculate wait timeout: min of keepalive interval and remaining close time
 			waitTimeout := keepaliveInterval
+			// A stream whose TTL is shorter than the keepalive interval would
+			// expire mid-wait, ending a connection the spec says must keep the
+			// stream alive. Wake early enough to touch it again; the cost is a
+			// keepalive comment per window, which SSE clients ignore.
+			if info.TTL > 0 && info.TTL/2 < waitTimeout {
+				waitTimeout = info.TTL / 2
+			}
 			if remaining := time.Until(closeDeadline); remaining < waitTimeout {
 				waitTimeout = remaining
 				if waitTimeout <= 0 {
@@ -923,11 +1269,14 @@ func (h *Handler) handleSSE(w http.ResponseWriter, r *http.Request, streamID str
 			}
 
 			// Wait for new data - storage handles efficient blocking
-			ctx, cancel := context.WithTimeout(r.Context(), waitTimeout)
+			ctx, cancel := context.WithTimeout(liveCtx, waitTimeout)
 			waitResult, err := h.storage.WaitForData(ctx, streamID, currentOffset, h.chunkSize)
 			cancel()
 
 			if err != nil {
+				if epoch.invalidated() {
+					return
+				}
 				// Check if parent context is done (client disconnect)
 				if r.Context().Err() != nil {
 					return
@@ -945,6 +1294,12 @@ func (h *Handler) handleSSE(w http.ResponseWriter, r *http.Request, streamID str
 				// Stream deleted or other error
 				return
 			}
+			if epoch.invalidated() {
+				return
+			}
+			if !incarnationMatches(info.IncarnationID, waitResult.IncarnationID) {
+				return
+			}
 
 			// Reuse waitResult directly instead of re-reading
 			result = waitResult
@@ -957,28 +1312,37 @@ func (h *Handler) handleSSE(w http.ResponseWriter, r *http.Request, streamID str
 			// Send data event
 			fmt.Fprintf(w, "event: data\n")
 
-			if protocol.IsJSONContentType(info.ContentType) {
+			switch {
+			case base64Data:
+				// Binary stream: standard base64 (RFC 4648) on a single data line.
+				// Section 5.8 permits splitting across lines; one line keeps the
+				// framing simple and is what clients must handle either way.
+				encoded := base64.StdEncoding.EncodeToString(concatenateMessages(result.Messages))
+				writeSSEDataLine(w, encoded)
+			case protocol.IsJSONContentType(info.ContentType):
 				jsonArray := formatResponseBody(result.Messages, info.ContentType)
-				fmt.Fprintf(w, "data: %s\n", string(jsonArray))
-			} else {
+				// JSON permits insignificant CR/LF between tokens. Every physical
+				// SSE line still needs its own data: prefix or a conforming client
+				// drops the unprefixed fragments and receives invalid JSON.
+				for _, line := range splitBySSELineTerminators(string(jsonArray)) {
+					writeSSEDataLine(w, line)
+				}
+			default:
 				// For text/*, send concatenated data split by lines.
 				// Per SSE spec, lines can be terminated by CR, LF, or CRLF.
 				// We must split by all terminators to prevent CRLF injection attacks.
 				data := concatenateMessages(result.Messages)
 				lines := splitBySSELineTerminators(string(data))
 				for _, line := range lines {
-					fmt.Fprintf(w, "data: %s\n", line)
+					writeSSEDataLine(w, line)
 				}
 			}
 			fmt.Fprintf(w, "\n")
 
-			// Send control event with cursor
-			fmt.Fprintf(w, "event: control\n")
-			if result.NextOffset.Compare(result.TailOffset) == 0 {
-				fmt.Fprintf(w, "data: {\"streamNextOffset\":\"%s\",\"upToDate\":true,\"streamCursor\":\"%s\"}\n\n", result.NextOffset, protocol.GenerateCursor(clientCursor))
-			} else {
-				fmt.Fprintf(w, "data: {\"streamNextOffset\":\"%s\",\"streamCursor\":\"%s\"}\n\n", result.NextOffset, protocol.GenerateCursor(clientCursor))
-			}
+			// Send control event with cursor (Section 5.8: streamCursor is required
+			// while the stream is open).
+			upToDate := result.NextOffset.Compare(result.TailOffset) == 0
+			writeSSEControlEvent(w, result.NextOffset.String(), upToDate, protocol.GenerateCursor(clientCursor))
 
 			flusher.Flush()
 			currentOffset = result.NextOffset
@@ -986,8 +1350,8 @@ func (h *Handler) handleSSE(w http.ResponseWriter, r *http.Request, streamID str
 	}
 }
 
-// handleHead implements HEAD (Metadata) - Section 5.4
-// Response codes: 200 OK, 404 Not Found, 429 Too Many Requests (Section 5.4)
+// handleHead implements HEAD (Metadata) - Section 5.5
+// Response codes: 200 OK, 404 Not Found, 429 Too Many Requests (Section 5.5)
 func (h *Handler) handleHead(w http.ResponseWriter, r *http.Request, streamID string) {
 	info, err := h.storage.Head(r.Context(), streamID)
 	if err != nil {
@@ -995,33 +1359,44 @@ func (h *Handler) handleHead(w http.ResponseWriter, r *http.Request, streamID st
 		return
 	}
 
-	// Set response headers per Section 5.4
+	// Set response headers per Section 5.5
 	setSecurityHeaders(w)
 	w.Header().Set("Content-Type", info.ContentType)                          // Per spec: stream's content type
 	w.Header().Set(protocol.HeaderStreamNextOffset, info.NextOffset.String()) // Per spec: current tail offset
 
-	// Set TTL/Expires-At if present (Section 5.4)
+	// Set TTL/Expires-At if present (Section 5.5)
 	if info.TTL > 0 {
 		w.Header().Set(protocol.HeaderStreamTTL, strconv.FormatInt(int64(info.TTL.Seconds()), 10))
 	}
 	if !info.ExpiresAt.IsZero() {
-		w.Header().Set(protocol.HeaderStreamExpiresAt, info.ExpiresAt.Format(time.RFC3339))
+		w.Header().Set(protocol.HeaderStreamExpiresAt, info.ExpiresAt.Format(time.RFC3339Nano))
 	}
 
-	// Set Cache-Control (Section 5.4)
+	// Set Cache-Control (Section 5.5)
 	w.Header().Set("Cache-Control", "no-store")
 
 	w.WriteHeader(http.StatusOK)
 }
 
-// handleDelete implements DELETE (Delete) - Section 5.3
-// Response codes: 204 No Content (success), 404 Not Found, 429 Too Many Requests (Section 5.3)
+// handleDelete implements DELETE (Delete) - Section 5.4
+// Response codes: 204 No Content (success), 404 Not Found, 429 Too Many Requests (Section 5.4)
 func (h *Handler) handleDelete(w http.ResponseWriter, r *http.Request, streamID string) {
+	unlock := h.mutations.lock(streamID)
+	defer unlock()
+
 	err := h.storage.Delete(r.Context(), streamID)
 	if err != nil {
 		writeStorageError(w, err)
 		return
 	}
+	// Wake live reads of the deleted incarnation before a later PUT can reuse the
+	// same stream ID.
+	h.mutations.bump(streamID)
+
+	// Producer state describes data that no longer exists. Keeping it would make the
+	// first append of a producer restarted against a recreated stream look like a
+	// duplicate (204) and silently discard the data (Section 5.2.1).
+	h.producers.forget(streamID)
 
 	setSecurityHeaders(w)
 	w.WriteHeader(http.StatusNoContent)
@@ -1111,12 +1486,81 @@ func splitBySSELineTerminators(s string) []string {
 	return lines
 }
 
+// sseControlEvent is the payload of an SSE control event (Section 5.8). Field
+// names are camelCase and the order below is the order they are serialized in.
+type sseControlEvent struct {
+	StreamNextOffset string `json:"streamNextOffset"`
+	UpToDate         bool   `json:"upToDate,omitempty"`
+	// StreamCursor is required while the stream is open and may only be omitted
+	// once the stream is closed, so it is empty only in that case.
+	StreamCursor string `json:"streamCursor,omitempty"`
+}
+
+// writeSSEControlEvent writes a complete SSE control event, including the
+// blank line that terminates it. Callers flush afterwards.
+func writeSSEControlEvent(w io.Writer, nextOffset string, upToDate bool, cursor string) {
+	payload, err := json.Marshal(sseControlEvent{
+		StreamNextOffset: nextOffset,
+		UpToDate:         upToDate,
+		StreamCursor:     cursor,
+	})
+	if err != nil {
+		// The struct holds only strings and a bool, so marshaling cannot fail;
+		// dropping the event is better than emitting a malformed one.
+		return
+	}
+	_, _ = fmt.Fprint(w, "event: control\n")
+	writeSSEDataLine(w, string(payload))
+	_, _ = fmt.Fprint(w, "\n")
+}
+
+// writeSSEDataLine writes a single SSE "data:" field holding value, which must
+// not contain a line terminator (callers split payloads with
+// splitBySSELineTerminators first).
+//
+// The value follows the colon with no separating space. The SSE parsing rules
+// strip at most one leading U+0020 from a data field, so a space is only
+// written when value itself starts with one — that way the byte a conforming
+// parser strips is always framing, never payload, and parsers that do not strip
+// still see the exact payload.
+func writeSSEDataLine(w io.Writer, value string) {
+	if strings.HasPrefix(value, " ") {
+		_, _ = fmt.Fprintf(w, "data: %s\n", value)
+		return
+	}
+	_, _ = fmt.Fprintf(w, "data:%s\n", value)
+}
+
 // setSecurityHeaders adds browser security headers to the response.
-// Per protocol Section 10.7, these headers prevent MIME-sniffing attacks
+// Per protocol Section 12.7, these headers prevent MIME-sniffing attacks
 // and cross-origin embedding exploits.
 func setSecurityHeaders(w http.ResponseWriter) {
 	w.Header().Set(headerXContentTypeOptions, "nosniff")
 	w.Header().Set(headerCrossOriginResourcePolicy, "cross-origin")
+}
+
+// setCORSHeaders makes the stream API usable from a browser on any origin.
+//
+// The allow-origin value is the wildcard rather than an echo of the request's
+// Origin: streams are served with cacheable Cache-Control values, and echoing
+// would make the response vary by origin in a way shared caches key on. The
+// wildcard also means credentials (cookies) are never sent — this handler
+// expects bearer credentials in the Authorization header instead.
+//
+// CORS is opt-in because allowing mutation methods from any website is unsafe
+// for unauthenticated or network-local deployments. Deployments that need a
+// narrower policy should leave HandlerConfig.EnableCORS false and wrap the
+// handler with middleware that owns the complete CORS policy.
+func (h *Handler) setCORSHeaders(w http.ResponseWriter) {
+	if !h.enableCORS {
+		return
+	}
+	headers := w.Header()
+	headers.Set(headerAccessControlAllowOrigin, "*")
+	headers.Set(headerAccessControlAllowMethods, corsAllowMethods)
+	headers.Set(headerAccessControlAllowHeaders, corsAllowHeaders)
+	headers.Set(headerAccessControlExposeHeaders, corsExposeHeaders)
+	headers.Set(headerAccessControlMaxAge, corsMaxAgeSeconds)
 }
 
 // writeError writes a JSON error response.
@@ -1130,7 +1574,10 @@ func writeError(w http.ResponseWriter, err *protoError) {
 // writeStorageError converts a storage error to an HTTP error response.
 // Handles both protoError (from internal use) and sentinel errors (from storage).
 func writeStorageError(w http.ResponseWriter, err error) {
-	if protoErr, ok := err.(*protoError); ok {
+	// errors.As, not a bare type assertion: storage backends wrap the protocol error
+	// they return, and a wrapped one must still map to its own status.
+	var protoErr *protoError
+	if errors.As(err, &protoErr) {
 		writeError(w, protoErr)
 		return
 	}
@@ -1147,8 +1594,15 @@ func writeStorageError(w http.ResponseWriter, err error) {
 		writeError(w, newError(codeBadRequest, err.Error()))
 	case errors.Is(err, ErrPayloadTooLarge):
 		writeError(w, newError(codePayloadTooLarge, err.Error()))
+	case errors.Is(err, ErrClosed):
+		// The storage backend is shutting down or already closed: the request may
+		// succeed against another instance or after a restart, so it is retryable.
+		writeError(w, newError(codeServiceUnavailable, "storage unavailable"))
 	default:
-		writeError(w, newError(codeInternal, err.Error()))
+		// Unclassified errors carry internal detail (file paths, driver messages)
+		// that must not reach a client, so the body is generic. There is no logger
+		// on Handler to record the detail; adding one is a separate change.
+		writeError(w, newError(codeInternal, "internal error"))
 	}
 }
 
@@ -1180,7 +1634,7 @@ func etagMatches(ifNoneMatch, etag string) bool {
 }
 
 // cacheControlHeader returns the appropriate Cache-Control header value based on stream privacy.
-// Per PROTOCOL.md Section 8.1:
+// Per PROTOCOL.md Section 10.1:
 //   - Shared, non-user-specific streams: "public, max-age=60, stale-while-revalidate=300"
 //   - User-specific or confidential streams: "private, max-age=60, stale-while-revalidate=300"
 func cacheControlHeader(isPrivate bool) string {
@@ -1190,41 +1644,63 @@ func cacheControlHeader(isPrivate bool) string {
 	return "public, max-age=60, stale-while-revalidate=300"
 }
 
-// sanitizeForETag encodes characters that are invalid in HTTP header values.
-// Per RFC 7230, header values must not contain NUL, CR, or LF characters.
-// We URL-encode any byte < 0x20 (control characters) or > 0x7E to ensure valid HTTP headers.
-func sanitizeForETag(s string) string {
-	var needsEncoding bool
-	for i := 0; i < len(s); i++ {
-		if s[i] < 0x20 || s[i] > 0x7E {
-			needsEncoding = true
-			break
-		}
-	}
-	if !needsEncoding {
-		return s
-	}
-
-	var buf strings.Builder
-	buf.Grow(len(s) * 3) // worst case: all bytes need encoding
-	for i := 0; i < len(s); i++ {
-		b := s[i]
-		if b < 0x20 || b > 0x7E {
-			buf.WriteString(fmt.Sprintf("%%%02X", b))
-		} else {
-			buf.WriteByte(b)
-		}
-	}
-	return buf.String()
+// incarnationMatches binds a Read result to the metadata snapshot used to
+// interpret it. Exact equality deliberately treats a Storage that populates
+// only one side as inconsistent; two empty values preserve compatibility with
+// implementations that do not expose optional incarnation identity.
+func incarnationMatches(infoID, resultID string) bool {
+	return infoID == resultID
 }
 
-// validateOffset validates an offset string per protocol Section 6 and 10.2.
+// makeETag returns an opaque, header-safe validator for one immutable range of
+// one stream incarnation. Length prefixes avoid ambiguity even though
+// incarnation IDs are arbitrary bytes. An empty incarnation ID cannot safely
+// distinguish delete/recreate cycles, so it produces no validator.
+func makeETag(incarnationID string, start, end Offset) string {
+	if incarnationID == "" {
+		return ""
+	}
+
+	digest := sha256.New()
+	var size [8]byte
+	writePart := func(part string) {
+		binary.BigEndian.PutUint64(size[:], uint64(len(part)))
+		_, _ = digest.Write(size[:])
+		_, _ = io.WriteString(digest, part)
+	}
+	writePart(incarnationID)
+	writePart(start.String())
+	writePart(end.String())
+
+	return fmt.Sprintf(`"%x"`, digest.Sum(nil))
+}
+
+// reservedPathSegment is the path prefix reserved for Durable Streams control APIs
+// (spec Section 6: subscriptions live at {stream-url}/__ds/subscriptions/:id).
+const reservedPathSegment = "__ds"
+
+// hasReservedSegment reports whether any segment of a stream path is the reserved
+// "__ds" segment. The spec reserves the first stream-root-relative segment, but the
+// stream root is defined by the (configurable) PathExtractor and is not visible here,
+// so every segment is checked. This is conservative: it rejects a few paths the spec
+// would allow, and never accepts one it reserves.
+func hasReservedSegment(streamID string) bool {
+	for _, segment := range strings.Split(streamID, "/") {
+		if segment == reservedPathSegment {
+			return true
+		}
+	}
+	return false
+}
+
+// validateOffset validates an offset string per protocol Sections 8 and 12.2.
 // Returns an error if the offset contains invalid characters or patterns.
 //
-// Per Section 6: Offsets MUST NOT contain commas, ampersands, equals signs,
-// or question marks (to avoid conflict with URL query parameter syntax).
+// Per Section 8: Offsets MUST NOT contain commas, ampersands, equals signs,
+// question marks, or slashes (to avoid conflict with URL query parameter and
+// path syntax).
 //
-// Per Section 10.2: Servers SHOULD validate and sanitize to prevent path
+// Per Section 12.2: Servers SHOULD validate and sanitize to prevent path
 // traversal attacks (patterns like "..").
 func validateOffset(offset string) error {
 	// Empty offset is valid (equivalent to stream start)
@@ -1232,8 +1708,8 @@ func validateOffset(offset string) error {
 		return nil
 	}
 
-	// Per Section 6: MUST NOT contain these URL query parameter conflict characters
-	if strings.ContainsAny(offset, ",&=?") {
+	// Per Section 8: MUST NOT contain these URL query parameter conflict characters
+	if strings.ContainsAny(offset, ",&=?/") {
 		return errors.New("invalid offset format")
 	}
 
@@ -1242,7 +1718,7 @@ func validateOffset(offset string) error {
 		return errors.New("invalid offset format")
 	}
 
-	// Per Section 10.2: prevent path traversal attacks
+	// Per Section 12.2: prevent path traversal attacks
 	// Check for ".." anywhere in the offset
 	if strings.Contains(offset, "..") {
 		return errors.New("invalid offset format")

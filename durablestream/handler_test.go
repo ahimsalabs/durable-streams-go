@@ -3,11 +3,14 @@ package durablestream_test
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -15,6 +18,38 @@ import (
 	"github.com/ahimsalabs/durable-streams-go/durablestream/internal/protocol"
 	"github.com/ahimsalabs/durable-streams-go/durablestream/storage/memorystorage"
 )
+
+// storageWithoutIncarnation models a third-party Storage written before
+// incarnation identity was added to the optional contract. The Handler must
+// remain compatible, but cannot issue a cache validator that survives safe
+// delete/recreate detection.
+type storageWithoutIncarnation struct {
+	durablestream.Storage
+}
+
+func (s storageWithoutIncarnation) Head(ctx context.Context, streamID string) (*durablestream.StreamInfo, error) {
+	info, err := s.Storage.Head(ctx, streamID)
+	if info != nil {
+		info.IncarnationID = ""
+	}
+	return info, err
+}
+
+func (s storageWithoutIncarnation) Read(ctx context.Context, streamID string, offset durablestream.Offset, limit int) (*durablestream.ReadResult, error) {
+	result, err := s.Storage.Read(ctx, streamID, offset, limit)
+	if result != nil {
+		result.IncarnationID = ""
+	}
+	return result, err
+}
+
+func (s storageWithoutIncarnation) WaitForData(ctx context.Context, streamID string, offset durablestream.Offset, limit int) (*durablestream.ReadResult, error) {
+	result, err := s.Storage.WaitForData(ctx, streamID, offset, limit)
+	if result != nil {
+		result.IncarnationID = ""
+	}
+	return result, err
+}
 
 func TestHandler_PUT_CreateStream(t *testing.T) {
 	tests := []struct {
@@ -75,6 +110,15 @@ func TestHandler_PUT_CreateStream(t *testing.T) {
 			contentType: "text/plain",
 			headers: map[string]string{
 				"Stream-TTL": "invalid",
+			},
+			wantStatus:  http.StatusBadRequest,
+			wantErrCode: "bad_request",
+		},
+		{
+			name:        "reject TTL that overflows time.Duration",
+			contentType: "text/plain",
+			headers: map[string]string{
+				"Stream-TTL": "9223372036854775807",
 			},
 			wantStatus:  http.StatusBadRequest,
 			wantErrCode: "bad_request",
@@ -471,6 +515,69 @@ func TestHandler_GET_LongPoll(t *testing.T) {
 		}
 	})
 
+	t.Run("timeout reports tail instead of start sentinel", func(t *testing.T) {
+		const streamID = "/empty-long-poll"
+		_, err := storage.Create(t.Context(), streamID, durablestream.StreamConfig{ContentType: "text/plain"})
+		if err != nil {
+			t.Fatalf("Create: %v", err)
+		}
+		info, err := storage.Head(t.Context(), streamID)
+		if err != nil {
+			t.Fatalf("Head: %v", err)
+		}
+
+		req := httptest.NewRequest(http.MethodGet, streamID+"?offset=-1&live=long-poll", nil)
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusNoContent {
+			t.Fatalf("status = %d, want %d", rec.Code, http.StatusNoContent)
+		}
+		if got := rec.Header().Get(protocol.HeaderStreamNextOffset); got != info.NextOffset.String() {
+			t.Errorf("Stream-Next-Offset = %q, want current tail %q", got, info.NextOffset)
+		}
+		if got := rec.Header().Get(protocol.HeaderStreamNextOffset); got == "-1" || got == "now" {
+			t.Errorf("server emitted reserved offset sentinel %q", got)
+		}
+	})
+
+	t.Run("timeout refreshes tail behind a future offset", func(t *testing.T) {
+		const streamID = "/future-long-poll"
+		_, err := storage.Create(t.Context(), streamID, durablestream.StreamConfig{ContentType: "text/plain"})
+		if err != nil {
+			t.Fatalf("Create: %v", err)
+		}
+
+		type appendResult struct {
+			offset durablestream.Offset
+			err    error
+		}
+		appended := make(chan appendResult, 1)
+		go func() {
+			time.Sleep(20 * time.Millisecond)
+			offset, err := storage.Append(context.Background(), streamID, []byte("still before requested offset"), "")
+			appended <- appendResult{offset: offset, err: err}
+		}()
+
+		// This syntactically valid opaque offset sorts beyond the offset the append
+		// above will mint. The append wakes WaitForData, but supplies no data after
+		// the requested position, so the request still reaches its timeout.
+		req := httptest.NewRequest(http.MethodGet, streamID+"?offset=9999999999999999_9999999999999999&live=long-poll", nil)
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+		result := <-appended
+		if result.err != nil {
+			t.Fatalf("Append: %v", result.err)
+		}
+
+		if rec.Code != http.StatusNoContent {
+			t.Fatalf("status = %d, want %d", rec.Code, http.StatusNoContent)
+		}
+		if got := rec.Header().Get(protocol.HeaderStreamNextOffset); got != result.offset.String() {
+			t.Errorf("Stream-Next-Offset = %q, want refreshed tail %q", got, result.offset)
+		}
+	})
+
 	t.Run("return when data arrives", func(t *testing.T) {
 		req := httptest.NewRequest(http.MethodGet, "/stream?offset="+offset.String()+"&live=long-poll", nil)
 		rec := httptest.NewRecorder()
@@ -504,6 +611,20 @@ func TestHandler_GET_LongPoll(t *testing.T) {
 			t.Errorf("status = %d, want %d", rec.Code, http.StatusBadRequest)
 		}
 	})
+}
+
+func TestHandler_GET_RejectsInvalidCursor(t *testing.T) {
+	storage := memorystorage.New()
+	handler := durablestream.NewHandler(storage, nil)
+
+	for _, cursor := range []string{"not-decimal", strings.Repeat("9", 65)} {
+		req := httptest.NewRequest(http.MethodGet, "/stream?cursor="+cursor, nil)
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+		if rec.Code != http.StatusBadRequest {
+			t.Errorf("cursor %q status = %d, want 400", cursor, rec.Code)
+		}
+	}
 }
 
 func TestHandler_GET_SSE(t *testing.T) {
@@ -567,18 +688,27 @@ func TestHandler_GET_SSE(t *testing.T) {
 		}
 	})
 
-	t.Run("reject incompatible content type", func(t *testing.T) {
-		// Create binary stream
+	t.Run("binary content type is served base64-encoded", func(t *testing.T) {
+		// Per spec Section 5.8, SSE supports all content types: binary streams are
+		// base64-encoded and announced with Stream-SSE-Data-Encoding: base64.
 		_, _ = storage.Create(context.Background(), "/binary-stream", durablestream.StreamConfig{
 			ContentType: "application/octet-stream",
 		})
 
 		req := httptest.NewRequest(http.MethodGet, "/binary-stream?offset=0000000000000000_0000000000000000&live=sse", nil)
 		rec := httptest.NewRecorder()
+
+		ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+		defer cancel()
+		req = req.WithContext(ctx)
+
 		handler.ServeHTTP(rec, req)
 
-		if rec.Code != http.StatusBadRequest {
-			t.Errorf("status = %d, want %d", rec.Code, http.StatusBadRequest)
+		if rec.Code != http.StatusOK {
+			t.Errorf("status = %d, want %d", rec.Code, http.StatusOK)
+		}
+		if got := rec.Header().Get(protocol.HeaderStreamSSEDataEncoding); got != "base64" {
+			t.Errorf("%s = %q, want %q", protocol.HeaderStreamSSEDataEncoding, got, "base64")
 		}
 	})
 
@@ -626,7 +756,7 @@ func TestHandler_GET_SSE(t *testing.T) {
 		body := rec.Body.String()
 
 		// Count actual SSE event types (lines that START with "event: control")
-		// vs escaped data (lines that start with "data: event: control").
+		// vs escaped data (lines that start with "data:event: control").
 		// The injected one should appear as a data line, not an SSE command.
 		actualControlEvents := 0
 		escapedControlStrings := 0
@@ -634,7 +764,7 @@ func TestHandler_GET_SSE(t *testing.T) {
 			if strings.HasPrefix(line, "event: control") {
 				actualControlEvents++
 			}
-			if strings.HasPrefix(line, "data: event: control") {
+			if strings.HasPrefix(line, "data:event: control") {
 				escapedControlStrings++
 			}
 		}
@@ -652,7 +782,7 @@ func TestHandler_GET_SSE(t *testing.T) {
 		}
 
 		// Verify the injected data payload also appears as a data line
-		if !strings.Contains(body, "data: data: {\"cr_injected\":true}") {
+		if !strings.Contains(body, "data:data: {\"cr_injected\":true}") {
 			t.Errorf("Expected injected data to be escaped as data line. Body:\n%s", body)
 		}
 	})
@@ -702,6 +832,31 @@ func TestHandler_HEAD_Metadata(t *testing.T) {
 	// Body should be empty for HEAD
 	if rec.Body.Len() > 0 {
 		t.Errorf("HEAD response has body: %s", rec.Body.String())
+	}
+}
+
+func TestHandler_HEAD_PreservesExpiresAtPrecision(t *testing.T) {
+	storage := memorystorage.New()
+	handler := durablestream.NewHandler(storage, nil)
+	expiresAt := time.Now().UTC().Add(time.Hour).Truncate(time.Second).Add(123456789 * time.Nanosecond)
+
+	_, err := storage.Create(context.Background(), "/stream", durablestream.StreamConfig{
+		ContentType: "text/plain",
+		ExpiresAt:   expiresAt,
+	})
+	if err != nil {
+		t.Fatalf("Create() error = %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodHead, "/stream", nil)
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusOK)
+	}
+	if got, want := rec.Header().Get(protocol.HeaderStreamExpiresAt), expiresAt.Format(time.RFC3339Nano); got != want {
+		t.Fatalf("Stream-Expires-At = %q, want %q", got, want)
 	}
 }
 
@@ -1250,6 +1405,83 @@ func TestHandler_GET_ETagAndIfNoneMatch(t *testing.T) {
 		}
 	})
 
+	t.Run("old ETag cannot validate a replacement at the same offsets", func(t *testing.T) {
+		storage := memorystorage.New()
+		t.Cleanup(func() { _ = storage.Close() })
+		handler := durablestream.NewHandler(storage, nil)
+		const path = "/recreated-etag"
+		cfg := durablestream.StreamConfig{ContentType: "text/plain"}
+
+		if created, err := storage.Create(context.Background(), path, cfg); err != nil || !created {
+			t.Fatalf("Create(old) = (%v, %v), want (true, nil)", created, err)
+		}
+		if _, err := storage.Append(context.Background(), path, []byte("old!"), ""); err != nil {
+			t.Fatalf("Append(old): %v", err)
+		}
+
+		first := httptest.NewRecorder()
+		handler.ServeHTTP(first, httptest.NewRequest(http.MethodGet, path+"?offset=0000000000000000_0000000000000000", nil))
+		if first.Code != http.StatusOK {
+			t.Fatalf("first GET status = %d, want 200", first.Code)
+		}
+		oldETag := first.Header().Get("ETag")
+		if oldETag == "" {
+			t.Fatal("first GET omitted ETag")
+		}
+
+		if err := storage.Delete(context.Background(), path); err != nil {
+			t.Fatalf("Delete(old): %v", err)
+		}
+		if created, err := storage.Create(context.Background(), path, cfg); err != nil || !created {
+			t.Fatalf("Create(replacement) = (%v, %v), want (true, nil)", created, err)
+		}
+		if _, err := storage.Append(context.Background(), path, []byte("new!"), ""); err != nil {
+			t.Fatalf("Append(replacement): %v", err)
+		}
+
+		req := httptest.NewRequest(http.MethodGet, path+"?offset=0000000000000000_0000000000000000", nil)
+		req.Header.Set("If-None-Match", oldETag)
+		second := httptest.NewRecorder()
+		handler.ServeHTTP(second, req)
+		if second.Code != http.StatusOK {
+			t.Fatalf("replacement GET status = %d, want 200", second.Code)
+		}
+		if got := second.Body.String(); got != "new!" {
+			t.Fatalf("replacement GET body = %q, want %q", got, "new!")
+		}
+		if newETag := second.Header().Get("ETag"); newETag == "" || newETag == oldETag {
+			t.Fatalf("replacement ETag = %q, want non-empty and different from %q", newETag, oldETag)
+		}
+	})
+
+	t.Run("storage without incarnation identity omits ETag and ignores condition", func(t *testing.T) {
+		base := memorystorage.New()
+		t.Cleanup(func() { _ = base.Close() })
+		const path = "/no-incarnation-etag"
+		if created, err := base.Create(context.Background(), path, durablestream.StreamConfig{ContentType: "text/plain"}); err != nil || !created {
+			t.Fatalf("Create() = (%v, %v), want (true, nil)", created, err)
+		}
+		if _, err := base.Append(context.Background(), path, []byte("data"), ""); err != nil {
+			t.Fatalf("Append(): %v", err)
+		}
+
+		handler := durablestream.NewHandler(storageWithoutIncarnation{Storage: base}, nil)
+		req := httptest.NewRequest(http.MethodGet, path+"?offset=0000000000000000_0000000000000000", nil)
+		req.Header.Set("If-None-Match", "*")
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status = %d, want 200", rec.Code)
+		}
+		if got := rec.Header().Get("ETag"); got != "" {
+			t.Fatalf("ETag = %q, want omitted", got)
+		}
+		if got := rec.Body.String(); got != "data" {
+			t.Fatalf("body = %q, want %q", got, "data")
+		}
+	})
+
 	t.Run("no 304 for offset=now", func(t *testing.T) {
 		// offset=now should never return 304 (per spec: no ETag for offset=now responses)
 		req := httptest.NewRequest(http.MethodGet, "/stream?offset=now", nil)
@@ -1263,7 +1495,7 @@ func TestHandler_GET_ETagAndIfNoneMatch(t *testing.T) {
 		}
 	})
 
-	t.Run("ETag is valid with stream ID containing control characters", func(t *testing.T) {
+	t.Run("ETag does not expose stream ID control characters", func(t *testing.T) {
 		storage := memorystorage.New()
 
 		// Create stream with control character in path (null byte)
@@ -1297,9 +1529,9 @@ func TestHandler_GET_ETagAndIfNoneMatch(t *testing.T) {
 		if strings.Contains(etag, "\x00") {
 			t.Errorf("ETag contains raw null byte: %q", etag)
 		}
-		// ETag should contain the encoded null byte (%00)
-		if !strings.Contains(etag, "%00") {
-			t.Errorf("ETag should contain encoded null byte (%%00), got: %q", etag)
+		// Validators are opaque SHA-256 digests, not escaped stream IDs.
+		if len(etag) != 66 || strings.Contains(etag, "%00") || strings.Contains(etag, "stream") {
+			t.Errorf("ETag should be an opaque quoted SHA-256 digest, got: %q", etag)
 		}
 	})
 }
@@ -2176,5 +2408,492 @@ func TestHandler_POST_IdempotentProducer_InitialSequenceGap(t *testing.T) {
 	// Check expected seq header
 	if rec.Header().Get(protocol.HeaderProducerExpectedSeq) != "0" {
 		t.Errorf("Producer-Expected-Seq = %q, want 0", rec.Header().Get(protocol.HeaderProducerExpectedSeq))
+	}
+}
+
+// sseControlPayload returns the JSON payload of the first SSE control event in
+// body, decoded into a map. It fails the test if no control event is present.
+//
+// The lookup is deliberately literal about framing — "event: control" followed
+// by a "data:" line whose value starts immediately after the colon — because
+// the framing itself is what several callers are asserting on.
+func sseControlPayload(t *testing.T, body string) map[string]any {
+	t.Helper()
+
+	lines := strings.Split(body, "\n")
+	for i, line := range lines {
+		if line != "event: control" || i+1 >= len(lines) {
+			continue
+		}
+		data, ok := strings.CutPrefix(lines[i+1], "data:")
+		if !ok {
+			t.Fatalf("control event not followed by a data line, got %q:\n%s", lines[i+1], body)
+		}
+		var payload map[string]any
+		if err := json.Unmarshal([]byte(data), &payload); err != nil {
+			t.Fatalf("control payload %q is not JSON: %v", data, err)
+		}
+		return payload
+	}
+
+	t.Fatalf("no control event in SSE body:\n%s", body)
+	return nil
+}
+
+// serveSSE runs one SSE request against handler and returns the response body.
+// The handler streams until its close deadline, so the caller's stream must be
+// created on a handler with a short SSECloseAfter.
+func serveSSE(t *testing.T, handler http.Handler, url string) *httptest.ResponseRecorder {
+	t.Helper()
+
+	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
+	defer cancel()
+
+	req := httptest.NewRequest(http.MethodGet, url, nil).WithContext(ctx)
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200. Body: %s", rec.Code, rec.Body.String())
+	}
+	return rec
+}
+
+func TestHandler_SSE_BackendRejectsMalformedOffsetBeforeHeaders(t *testing.T) {
+	storage := memorystorage.New()
+	handler := durablestream.NewHandler(storage, &durablestream.HandlerConfig{
+		SSECloseAfter: 10 * time.Millisecond,
+	})
+	if _, err := storage.Create(t.Context(), "/offset-stream", durablestream.StreamConfig{
+		ContentType: "text/plain",
+	}); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/offset-stream?offset=bogus&live=sse", nil)
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400 before SSE headers are committed (body %q)", rec.Code, rec.Body.String())
+	}
+	if got := rec.Header().Get("Content-Type"); got == "text/event-stream" {
+		t.Fatalf("malformed offset committed SSE Content-Type %q", got)
+	}
+}
+
+// Section 5.8: control events MUST carry streamCursor while the stream is open,
+// and Section 10.1 defines the cursor as a decimal interval number.
+func TestHandler_SSE_ControlEvent_CarriesNumericStreamCursor(t *testing.T) {
+	storage := memorystorage.New()
+	handler := durablestream.NewHandler(storage, &durablestream.HandlerConfig{
+		SSECloseAfter: 50 * time.Millisecond,
+	})
+
+	if _, err := storage.Create(t.Context(), "/cursor-stream", durablestream.StreamConfig{
+		ContentType: "text/plain",
+	}); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if _, err := storage.Append(t.Context(), "/cursor-stream", []byte("test data"), ""); err != nil {
+		t.Fatalf("Append: %v", err)
+	}
+
+	rec := serveSSE(t, handler, "/cursor-stream?offset=-1&live=sse")
+	payload := sseControlPayload(t, rec.Body.String())
+
+	cursor, ok := payload["streamCursor"].(string)
+	if !ok {
+		t.Fatalf("control payload has no streamCursor string: %v", payload)
+	}
+	if _, err := strconv.ParseUint(cursor, 10, 64); err != nil {
+		t.Errorf("streamCursor = %q, want a decimal number: %v", cursor, err)
+	}
+	if payload["streamNextOffset"] == "" {
+		t.Errorf("control payload missing streamNextOffset: %v", payload)
+	}
+}
+
+// Section 10.1: when the client echoes a cursor greater than or equal to the
+// current interval, the server MUST return a strictly greater one so CDN cache
+// keys keep advancing. This is the SSE half of that rule.
+func TestHandler_SSE_EchoedCursor_AdvancesWithJitter(t *testing.T) {
+	storage := memorystorage.New()
+	handler := durablestream.NewHandler(storage, &durablestream.HandlerConfig{
+		SSECloseAfter: 50 * time.Millisecond,
+	})
+
+	if _, err := storage.Create(t.Context(), "/jitter-stream", durablestream.StreamConfig{
+		ContentType: "text/plain",
+	}); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if _, err := storage.Append(t.Context(), "/jitter-stream", []byte("test data"), ""); err != nil {
+		t.Fatalf("Append: %v", err)
+	}
+
+	first := sseControlPayload(t, serveSSE(t, handler, "/jitter-stream?offset=-1&live=sse").Body.String())
+	cursor1, _ := first["streamCursor"].(string)
+
+	second := sseControlPayload(t, serveSSE(t,
+		handler, "/jitter-stream?offset=-1&live=sse&cursor="+cursor1).Body.String())
+	cursor2, _ := second["streamCursor"].(string)
+
+	n1, err := strconv.ParseUint(cursor1, 10, 64)
+	if err != nil {
+		t.Fatalf("first cursor %q is not numeric: %v", cursor1, err)
+	}
+	n2, err := strconv.ParseUint(cursor2, 10, 64)
+	if err != nil {
+		t.Fatalf("second cursor %q is not numeric: %v", cursor2, err)
+	}
+	if n2 <= n1 {
+		t.Errorf("echoed cursor %d did not advance past %d", n2, n1)
+	}
+}
+
+// Section 5.8: each line of a payload becomes its own data: field. The value
+// starts immediately after the colon so that consumers stripping the single
+// optional space defined by the SSE parsing rules cannot eat payload bytes.
+func TestHandler_SSE_MultilinePayload_SplitsIntoUnpaddedDataLines(t *testing.T) {
+	storage := memorystorage.New()
+	handler := durablestream.NewHandler(storage, &durablestream.HandlerConfig{
+		SSECloseAfter: 50 * time.Millisecond,
+	})
+
+	if _, err := storage.Create(t.Context(), "/newline-stream", durablestream.StreamConfig{
+		ContentType: "text/plain",
+	}); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if _, err := storage.Append(t.Context(), "/newline-stream", []byte("line1\nline2\nline3"), ""); err != nil {
+		t.Fatalf("Append: %v", err)
+	}
+
+	body := serveSSE(t, handler, "/newline-stream?offset=-1&live=sse").Body.String()
+
+	if !strings.Contains(body, "event: data\n") {
+		t.Errorf("body missing data event:\n%s", body)
+	}
+	for _, want := range []string{"data:line1\n", "data:line2\n", "data:line3\n"} {
+		if !strings.Contains(body, want) {
+			t.Errorf("body missing %q:\n%s", want, body)
+		}
+	}
+	if strings.Contains(body, "data: line") {
+		t.Errorf("data lines are padded with a space, which a conforming SSE parser would strip:\n%s", body)
+	}
+}
+
+// A payload line that itself starts with a space must survive the round trip,
+// so the framing space is written back before it — the byte a conforming parser
+// strips is then framing rather than payload.
+func TestHandler_SSE_LeadingSpacePayload_SurvivesSSEUnescaping(t *testing.T) {
+	storage := memorystorage.New()
+	handler := durablestream.NewHandler(storage, &durablestream.HandlerConfig{
+		SSECloseAfter: 50 * time.Millisecond,
+	})
+
+	if _, err := storage.Create(t.Context(), "/space-stream", durablestream.StreamConfig{
+		ContentType: "text/plain",
+	}); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if _, err := storage.Append(t.Context(), "/space-stream", []byte("  indented"), ""); err != nil {
+		t.Fatalf("Append: %v", err)
+	}
+
+	body := serveSSE(t, handler, "/space-stream?offset=-1&live=sse").Body.String()
+
+	if !strings.Contains(body, "data:   indented\n") {
+		t.Errorf("leading-space payload not padded for SSE unescaping:\n%s", body)
+	}
+}
+
+// Browsers preflight any request carrying a non-safelisted header. If-None-Match
+// is the one the conditional catch-up read of Section 10.1 depends on.
+func TestHandler_OPTIONS_PreflightAllowsProtocolHeaders(t *testing.T) {
+	handler := durablestream.NewHandler(memorystorage.New(), &durablestream.HandlerConfig{EnableCORS: true})
+
+	// A preflight arrives before the stream exists, so it must not depend on one.
+	req := httptest.NewRequest(http.MethodOptions, "/no-such-stream", nil)
+	req.Header.Set("Origin", "https://example.com")
+	req.Header.Set("Access-Control-Request-Method", http.MethodGet)
+	req.Header.Set("Access-Control-Request-Headers", "if-none-match")
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusNoContent {
+		t.Errorf("status = %d, want %d. Body: %s", rec.Code, http.StatusNoContent, rec.Body.String())
+	}
+
+	allowHeaders := strings.ToLower(rec.Header().Get("Access-Control-Allow-Headers"))
+	for _, want := range []string{"if-none-match", "content-type", "stream-ttl", "producer-id"} {
+		if !strings.Contains(allowHeaders, want) {
+			t.Errorf("Access-Control-Allow-Headers = %q, want it to include %q", allowHeaders, want)
+		}
+	}
+
+	allowMethods := rec.Header().Get("Access-Control-Allow-Methods")
+	for _, want := range []string{http.MethodGet, http.MethodPut, http.MethodPost, http.MethodDelete, http.MethodHead} {
+		if !strings.Contains(allowMethods, want) {
+			t.Errorf("Access-Control-Allow-Methods = %q, want it to include %q", allowMethods, want)
+		}
+	}
+
+	if got := rec.Header().Get("Access-Control-Allow-Origin"); got != "*" {
+		t.Errorf("Access-Control-Allow-Origin = %q, want *", got)
+	}
+}
+
+// Protocol headers are unreadable from a browser unless they are exposed, so
+// every response — not just the preflight — carries the CORS headers.
+func TestHandler_GET_ExposesProtocolHeadersToBrowsers(t *testing.T) {
+	storage := memorystorage.New()
+	handler := durablestream.NewHandler(storage, &durablestream.HandlerConfig{EnableCORS: true})
+
+	if _, err := storage.Create(t.Context(), "/cors-stream", durablestream.StreamConfig{
+		ContentType: "text/plain",
+	}); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/cors-stream", nil)
+	req.Header.Set("Origin", "https://example.com")
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if got := rec.Header().Get("Access-Control-Allow-Origin"); got != "*" {
+		t.Errorf("Access-Control-Allow-Origin = %q, want *", got)
+	}
+	exposed := rec.Header().Get("Access-Control-Expose-Headers")
+	for _, want := range []string{
+		protocol.HeaderStreamNextOffset,
+		protocol.HeaderStreamCursor,
+		protocol.HeaderProducerEpoch,
+		protocol.HeaderProducerSeq,
+		"ETag",
+		"Location",
+	} {
+		if !strings.Contains(exposed, want) {
+			t.Errorf("Access-Control-Expose-Headers = %q, want it to include %q", exposed, want)
+		}
+	}
+}
+
+func TestHandler_DefaultCORSLeavesPolicyToOuterMiddleware(t *testing.T) {
+	handler := durablestream.NewHandler(memorystorage.New(), nil)
+	outer := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Access-Control-Allow-Origin", "https://trusted.example")
+		handler.ServeHTTP(w, r)
+	})
+
+	req := httptest.NewRequest(http.MethodOptions, "/stream", nil)
+	rec := httptest.NewRecorder()
+	outer.ServeHTTP(rec, req)
+
+	if got := rec.Header().Get("Access-Control-Allow-Origin"); got != "https://trusted.example" {
+		t.Errorf("Access-Control-Allow-Origin = %q, want outer policy", got)
+	}
+	if got := rec.Header().Get("Access-Control-Allow-Methods"); got != "" {
+		t.Errorf("handler installed Access-Control-Allow-Methods %q without CORS enabled", got)
+	}
+}
+
+// touchCountingStorage records which requests reset a stream's sliding TTL
+// window. It counts rather than watches a clock, so the test asserts the
+// protocol rule itself — which methods count as activity — without waiting for
+// anything to expire.
+type touchCountingStorage struct {
+	durablestream.Storage
+
+	mu      sync.Mutex
+	touches int
+}
+
+func (s *touchCountingStorage) Touch(ctx context.Context, streamID string) error {
+	s.mu.Lock()
+	s.touches++
+	s.mu.Unlock()
+	return s.Storage.Touch(ctx, streamID)
+}
+
+func (s *touchCountingStorage) touchCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.touches
+}
+
+// Section 5.1: a sliding TTL is reset by every read and write that reaches the
+// origin, and by nothing else — HEAD in particular must leave it alone.
+func TestHandler_SlidingTTL_ResetsOnReadsAndWritesOnly(t *testing.T) {
+	tests := []struct {
+		name       string
+		newRequest func() *http.Request
+		wantReset  bool
+	}{
+		{
+			name: "GET catch-up read",
+			newRequest: func() *http.Request {
+				return httptest.NewRequest(http.MethodGet, "/ttl-stream", nil)
+			},
+			wantReset: true,
+		},
+		{
+			name: "GET at the tail with offset=now",
+			newRequest: func() *http.Request {
+				return httptest.NewRequest(http.MethodGet, "/ttl-stream?offset=now", nil)
+			},
+			wantReset: true,
+		},
+		{
+			name: "GET long-poll that times out with no data",
+			newRequest: func() *http.Request {
+				return httptest.NewRequest(http.MethodGet, "/ttl-stream?live=long-poll&offset=now", nil)
+			},
+			wantReset: true,
+		},
+		{
+			name: "POST append",
+			newRequest: func() *http.Request {
+				req := httptest.NewRequest(http.MethodPost, "/ttl-stream", strings.NewReader("data"))
+				req.Header.Set("Content-Type", "text/plain")
+				return req
+			},
+			wantReset: true,
+		},
+		{
+			name: "POST rejected for a mismatched content type",
+			newRequest: func() *http.Request {
+				req := httptest.NewRequest(http.MethodPost, "/ttl-stream", strings.NewReader("data"))
+				req.Header.Set("Content-Type", "application/json")
+				return req
+			},
+			wantReset: true,
+		},
+		{
+			name: "PUT replayed against the existing stream",
+			newRequest: func() *http.Request {
+				req := httptest.NewRequest(http.MethodPut, "/ttl-stream", nil)
+				req.Header.Set("Content-Type", "text/plain")
+				req.Header.Set(protocol.HeaderStreamTTL, "3600")
+				return req
+			},
+			wantReset: true,
+		},
+		{
+			name: "HEAD",
+			newRequest: func() *http.Request {
+				return httptest.NewRequest(http.MethodHead, "/ttl-stream", nil)
+			},
+			wantReset: false,
+		},
+		{
+			name: "DELETE",
+			newRequest: func() *http.Request {
+				return httptest.NewRequest(http.MethodDelete, "/ttl-stream", nil)
+			},
+			wantReset: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			storage := &touchCountingStorage{Storage: memorystorage.New()}
+			handler := durablestream.NewHandler(storage, &durablestream.HandlerConfig{
+				LongPollTimeout: 50 * time.Millisecond,
+			})
+			if _, err := storage.Create(t.Context(), "/ttl-stream", durablestream.StreamConfig{
+				ContentType: "text/plain",
+				TTL:         time.Hour,
+				ExpiresAt:   time.Now().Add(time.Hour),
+			}); err != nil {
+				t.Fatalf("Create: %v", err)
+			}
+
+			handler.ServeHTTP(httptest.NewRecorder(), tt.newRequest())
+
+			got := storage.touchCount() > 0
+			if got != tt.wantReset {
+				t.Errorf("request reset the TTL window: %t, want %t (%d resets)", got, tt.wantReset, storage.touchCount())
+			}
+		})
+	}
+}
+
+// A long-poll timeout may be configured beyond the stream's sliding TTL, but
+// the live request must return while the stream is still alive rather than
+// waiting for Storage to expire it underneath the reader (Section 5.1).
+func TestHandler_SlidingTTL_LongPollReturnsBeforeExpiry(t *testing.T) {
+	const window = 400 * time.Millisecond
+
+	storage := memorystorage.New()
+	handler := durablestream.NewHandler(storage, &durablestream.HandlerConfig{
+		LongPollTimeout: 2 * time.Second,
+	})
+	if _, err := storage.Create(t.Context(), "/live-ttl", durablestream.StreamConfig{
+		ContentType: "text/plain",
+		TTL:         window,
+		ExpiresAt:   time.Now().Add(window),
+	}); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	start := time.Now()
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/live-ttl?live=long-poll&offset=now", nil))
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("long-poll status = %d, want %d (body %q)", rec.Code, http.StatusNoContent, rec.Body.String())
+	}
+	if elapsed := time.Since(start); elapsed >= window {
+		t.Errorf("long-poll returned after %v, want before TTL window %v", elapsed, window)
+	}
+	if _, err := storage.Head(t.Context(), "/live-ttl"); err != nil {
+		t.Errorf("stream expired under active long-poll: %v", err)
+	}
+}
+
+// A stream created with a sliding TTL must outlive its original deadline once a
+// read renews it, and expire once the reads stop.
+func TestHandler_SlidingTTL_ReadKeepsStreamAlive(t *testing.T) {
+	const window = time.Second
+
+	storage := memorystorage.New()
+	handler := durablestream.NewHandler(storage, nil)
+
+	put := httptest.NewRequest(http.MethodPut, "/sliding", nil)
+	put.Header.Set("Content-Type", "text/plain")
+	put.Header.Set(protocol.HeaderStreamTTL, strconv.Itoa(int(window.Seconds())))
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, put)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("PUT status = %d, want %d", rec.Code, http.StatusCreated)
+	}
+
+	head := func() int {
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, httptest.NewRequest(http.MethodHead, "/sliding", nil))
+		return rec.Code
+	}
+
+	// Read past the halfway point, renewing the window.
+	time.Sleep(window / 2)
+	rec = httptest.NewRecorder()
+	handler.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/sliding", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET status = %d, want %d", rec.Code, http.StatusOK)
+	}
+
+	// Past the original deadline, but only half a window past the read.
+	time.Sleep(window/2 + window/4)
+	if got := head(); got != http.StatusOK {
+		t.Errorf("HEAD status = %d after a read renewed the window, want %d", got, http.StatusOK)
+	}
+
+	// Idle for a whole window plus an ordinary scheduling margin, with only the
+	// HEAD above, which does not renew anything.
+	time.Sleep(window + window/2)
+	if got := head(); got != http.StatusNotFound {
+		t.Errorf("HEAD status = %d once the stream went idle for a full window, want %d", got, http.StatusNotFound)
 	}
 }
