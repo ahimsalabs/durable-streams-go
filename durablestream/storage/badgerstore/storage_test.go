@@ -6,12 +6,14 @@ import (
 	"errors"
 	"io"
 	"log/slog"
+	"math"
 	"os"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/ahimsalabs/durable-streams-go/durablestream"
+	"github.com/ahimsalabs/durable-streams-go/durablestream/storage"
 	"github.com/dgraph-io/badger/v4"
 )
 
@@ -42,12 +44,57 @@ func newTestStorage(t *testing.T) *Storage {
 	if err != nil {
 		t.Fatalf("failed to create storage: %v", err)
 	}
+	// Wait for the startup sweep so tests that write keys directly are not
+	// racing the reaper.
+	<-s.initialReapDone
 	t.Cleanup(func() {
 		if err := s.Close(); err != nil {
 			t.Errorf("failed to close storage: %v", err)
 		}
 	})
 	return s
+}
+
+// currentGeneration returns the generation a stream is currently using.
+func currentGeneration(t *testing.T, s *Storage, streamID string) generation {
+	t.Helper()
+	var gen generation
+	err := s.db.View(func(txn *badger.Txn) error {
+		rec, found, err := getRecord(txn, streamID)
+		if err != nil {
+			return err
+		}
+		if !found {
+			t.Fatalf("stream %q does not exist", streamID)
+		}
+		gen = rec.Gen
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("read generation for %q: %v", streamID, err)
+	}
+	return gen
+}
+
+// countKeys returns the number of keys with the given prefix.
+func countKeys(t *testing.T, s *Storage, prefix []byte) int {
+	t.Helper()
+	var n int
+	err := s.db.View(func(txn *badger.Txn) error {
+		opts := badger.DefaultIteratorOptions
+		opts.Prefix = prefix
+		opts.PrefetchValues = false
+		it := txn.NewIterator(opts)
+		defer it.Close()
+		for it.Seek(prefix); it.ValidForPrefix(prefix); it.Next() {
+			n++
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("count keys %q: %v", prefix, err)
+	}
+	return n
 }
 
 // concatMessages concatenates all message data from a ReadResult.
@@ -79,16 +126,28 @@ func TestNew(t *testing.T) {
 		if s == nil {
 			t.Fatal("New() returned nil")
 		}
+		if s.tempDir != "" {
+			t.Fatalf("InMemory storage created disk directory %q", s.tempDir)
+		}
 	})
 
-	t.Run("creates storage with empty dir (in-memory)", func(t *testing.T) {
+	t.Run("creates ephemeral disk storage with empty dir", func(t *testing.T) {
 		s, err := New(Options{Dir: "", Logger: &quietLogger{}, GCInterval: -1, CleanupInterval: -1})
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
-		defer s.Close()
-		if s == nil {
-			t.Fatal("New() returned nil")
+		tempDir := s.tempDir
+		if tempDir == "" {
+			t.Fatal("empty Dir did not create an ephemeral disk directory")
+		}
+		if _, err := os.Stat(tempDir); err != nil {
+			t.Fatalf("stat ephemeral directory: %v", err)
+		}
+		if err := s.Close(); err != nil {
+			t.Fatalf("close ephemeral storage: %v", err)
+		}
+		if _, err := os.Stat(tempDir); !os.IsNotExist(err) {
+			t.Fatalf("ephemeral directory still exists after Close: %v", err)
 		}
 	})
 
@@ -114,14 +173,38 @@ func TestNew(t *testing.T) {
 		defer s.Close()
 	})
 
-	t.Run("uses default max message size", func(t *testing.T) {
+	t.Run("uses in-memory default max message size", func(t *testing.T) {
 		s, err := New(Options{InMemory: true, Logger: &quietLogger{}, GCInterval: -1, CleanupInterval: -1})
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
 		defer s.Close()
-		if s.maxMessageSize != DefaultMaxMessageSize {
-			t.Errorf("expected default max message size %d, got %d", DefaultMaxMessageSize, s.maxMessageSize)
+		if s.maxMessageSize != DefaultInMemoryMaxMessageSize {
+			t.Errorf("expected in-memory max message size %d, got %d", DefaultInMemoryMaxMessageSize, s.maxMessageSize)
+		}
+		if _, err := s.Create(t.Context(), "in-memory-limit", durablestream.StreamConfig{ContentType: "application/octet-stream"}); err != nil {
+			t.Fatalf("Create: %v", err)
+		}
+		if _, err := s.Append(t.Context(), "in-memory-limit", make([]byte, DefaultInMemoryMaxMessageSize), ""); err != nil {
+			t.Fatalf("Append at in-memory limit: %v", err)
+		}
+	})
+
+	t.Run("rejects in-memory message limit above Badger maximum", func(t *testing.T) {
+		_, err := New(Options{
+			InMemory:       true,
+			MaxMessageSize: DefaultInMemoryMaxMessageSize + 1,
+			Logger:         &quietLogger{},
+		})
+		if err == nil || !strings.Contains(err.Error(), "exceeds in-memory limit") {
+			t.Fatalf("New() error = %v, want in-memory limit error", err)
+		}
+	})
+
+	t.Run("rejects directory in memory-only mode", func(t *testing.T) {
+		_, err := New(Options{InMemory: true, Dir: t.TempDir(), Logger: &quietLogger{}})
+		if err == nil || !strings.Contains(err.Error(), "mutually exclusive") {
+			t.Fatalf("New() error = %v, want mutually exclusive error", err)
 		}
 	})
 
@@ -580,10 +663,11 @@ func TestRead(t *testing.T) {
 		_, _ = s.Create(context.Background(), "test", durablestream.StreamConfig{ContentType: "text/plain"})
 
 		// Manually insert messages at offsets 1, 3, 5 (gaps at 2, 4)
+		gen := currentGeneration(t, s, "test")
 		err := s.db.Update(func(txn *badger.Txn) error {
-			_ = txn.Set([]byte("m:test:0000000000000000_0000000000000001"), []byte("msg1"))
-			_ = txn.Set([]byte("m:test:0000000000000000_0000000000000003"), []byte("msg3"))
-			_ = txn.Set([]byte("m:test:0000000000000000_0000000000000005"), []byte("msg5"))
+			_ = txn.Set(messageKey("test", gen, "0000000000000000_0000000000000001"), []byte("msg1"))
+			_ = txn.Set(messageKey("test", gen, "0000000000000000_0000000000000003"), []byte("msg3"))
+			_ = txn.Set(messageKey("test", gen, "0000000000000000_0000000000000005"), []byte("msg5"))
 			return nil
 		})
 		if err != nil {
@@ -943,7 +1027,8 @@ func TestWaitForData(t *testing.T) {
 		_, _ = s.Create(context.Background(), "test", durablestream.StreamConfig{ContentType: "text/plain"})
 
 		// Remove in-memory state to simulate restart
-		s.streams.LoadAndDelete("test")
+		gen := currentGeneration(t, s, "test")
+		s.streams.LoadAndDelete(streamStateKey("test", gen))
 
 		ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
 		defer cancel()
@@ -1131,7 +1216,7 @@ func TestGetTailOffset(t *testing.T) {
 
 	// Initial tail offset should be 0
 	err := s.db.View(func(txn *badger.Txn) error {
-		tailOffset, err := s.getTailOffset(txn, "test")
+		tailOffset, err := getTailOffset(txn, "test", currentGeneration(t, s, "test"))
 		if err != nil {
 			return err
 		}
@@ -1149,7 +1234,7 @@ func TestGetTailOffset(t *testing.T) {
 	_, _ = s.Append(context.Background(), "test", []byte("msg2"), "")
 
 	err = s.db.View(func(txn *badger.Txn) error {
-		tailOffset, err := s.getTailOffset(txn, "test")
+		tailOffset, err := getTailOffset(txn, "test", currentGeneration(t, s, "test"))
 		if err != nil {
 			return err
 		}
@@ -1240,6 +1325,29 @@ func TestReadWithInvalidOffset(t *testing.T) {
 	}
 }
 
+func TestReadAtMaxInt64OffsetDoesNotOverflow(t *testing.T) {
+	s := newTestStorage(t)
+	ctx := context.Background()
+	if _, err := s.Create(ctx, "max-offset", durablestream.StreamConfig{ContentType: "text/plain"}); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	if _, err := s.Append(ctx, "max-offset", []byte("first"), ""); err != nil {
+		t.Fatalf("append: %v", err)
+	}
+
+	offset := storage.FormatSimpleOffset(math.MaxInt64)
+	res, err := s.Read(ctx, "max-offset", offset, 0)
+	if err != nil {
+		t.Fatalf("read at MaxInt64 offset: %v", err)
+	}
+	if len(res.Messages) != 0 {
+		t.Fatalf("read at MaxInt64 returned %d messages, want none", len(res.Messages))
+	}
+	if res.NextOffset != offset {
+		t.Errorf("NextOffset = %q, want requested offset %q", res.NextOffset, offset)
+	}
+}
+
 func TestReadWithNegativeLimit(t *testing.T) {
 	s := newTestStorage(t)
 	_, _ = s.Create(context.Background(), "test", durablestream.StreamConfig{ContentType: "text/plain"})
@@ -1297,9 +1405,10 @@ func TestConcurrentSequenceCreation(t *testing.T) {
 	// Launch many goroutines trying to get sequence simultaneously
 	const numGoroutines = 50
 	results := make(chan *badger.Sequence, numGoroutines)
+	gen := currentGeneration(t, s, "test")
 	for i := 0; i < numGoroutines; i++ {
 		go func() {
-			seq, err := s.getOrCreateSequence("test")
+			seq, err := s.getOrCreateSequence("test", gen)
 			if err != nil {
 				t.Errorf("getOrCreateSequence error: %v", err)
 				results <- nil

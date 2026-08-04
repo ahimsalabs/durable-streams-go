@@ -30,7 +30,7 @@ func silentSLogger() *slog.Logger {
 func newFuzzStorage() (*Storage, error) {
 	return New(Options{
 		InMemory:        true,
-		MaxMessageSize:  10 * 1024 * 1024,
+		MaxMessageSize:  DefaultInMemoryMaxMessageSize,
 		GCInterval:      -1,
 		CleanupInterval: -1,
 		Logger:          &silentLogger{},

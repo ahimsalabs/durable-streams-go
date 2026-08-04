@@ -18,10 +18,12 @@ var (
 	// ErrConflict indicates a conflict occurred:
 	// - Stream exists with different configuration (on create)
 	// - Content type mismatch (on append)
+	// - Stream-Seq does not sort after the last accepted value (in Storage)
 	ErrConflict = errors.New("conflict")
 
-	// ErrSequenceConflict indicates a sequence number conflict on append.
-	// This occurs when appending with a sequence number <= the last appended sequence.
+	// ErrSequenceConflict indicates a Stream-Seq conflict on append.
+	// This occurs when appending with a sequence value that does not sort after
+	// the last accepted value. Generic HTTP 409 responses use [ErrConflict].
 	ErrSequenceConflict = errors.New("sequence conflict")
 
 	// ErrClosed indicates the stream or connection has been closed.
@@ -33,9 +35,9 @@ var (
 	// ErrPayloadTooLarge indicates the request payload exceeds the maximum allowed size.
 	ErrPayloadTooLarge = errors.New("payload too large")
 
-	// ErrParseError indicates the server returned malformed/invalid JSON.
-	// This occurs when a JSON stream returns truncated or corrupted JSON responses.
-	ErrParseError = errors.New("parse error: malformed JSON response")
+	// ErrParseError indicates the server returned a malformed protocol response,
+	// such as invalid JSON, SSE framing, or required response metadata.
+	ErrParseError = errors.New("parse error: malformed protocol response")
 )
 
 // errorCode represents an internal error code for HTTP status mapping.
@@ -52,6 +54,9 @@ const (
 	codeTooManyRequests errorCode = "too_many_requests"
 	codeInternal        errorCode = "internal"
 	codeNotImplemented  errorCode = "not_implemented"
+	// codeServiceUnavailable marks a transient failure (e.g. storage closed or
+	// shutting down); the client may retry.
+	codeServiceUnavailable errorCode = "service_unavailable"
 )
 
 // httpStatus returns the HTTP status code for an error code.
@@ -75,6 +80,8 @@ func (c errorCode) httpStatus() int {
 		return 500
 	case codeNotImplemented:
 		return 501
+	case codeServiceUnavailable:
+		return 503
 	default:
 		return 500
 	}
@@ -99,6 +106,8 @@ func httpStatusToErrorCode(status int) errorCode {
 		return codeTooManyRequests
 	case 501:
 		return codeNotImplemented
+	case 503:
+		return codeServiceUnavailable
 	default:
 		return codeInternal
 	}

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"sync"
 	"testing"
 	"time"
 
@@ -402,15 +403,23 @@ func TestRead(t *testing.T) {
 		}
 	})
 
-	t.Run("returns gone for invalid offset", func(t *testing.T) {
+	t.Run("returns empty result past the tail", func(t *testing.T) {
 		s := New()
 		_, _ = s.Create(context.Background(), "test", durablestream.StreamConfig{ContentType: "text/plain"})
 		_, _ = s.Append(context.Background(), "test", []byte("data"), "")
 
-		// Offset beyond current tail
-		_, err := s.Read(context.Background(), "test", "0000000000000000_0000000000000099", 0)
-		if !errors.Is(err, durablestream.ErrGone) {
-			t.Errorf("expected ErrGone, got: %v", err)
+		// Offset beyond current tail. Per the Storage contract this is not an
+		// error: ErrGone is reserved for retention/compaction.
+		const past = durablestream.Offset("0000000000000000_0000000000000099")
+		result, err := s.Read(context.Background(), "test", past, 0)
+		if err != nil {
+			t.Fatalf("read past tail: %v", err)
+		}
+		if len(result.Messages) != 0 {
+			t.Errorf("got %d messages past the tail, want 0", len(result.Messages))
+		}
+		if result.NextOffset != past {
+			t.Errorf("NextOffset = %q, want the requested offset %q", result.NextOffset, past)
 		}
 	})
 
@@ -968,6 +977,285 @@ func TestConcurrentAccess(t *testing.T) {
 	if info.NextOffset != "0000000000000000_0000000000001000" {
 		t.Errorf("expected 1000 appends, got offset %s", info.NextOffset)
 	}
+}
+
+// TestDeleteConcurrentWithExpiredCreate stresses the window in which Create
+// replaces an expired stream while Delete removes it. Both paths wake waiters
+// by closing notifyCh; before the fix one of them could close it twice and
+// panic with "close of closed channel". Run with -race.
+func TestDeleteConcurrentWithExpiredCreate(t *testing.T) {
+	const iterations = 2000
+
+	for i := 0; i < iterations; i++ {
+		s := New()
+		if _, err := s.Create(context.Background(), "test", durablestream.StreamConfig{
+			ContentType: "text/plain",
+			ExpiresAt:   time.Now().Add(-time.Hour),
+		}); err != nil {
+			t.Fatalf("seed create: %v", err)
+		}
+
+		// start gates both goroutines so they contend on the same window.
+		start := make(chan struct{})
+		var wg sync.WaitGroup
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			<-start
+			_, _ = s.Create(context.Background(), "test", durablestream.StreamConfig{
+				ContentType: "application/json",
+			})
+		}()
+		go func() {
+			defer wg.Done()
+			<-start
+			_ = s.Delete(context.Background(), "test")
+		}()
+		close(start)
+		wg.Wait()
+	}
+}
+
+// TestCapturedStreamRejectsAppendAfterDelete covers the stale-pointer window in
+// Append: it can load a stream just before Delete removes and marks it, then
+// acquire the stream lock only after Delete has closed notifyCh. The old code
+// closed notifyCh a second time and panicked.
+func TestCapturedStreamRejectsAppendAfterDelete(t *testing.T) {
+	s := New()
+	if _, err := s.Create(context.Background(), "test", durablestream.StreamConfig{ContentType: "text/plain"}); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	stream, ok := s.streams.Load("test")
+	if !ok {
+		t.Fatal("created stream is missing from map")
+	}
+	if err := s.Delete(context.Background(), "test"); err != nil {
+		t.Fatalf("delete: %v", err)
+	}
+
+	if _, err := appendBatchToStream(stream, [][]byte{[]byte("stale")}, ""); !errors.Is(err, durablestream.ErrNotFound) {
+		t.Fatalf("append through pointer captured before Delete = %v, want ErrNotFound", err)
+	}
+	if _, err := readStream(context.Background(), stream, durablestream.ZeroOffset, 0); !errors.Is(err, durablestream.ErrNotFound) {
+		t.Fatalf("read through pointer captured before Delete = %v, want ErrNotFound", err)
+	}
+}
+
+// TestWaitStaysBoundToDeletedIncarnation verifies that a waiter holding the old
+// stream pointer cannot consume data from a replacement with the same ID.
+func TestWaitStaysBoundToDeletedIncarnation(t *testing.T) {
+	s := New()
+	if _, err := s.Create(context.Background(), "test", durablestream.StreamConfig{ContentType: "text/plain"}); err != nil {
+		t.Fatalf("create old stream: %v", err)
+	}
+	old, ok := s.streams.Load("test")
+	if !ok {
+		t.Fatal("old stream is missing from map")
+	}
+
+	if err := s.Delete(context.Background(), "test"); err != nil {
+		t.Fatalf("delete old stream: %v", err)
+	}
+	if _, err := s.Create(context.Background(), "test", durablestream.StreamConfig{ContentType: "application/json"}); err != nil {
+		t.Fatalf("create replacement: %v", err)
+	}
+	if _, err := s.Append(context.Background(), "test", []byte(`{"replacement":true}`), ""); err != nil {
+		t.Fatalf("append replacement data: %v", err)
+	}
+
+	res, err := s.waitForStream(context.Background(), old, durablestream.ZeroOffset, 0)
+	if !errors.Is(err, durablestream.ErrNotFound) {
+		t.Fatalf("wait on deleted incarnation = (%v, %v), want ErrNotFound", res, err)
+	}
+}
+
+// TestConcurrentCreateOfExpiredStream asserts that when many goroutines race to
+// replace the same expired stream, exactly one observes created=true. Before the
+// fix, LoadOrStore followed by an unconditional Store let several callers each
+// claim creation and install their own replacement.
+func TestConcurrentCreateOfExpiredStream(t *testing.T) {
+	const iterations = 500
+	const creators = 4
+
+	for i := 0; i < iterations; i++ {
+		s := New()
+		if _, err := s.Create(context.Background(), "test", durablestream.StreamConfig{
+			ContentType: "text/plain",
+			ExpiresAt:   time.Now().Add(-time.Hour),
+		}); err != nil {
+			t.Fatalf("seed create: %v", err)
+		}
+
+		cfg := durablestream.StreamConfig{ContentType: "application/json"}
+		start := make(chan struct{})
+		results := make(chan bool, creators)
+		var wg sync.WaitGroup
+		for j := 0; j < creators; j++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				<-start
+				created, err := s.Create(context.Background(), "test", cfg)
+				if err != nil {
+					t.Errorf("create: %v", err)
+					return
+				}
+				results <- created
+			}()
+		}
+		close(start)
+		wg.Wait()
+		close(results)
+
+		createdCount := 0
+		for created := range results {
+			if created {
+				createdCount++
+			}
+		}
+		if createdCount != 1 {
+			t.Fatalf("expected exactly 1 creator to observe created=true, got %d", createdCount)
+		}
+	}
+}
+
+// TestReadReturnsCopy verifies Read hands out message data the caller owns:
+// mutating it must not corrupt the stored log.
+func TestReadReturnsCopy(t *testing.T) {
+	s := New()
+	if _, err := s.Create(context.Background(), "test", durablestream.StreamConfig{ContentType: "text/plain"}); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	if _, err := s.Append(context.Background(), "test", []byte("hello"), ""); err != nil {
+		t.Fatalf("append: %v", err)
+	}
+
+	first, err := s.Read(context.Background(), "test", "", 0)
+	if err != nil {
+		t.Fatalf("first read: %v", err)
+	}
+	if len(first.Messages) != 1 {
+		t.Fatalf("expected 1 message, got %d", len(first.Messages))
+	}
+	copy(first.Messages[0].Data, "XXXXX")
+
+	second, err := s.Read(context.Background(), "test", "", 0)
+	if err != nil {
+		t.Fatalf("second read: %v", err)
+	}
+	if len(second.Messages) != 1 {
+		t.Fatalf("expected 1 message, got %d", len(second.Messages))
+	}
+	if got := string(second.Messages[0].Data); got != "hello" {
+		t.Errorf("stored data mutated by caller: got %q, want %q", got, "hello")
+	}
+}
+
+// TestWaitForDataReturnsCopy covers the same ownership contract through
+// WaitForData, which returns results produced by Read.
+func TestWaitForDataReturnsCopy(t *testing.T) {
+	s := New()
+	if _, err := s.Create(context.Background(), "test", durablestream.StreamConfig{ContentType: "text/plain"}); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	if _, err := s.Append(context.Background(), "test", []byte("hello"), ""); err != nil {
+		t.Fatalf("append: %v", err)
+	}
+
+	first, err := s.WaitForData(context.Background(), "test", "", 0)
+	if err != nil {
+		t.Fatalf("first WaitForData: %v", err)
+	}
+	copy(first.Messages[0].Data, "XXXXX")
+
+	second, err := s.Read(context.Background(), "test", "", 0)
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if got := string(second.Messages[0].Data); got != "hello" {
+		t.Errorf("stored data mutated by caller: got %q, want %q", got, "hello")
+	}
+}
+
+// TestAppendCopiesInput verifies the storage copies caller-provided data, so a
+// caller reusing its buffer cannot rewrite history.
+func TestAppendCopiesInput(t *testing.T) {
+	s := New()
+	if _, err := s.Create(context.Background(), "test", durablestream.StreamConfig{ContentType: "text/plain"}); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+
+	buf := []byte("hello")
+	if _, err := s.Append(context.Background(), "test", buf, ""); err != nil {
+		t.Fatalf("append: %v", err)
+	}
+	copy(buf, "XXXXX")
+
+	result, err := s.Read(context.Background(), "test", "", 0)
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if got := string(result.Messages[0].Data); got != "hello" {
+		t.Errorf("stored data reflects caller buffer reuse: got %q, want %q", got, "hello")
+	}
+}
+
+// TestCancelledContext verifies every method fails fast when the caller's
+// context is already cancelled, rather than doing work for a dead request.
+func TestCancelledContext(t *testing.T) {
+	s := New()
+	if _, err := s.Create(context.Background(), "test", durablestream.StreamConfig{ContentType: "text/plain"}); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	if _, err := s.Append(context.Background(), "test", []byte("data"), ""); err != nil {
+		t.Fatalf("append: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	t.Run("Create", func(t *testing.T) {
+		if _, err := s.Create(ctx, "other", durablestream.StreamConfig{ContentType: "text/plain"}); !errors.Is(err, context.Canceled) {
+			t.Errorf("expected context.Canceled, got: %v", err)
+		}
+		if _, err := s.Head(context.Background(), "other"); !errors.Is(err, durablestream.ErrNotFound) {
+			t.Errorf("cancelled Create should not have created the stream, got: %v", err)
+		}
+	})
+
+	t.Run("Append", func(t *testing.T) {
+		if _, err := s.Append(ctx, "test", []byte("more"), ""); !errors.Is(err, context.Canceled) {
+			t.Errorf("expected context.Canceled, got: %v", err)
+		}
+	})
+
+	t.Run("Read", func(t *testing.T) {
+		if _, err := s.Read(ctx, "test", "", 0); !errors.Is(err, context.Canceled) {
+			t.Errorf("expected context.Canceled, got: %v", err)
+		}
+	})
+
+	t.Run("Head", func(t *testing.T) {
+		if _, err := s.Head(ctx, "test"); !errors.Is(err, context.Canceled) {
+			t.Errorf("expected context.Canceled, got: %v", err)
+		}
+	})
+
+	t.Run("WaitForData", func(t *testing.T) {
+		// Data is available, so only an entry check can surface cancellation.
+		if _, err := s.WaitForData(ctx, "test", "", 0); !errors.Is(err, context.Canceled) {
+			t.Errorf("expected context.Canceled, got: %v", err)
+		}
+	})
+
+	t.Run("Delete", func(t *testing.T) {
+		if err := s.Delete(ctx, "test"); !errors.Is(err, context.Canceled) {
+			t.Errorf("expected context.Canceled, got: %v", err)
+		}
+		if _, err := s.Head(context.Background(), "test"); err != nil {
+			t.Errorf("cancelled Delete should not have removed the stream, got: %v", err)
+		}
+	})
 }
 
 func TestReadWithPartialLimit(t *testing.T) {

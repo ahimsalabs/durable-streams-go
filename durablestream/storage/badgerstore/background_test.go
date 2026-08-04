@@ -2,6 +2,7 @@ package badgerstore
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -10,6 +11,7 @@ import (
 	"time"
 
 	"github.com/ahimsalabs/durable-streams-go/durablestream"
+	"github.com/ahimsalabs/durable-streams-go/durablestream/storage"
 	"github.com/dgraph-io/badger/v4"
 )
 
@@ -46,6 +48,148 @@ func TestCleanupExpiredStreams(t *testing.T) {
 	_, err = s.Head(context.Background(), "valid")
 	if err != nil {
 		t.Errorf("valid stream should still exist: %v", err)
+	}
+}
+
+func TestCleanupExpiredStreamsScansInBoundedPages(t *testing.T) {
+	s := newTestStorage(t)
+	ctx := context.Background()
+
+	streamCount := cleanupScanBatchSize + 7
+	for i := range streamCount {
+		streamID := fmt.Sprintf("paged-expired-%04d", i)
+		created, err := s.Create(ctx, streamID, durablestream.StreamConfig{
+			ContentType: "text/plain",
+			ExpiresAt:   time.Now().Add(-time.Hour),
+		})
+		if err != nil || !created {
+			t.Fatalf("Create(%q) = (%v, %v), want (true, nil)", streamID, created, err)
+		}
+	}
+
+	first, next, err := s.scanExpiredStreams(ctx, []byte(prefixConfig))
+	if err != nil {
+		t.Fatalf("scan first page: %v", err)
+	}
+	if len(first) != cleanupScanBatchSize {
+		t.Fatalf("first page size = %d, want %d", len(first), cleanupScanBatchSize)
+	}
+	if next == nil {
+		t.Fatal("first page reported end of scan with records remaining")
+	}
+
+	second, afterSecond, err := s.scanExpiredStreams(ctx, next)
+	if err != nil {
+		t.Fatalf("scan second page: %v", err)
+	}
+	if len(second) != streamCount-cleanupScanBatchSize {
+		t.Fatalf("second page size = %d, want %d", len(second), streamCount-cleanupScanBatchSize)
+	}
+	if afterSecond != nil {
+		t.Fatalf("second page returned unexpected continuation key %q", afterSecond)
+	}
+
+	s.cleanupExpiredStreams(ctx)
+	for i := range streamCount {
+		streamID := fmt.Sprintf("paged-expired-%04d", i)
+		if _, err := s.Head(ctx, streamID); !errors.Is(err, durablestream.ErrNotFound) {
+			t.Errorf("Head(%q) after cleanup = %v, want ErrNotFound", streamID, err)
+		}
+	}
+}
+
+func TestDeleteExpiredGenerationPreservesReplacement(t *testing.T) {
+	s := newTestStorage(t)
+	ctx := context.Background()
+	const streamID = "cleanup-replacement"
+
+	created, err := s.Create(ctx, streamID, durablestream.StreamConfig{
+		ContentType: "text/plain",
+		ExpiresAt:   time.Now().Add(-time.Hour),
+	})
+	if err != nil || !created {
+		t.Fatalf("create expired stream = (%v, %v), want (true, nil)", created, err)
+	}
+	expiredGen := currentGeneration(t, s, streamID)
+
+	created, err = s.Create(ctx, streamID, durablestream.StreamConfig{
+		ContentType: "text/plain",
+		ExpiresAt:   time.Now().Add(time.Hour),
+	})
+	if err != nil || !created {
+		t.Fatalf("replace expired stream = (%v, %v), want (true, nil)", created, err)
+	}
+	replacementGen := currentGeneration(t, s, streamID)
+	if replacementGen == expiredGen {
+		t.Fatal("replacement reused expired generation")
+	}
+
+	removed, err := s.deleteExpiredGeneration(ctx, expiredGeneration{
+		streamID: streamID,
+		gen:      expiredGen,
+	})
+	if err != nil {
+		t.Fatalf("delete stale cleanup candidate: %v", err)
+	}
+	if removed {
+		t.Fatal("stale cleanup candidate deleted replacement generation")
+	}
+
+	if _, err := s.Append(ctx, streamID, []byte("replacement data"), ""); err != nil {
+		t.Fatalf("append to replacement after stale cleanup: %v", err)
+	}
+	if got := currentGeneration(t, s, streamID); got != replacementGen {
+		t.Fatalf("generation after stale cleanup = %q, want %q", got, replacementGen)
+	}
+}
+
+func TestDeleteExpiredGenerationPreservesRenewedStream(t *testing.T) {
+	s := newTestStorage(t)
+	ctx := context.Background()
+	const streamID = "cleanup-renewed"
+
+	created, err := s.Create(ctx, streamID, durablestream.StreamConfig{
+		ContentType: "text/plain",
+		ExpiresAt:   time.Now().Add(-time.Hour),
+	})
+	if err != nil || !created {
+		t.Fatalf("create expired stream = (%v, %v), want (true, nil)", created, err)
+	}
+	gen := currentGeneration(t, s, streamID)
+
+	// Model a Touch that committed after cleanup's read snapshot: the generation
+	// is unchanged, but its expiry has moved into the future.
+	err = s.update(func(txn *badger.Txn) error {
+		rec, found, err := getRecord(txn, streamID)
+		if err != nil {
+			return err
+		}
+		if !found {
+			return errors.New("stream disappeared")
+		}
+		rec.ExpiresAt = time.Now().Add(time.Hour)
+		encoded, err := json.Marshal(rec)
+		if err != nil {
+			return err
+		}
+		return txn.Set(configKey(streamID), encoded)
+	})
+	if err != nil {
+		t.Fatalf("renew stream: %v", err)
+	}
+
+	removed, err := s.deleteExpiredGeneration(ctx, expiredGeneration{
+		streamID: streamID,
+		gen:      gen,
+	})
+	if err != nil {
+		t.Fatalf("delete renewed cleanup candidate: %v", err)
+	}
+	if removed {
+		t.Fatal("cleanup deleted generation renewed after its scan")
+	}
+	if _, err := s.Head(ctx, streamID); err != nil {
+		t.Fatalf("renewed stream missing after cleanup: %v", err)
 	}
 }
 
@@ -243,10 +387,11 @@ func TestCleanupWithStreamContainingMessages(t *testing.T) {
 	})
 
 	// Add messages (bypassing expiry check by using raw db access)
+	gen := currentGeneration(t, s, "expired-with-data")
 	err := s.db.Update(func(txn *badger.Txn) error {
 		for i := 0; i < 50; i++ {
-			key := fmt.Sprintf("m:expired-with-data:0000000000000000_%016d", i+1)
-			if err := txn.Set([]byte(key), []byte("message data")); err != nil {
+			key := messageKey("expired-with-data", gen, storage.FormatSimpleOffset(int64(i+1)))
+			if err := txn.Set(key, []byte("message data")); err != nil {
 				return err
 			}
 		}
@@ -256,8 +401,9 @@ func TestCleanupWithStreamContainingMessages(t *testing.T) {
 		t.Fatalf("failed to add messages: %v", err)
 	}
 
-	// Run cleanup
+	// Run cleanup, then the reaper that purges the deleted stream's data.
 	s.cleanupExpiredStreams(context.Background())
+	s.reap(context.Background(), false)
 
 	// Stream and all messages should be deleted
 	_, err = s.Head(context.Background(), "expired-with-data")
@@ -269,7 +415,7 @@ func TestCleanupWithStreamContainingMessages(t *testing.T) {
 	var messageCount int
 	err = s.db.View(func(txn *badger.Txn) error {
 		opts := badger.DefaultIteratorOptions
-		opts.Prefix = []byte("m:expired-with-data:")
+		opts.Prefix = messagePrefix("expired-with-data", gen)
 		it := txn.NewIterator(opts)
 		defer it.Close()
 		for it.Seek(opts.Prefix); it.ValidForPrefix(opts.Prefix); it.Next() {

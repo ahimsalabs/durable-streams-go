@@ -1,6 +1,7 @@
 package durablestream
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"net/http/httptest"
@@ -25,23 +26,29 @@ func parseTestOffset(offset Offset) int64 {
 	if len(parts) != 2 {
 		return 0
 	}
+	// A malformed suffix leaves idx at zero, which is the same "start of stream"
+	// answer the sentinel cases above return, so the scan error carries nothing
+	// a caller could act on.
 	var idx int64
-	fmt.Sscanf(parts[1], "%d", &idx)
+	_, _ = fmt.Sscanf(parts[1], "%d", &idx)
 	return idx
 }
 
 // testStorage is a minimal storage implementation for internal tests.
 // It provides basic functionality without importing external packages.
 type testStorage struct {
-	mu      sync.RWMutex
-	streams map[string]*testStream
+	mu              sync.RWMutex
+	streams         map[string]*testStream
+	nextIncarnation uint64
 }
 
 type testStream struct {
 	config   StreamConfig
 	messages []StoredMessage
+	lastSeq  string
 	notifyCh chan struct{} // Closed on append, replaced with new channel
 	deleted  bool
+	incID    string
 }
 
 func newTestStorage() *testStorage {
@@ -51,48 +58,108 @@ func newTestStorage() *testStorage {
 }
 
 func (s *testStorage) Create(ctx context.Context, streamID string, cfg StreamConfig) (bool, error) {
+	created, _, err := s.CreateWithMessages(ctx, streamID, cfg, nil)
+	return created, err
+}
+
+func (s *testStorage) CreateWithMessages(ctx context.Context, streamID string, cfg StreamConfig, messages [][]byte) (bool, Offset, error) {
+	if err := ctx.Err(); err != nil {
+		return false, "", err
+	}
+	cloned := make([][]byte, len(messages))
+	for i, data := range messages {
+		if len(data) == 0 {
+			return false, "", ErrBadRequest
+		}
+		cloned[i] = bytes.Clone(data)
+	}
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	if _, ok := s.streams[streamID]; ok {
-		return false, nil
+	if stream, ok := s.streams[streamID]; ok {
+		if !stream.config.IsExpired() {
+			if stream.config.Matches(cfg) {
+				return false, testStreamTail(stream), nil
+			}
+			return false, "", ErrConflict
+		}
+		stream.deleted = true
+		close(stream.notifyCh)
 	}
 
+	s.nextIncarnation++
 	stream := &testStream{
 		config:   cfg,
-		messages: make([]StoredMessage, 0),
+		messages: make([]StoredMessage, len(cloned)),
 		notifyCh: make(chan struct{}),
+		incID:    fmt.Sprintf("test-incarnation-%d", s.nextIncarnation),
+	}
+	for i, data := range cloned {
+		stream.messages[i] = StoredMessage{
+			Data:   data,
+			Offset: formatTestOffset(int64(i + 1)),
+		}
 	}
 
 	s.streams[streamID] = stream
-	return true, nil
+	return true, testStreamTail(stream), nil
 }
 
 func (s *testStorage) Append(ctx context.Context, streamID string, data []byte, seq string) (Offset, error) {
+	return s.AppendBatch(ctx, streamID, [][]byte{data}, seq)
+}
+
+func (s *testStorage) AppendBatch(ctx context.Context, streamID string, messages [][]byte, seq string) (Offset, error) {
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
+	if len(messages) == 0 {
+		return "", ErrBadRequest
+	}
+	cloned := make([][]byte, len(messages))
+	for i, data := range messages {
+		if len(data) == 0 {
+			return "", ErrBadRequest
+		}
+		cloned[i] = bytes.Clone(data)
+	}
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	stream, ok := s.streams[streamID]
-	if !ok {
+	if !ok || stream.config.IsExpired() {
 		return "", ErrNotFound
 	}
-
-	// Copy data - caller may reuse the slice (per Storage interface contract)
-	b := make([]byte, len(data))
-	copy(b, data)
-
-	offset := formatTestOffset(int64(len(stream.messages) + 1))
-	msg := StoredMessage{
-		Data:   b,
-		Offset: offset,
+	if seq != "" && stream.lastSeq != "" && seq <= stream.lastSeq {
+		return "", ErrConflict
 	}
-	stream.messages = append(stream.messages, msg)
+
+	var offset Offset
+	for _, data := range cloned {
+		offset = formatTestOffset(int64(len(stream.messages) + 1))
+		stream.messages = append(stream.messages, StoredMessage{
+			Data:   data,
+			Offset: offset,
+		})
+	}
+	if seq != "" {
+		stream.lastSeq = seq
+	}
 
 	// Notify waiters: close current channel to wake all waiters, then replace it
 	close(stream.notifyCh)
 	stream.notifyCh = make(chan struct{})
 
 	return offset, nil
+}
+
+func testStreamTail(stream *testStream) Offset {
+	if len(stream.messages) == 0 {
+		return formatTestOffset(0)
+	}
+	return stream.messages[len(stream.messages)-1].Offset
 }
 
 func (s *testStorage) Read(ctx context.Context, streamID string, offset Offset, limit int) (*ReadResult, error) {
@@ -142,9 +209,10 @@ func (s *testStorage) Read(ctx context.Context, streamID string, offset Offset, 
 	}
 
 	return &ReadResult{
-		Messages:   messages,
-		NextOffset: nextOffset,
-		TailOffset: tailOffset,
+		Messages:      messages,
+		NextOffset:    nextOffset,
+		TailOffset:    tailOffset,
+		IncarnationID: stream.incID,
 	}, nil
 }
 
@@ -165,11 +233,26 @@ func (s *testStorage) Head(ctx context.Context, streamID string) (*StreamInfo, e
 	}
 
 	return &StreamInfo{
-		ContentType: stream.config.ContentType,
-		NextOffset:  nextOffset,
-		TTL:         stream.config.TTL,
-		ExpiresAt:   stream.config.ExpiresAt,
+		ContentType:   stream.config.ContentType,
+		NextOffset:    nextOffset,
+		TTL:           stream.config.TTL,
+		ExpiresAt:     stream.config.ExpiresAt,
+		IncarnationID: stream.incID,
 	}, nil
+}
+
+func (s *testStorage) Touch(ctx context.Context, streamID string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	stream, ok := s.streams[streamID]
+	if !ok {
+		return ErrNotFound
+	}
+	if cfg, moved := stream.config.SlideExpiry(time.Now()); moved {
+		stream.config = cfg
+	}
+	return nil
 }
 
 func (s *testStorage) Delete(ctx context.Context, streamID string) error {
