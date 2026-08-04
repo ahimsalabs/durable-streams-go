@@ -37,7 +37,12 @@ tasks:
   fmt:check:
     desc: Check code formatting
     cmds:
-      - "{{.GOFUMPT}} -d . | grep . && exit 1 || exit 0"
+      - |
+        output="$({{.GOFUMPT}} -d .)" || exit $?
+        if [ -n "$output" ]; then
+          printf '%s\n' "$output"
+          exit 1
+        fi
 
   staticcheck:
     desc: Run staticcheck
@@ -85,35 +90,23 @@ tasks:
 
   conformance:go:
     desc: Run server conformance tests against Go server (memorystorage)
-    deps: [conformance:go:server]
-    dir: conformance
     cmds:
-      - CONFORMANCE_TEST_URL=http://localhost:8788 npm run test:server {{.CLI_ARGS}}
-
-  conformance:go:server:
-    desc: Start Go server in background for conformance tests (memorystorage)
-    cmds:
-      - |
-        go build -o /tmp/ds-testserver ./cmd/testserver
-        /tmp/ds-testserver -port 8788 &
-        sleep 1
-        echo "Go server started on port 8788 (memorystorage)"
+      - task: conformance:go:run
+        vars: {STORAGE: memory, PORT: 8788}
 
   conformance:go:badger:
     desc: Run server conformance tests against Go server (badgerstore)
-    deps: [conformance:go:server:badger]
-    dir: conformance
     cmds:
-      - CONFORMANCE_TEST_URL=http://localhost:8789 npm run test:server {{.CLI_ARGS}}
+      - task: conformance:go:run
+        vars: {STORAGE: badger, PORT: 8789}
 
-  conformance:go:server:badger:
-    desc: Start Go server in background for conformance tests (badgerstore)
+  conformance:go:run:
+    internal: true
     cmds:
-      - |
-        go build -o /tmp/ds-testserver ./cmd/testserver
-        /tmp/ds-testserver -port 8789 -storage badger &
-        sleep 1
-        echo "Go server started on port 8789 (badgerstore)"
+      # The script owns the server's lifetime and kills it on every exit path,
+      # so no process is left holding the port. It cannot be inlined here:
+      # Task's built-in shell does not support `trap` for INT/TERM.
+      - ./run-server-conformance.sh {{.STORAGE}} {{.PORT}} {{.CLI_ARGS}}
 
 
   # ============================================================================
@@ -199,3 +192,8 @@ tasks:
     desc: Check for large code blocks not covered by snippets
     cmds:
       - go run ./internal/snippet -lint README.md
+
+  api:
+    desc: Regenerate the ignored local API.md from Go doc comments
+    cmds:
+      - go doc -all ./durablestream > API.md

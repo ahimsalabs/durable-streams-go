@@ -5,11 +5,11 @@
   "scripts": {
     "test:server": "vitest run",
     "test:server:watch": "vitest",
-    "test:client": "client-conformance-tests --run ../cmd/conformance-adapter/adapter"
+    "test:client": "client-conformance-tests"
   },
   "dependencies": {
-    "@durable-streams/client-conformance-tests": "^0.2.0",
-    "@durable-streams/server-conformance-tests": "^0.1.8",
+    "@durable-streams/client-conformance-tests": "^0.2.12",
+    "@durable-streams/server-conformance-tests": "^0.3.6",
     "vitest": "^4.0.0"
   }
 }

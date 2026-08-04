@@ -419,8 +419,8 @@ func handleAppend(cmd Command) Result {
 		}
 	}
 
-	if err := writer.Send(data, opts); err != nil {
-		return errorResult("append", err)
+	if err := writer.SendContext(ctx, data, opts); err != nil {
+		return appendErrorResult(err, opts != nil)
 	}
 
 	hdrsSent, paramsSent := getSentDynamic()
@@ -432,6 +432,24 @@ func handleAppend(cmd Command) Result {
 		HeadersSent: hdrsSent,
 		ParamsSent:  paramsSent,
 	}
+}
+
+// appendErrorResult retains the adapter protocol's specific sequence-conflict
+// code. The hasSequence fallback supports older clients that reported every
+// wire-level conflict as ErrConflict.
+func appendErrorResult(err error, hasSequence bool) Result {
+	if errors.Is(err, durablestream.ErrSequenceConflict) ||
+		(hasSequence && errors.Is(err, durablestream.ErrConflict)) {
+		return Result{
+			Type:        "error",
+			Success:     false,
+			CommandType: "append",
+			Status:      http.StatusConflict,
+			ErrorCode:   "SEQUENCE_CONFLICT",
+			Message:     err.Error(),
+		}
+	}
+	return errorResult("append", err)
 }
 
 // idempotentAppendTransport creates a transport that bypasses the durablestream.Client
@@ -575,6 +593,25 @@ func handleIdempotentAppendBatch(cmd Command) Result {
 	}
 }
 
+// readModeForLive translates the adapter protocol's optional live field. An
+// omitted field unmarshals into a nil interface and, like explicit false, means
+// a single catch-up read. The bool return reports whether live tailing was
+// requested; ReadModeAuto alone cannot encode that distinction.
+func readModeForLive(live any) (durablestream.ReadMode, bool) {
+	switch v := live.(type) {
+	case string:
+		switch v {
+		case "long-poll":
+			return durablestream.ReadModeLongPoll, true
+		case "sse":
+			return durablestream.ReadModeSSE, true
+		}
+	case bool:
+		return durablestream.ReadModeAuto, v
+	}
+	return durablestream.ReadModeAuto, false
+}
+
 func handleRead(cmd Command) Result {
 	timeoutMs := cmd.TimeoutMs
 	if timeoutMs == 0 {
@@ -590,21 +627,10 @@ func handleRead(cmd Command) Result {
 		offset = durablestream.Offset(cmd.Offset)
 	}
 
-	// Determine live mode from command
-	var readMode durablestream.ReadMode
-	switch v := cmd.Live.(type) {
-	case string:
-		switch v {
-		case "long-poll":
-			readMode = durablestream.ReadModeLongPoll
-		case "sse":
-			readMode = durablestream.ReadModeSSE
-		}
-	case bool:
-		if !v {
-			readMode = durablestream.ReadModeAuto // No live mode, just catch-up
-		}
-	}
+	// Determine live mode from command. Keep the live/non-live bit separately:
+	// the zero ReadMode is Auto both for an omitted live field (catch-up only)
+	// and for live=true (auto-select live transport).
+	readMode, live := readModeForLive(cmd.Live)
 
 	// Resolve dynamic headers once for this operation via context
 	ctx = withResolvedHeaders(ctx)
@@ -636,7 +662,9 @@ func handleRead(cmd Command) Result {
 				// Timeout - we've caught up (no new data within timeout)
 				upToDate = true
 				finalOffset = reader.Offset().String()
-				status = 204
+				if len(chunks) == 0 {
+					status = 204
+				}
 				break
 			}
 			// Include reader's offset so test runner knows current position
@@ -662,7 +690,7 @@ func handleRead(cmd Command) Result {
 		}
 
 		// In non-live mode, if we got upToDate, we're done
-		if cmd.Live == false && result.UpToDate {
+		if !live && result.UpToDate {
 			break
 		}
 	}

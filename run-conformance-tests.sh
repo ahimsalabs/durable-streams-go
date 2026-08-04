@@ -1,12 +1,15 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # Wrapper script to run client conformance tests for the local Go client
 # Builds and runs the local conformance adapter from this repository
 
-set -e
+set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ADAPTER_DIR="${SCRIPT_DIR}/conformance/adapter"
-ADAPTER_BIN="/tmp/durable-streams-go-conformance-adapter"
+BIN_DIR="$(mktemp -d)"
+ADAPTER_BIN="${BIN_DIR}/durable-streams-go-conformance-adapter"
+CLIENT_SUITE="${SCRIPT_DIR}/conformance/node_modules/.bin/client-conformance-tests"
+trap 'rm -rf "$BIN_DIR"' EXIT
 
 # Colors for output
 RED='\033[0;31m'
@@ -27,12 +30,15 @@ build_adapter() {
 
 # Run the conformance tests
 run_tests() {
+    echo_info "Installing pinned conformance dependencies..."
+    npm ci --prefix "${SCRIPT_DIR}/conformance" --ignore-scripts --no-audit --no-fund
+
     build_adapter
 
     echo_info "Running client conformance tests..."
     echo_info "Adapter: $ADAPTER_DIR (local)"
 
-    npx @durable-streams/client-conformance-tests --run "$ADAPTER_BIN" "$@"
+    "$CLIENT_SUITE" --run "$ADAPTER_BIN" "$@"
 }
 
 # Main

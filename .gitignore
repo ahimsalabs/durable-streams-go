@@ -1,8 +1,9 @@
-# Built binaries
-testserver
-durablestream.test
-snippet
-conformance-adapter
+# Built binaries (repo root only; unanchored names also match cmd/testserver
+# and internal/snippet, which hides their sources)
+/testserver
+/durablestream.test
+/snippet
+/conformance-adapter
 
 # Generated docs
 API.md
