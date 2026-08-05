@@ -28,7 +28,18 @@ type result struct {
 	created bool
 	offset  durablestream.Offset
 	err     error
+
+	// Barrier results: the WAL position and txnID with every prior frame
+	// committed and published.
+	walSeq  uint64
+	walOff  int64
+	nextTxn uint64
 }
+
+// opBarrier is a queue-only operation (never a WAL frame): its result carries
+// the WAL position at which every earlier submission has been committed and
+// published. The materializer uses it to bound checkpoint advancement.
+const opBarrier opKind = 0xff
 
 // partition is one WAL partition and its worker. The worker goroutine is the
 // only writer of the partition's WAL and the only mutator of its streams'
@@ -55,6 +66,16 @@ type partition struct {
 	lastTS    int64
 	encodeBuf []byte
 	broken    error // latched fail-stop error after a WAL I/O failure
+
+	// Materializer coordination. The worker adds under dirtyMu at publish
+	// time; the materializer swaps the containers each round.
+	dirtyMu  sync.Mutex
+	dirty    map[*streamState]struct{}
+	removals []*streamState // dead incarnations awaiting directory removal
+
+	// Materializer-owned: the last durably written checkpoint position.
+	ckptSeq uint64
+	ckptOff int64
 }
 
 func newPartition(id uint32, st *Storage, wal *walWriter) *partition {
@@ -66,7 +87,33 @@ func newPartition(id uint32, st *Storage, wal *walWriter) *partition {
 		accepting: true,
 		stop:      make(chan struct{}),
 		nextTxnID: 1,
+		dirty:     make(map[*streamState]struct{}),
 	}
+}
+
+// markDirty records that a stream's state changed since the materializer's
+// last round.
+func (p *partition) markDirty(st *streamState) {
+	p.dirtyMu.Lock()
+	p.dirty[st] = struct{}{}
+	p.dirtyMu.Unlock()
+}
+
+// markRemoval queues a dead incarnation's directory for removal.
+func (p *partition) markRemoval(st *streamState) {
+	p.dirtyMu.Lock()
+	p.removals = append(p.removals, st)
+	p.dirtyMu.Unlock()
+}
+
+// swapDirty hands the current dirty set and removal list to the materializer.
+func (p *partition) swapDirty() (map[*streamState]struct{}, []*streamState) {
+	p.dirtyMu.Lock()
+	dirty, removals := p.dirty, p.removals
+	p.dirty = make(map[*streamState]struct{})
+	p.removals = nil
+	p.dirtyMu.Unlock()
+	return dirty, removals
 }
 
 // submit hands a request to the worker and blocks until it completes. It is
@@ -230,6 +277,8 @@ type stagedOp struct {
 	req *request
 	res result
 
+	barrier bool
+
 	applyCreate *createApply
 	applyAppend *appendApply
 	applyDelete *deleteApply
@@ -340,8 +389,13 @@ func (p *partition) processGroup(group []*request) {
 		p.encodeBuf = nil
 	}
 
+	// Publish everything before delivering any result: a barrier's result
+	// must not reach the materializer while frames later in this group are
+	// still unpublished, or a checkpoint could advance past them.
 	for _, op := range staged {
 		p.publish(op, segSeq, base)
+	}
+	for _, op := range staged {
 		op.req.done <- op.res
 	}
 }
@@ -354,6 +408,12 @@ const maxRetainedEncodeBuf = 8 << 20
 // waiters (invariant I3: only after the group fdatasync).
 func (p *partition) publish(op *stagedOp, segSeq uint64, base int64) {
 	switch {
+	case op.barrier:
+		// Everything submitted before this barrier is committed and
+		// published; report the WAL frontier for checkpointing.
+		op.res.walSeq = p.wal.activeSeq
+		op.res.walOff = p.wal.writePos
+		op.res.nextTxn = p.nextTxnID
 	case op.applyCreate != nil:
 		a := op.applyCreate
 		st := a.newState
@@ -369,7 +429,9 @@ func (p *partition) publish(op *stagedOp, segSeq uint64, base int64) {
 		p.st.streams.Store(st.id, st)
 		if a.displaced != nil {
 			a.displaced.markDeleted()
+			p.markRemoval(a.displaced)
 		}
+		p.markDirty(st)
 	case op.applyAppend != nil:
 		a := op.applyAppend
 		st := a.state
@@ -394,16 +456,19 @@ func (p *partition) publish(op *stagedOp, segSeq uint64, base int64) {
 		}
 		st.mu.Unlock()
 		st.wake()
+		p.markDirty(st)
 	case op.applyDelete != nil:
 		a := op.applyDelete
 		a.state.markDeleted()
 		p.st.streams.CompareAndDelete(a.state.id, a.state)
+		p.markRemoval(a.state)
 	case op.applyTouch != nil:
 		a := op.applyTouch
 		a.state.mu.Lock()
 		a.state.cfg.ExpiresAt = a.expiresAt
 		a.state.mu.Unlock()
 		a.state.wake()
+		p.markDirty(a.state)
 	}
 }
 
@@ -430,6 +495,10 @@ func (p *partition) loadPending(pending map[string]*pendingStream, streamID stri
 // stream, prepares its frame spec and apply context.
 func (p *partition) stage(req *request, pending map[string]*pendingStream, now time.Time, ts int64) (*stagedOp, frameSpec) {
 	op := &stagedOp{req: req}
+	if req.op == opBarrier {
+		op.barrier = true // resolved in publish, after the group commits
+		return op, frameSpec{}
+	}
 	ps := p.loadPending(pending, req.streamID)
 	expired := ps.exists && !ps.cfg.ExpiresAt.IsZero() && now.After(ps.cfg.ExpiresAt)
 

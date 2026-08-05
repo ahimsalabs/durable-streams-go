@@ -9,13 +9,16 @@ import (
 
 // Defaults for Options fields left at their zero values.
 const (
-	DefaultPartitions      = 32
-	DefaultMaxMessageSize  = 10 << 20 // 10 MiB
-	DefaultWALSegmentBytes = 256 << 20
-	DefaultGroupLinger     = 500 * time.Microsecond
-	DefaultGroupMaxBytes   = 4 << 20
-	DefaultQueueDepth      = 256
-	DefaultShutdownTimeout = 30 * time.Second
+	DefaultPartitions          = 32
+	DefaultMaxMessageSize      = 10 << 20 // 10 MiB
+	DefaultWALSegmentBytes     = 256 << 20
+	DefaultGroupLinger         = 500 * time.Microsecond
+	DefaultGroupMaxBytes       = 4 << 20
+	DefaultQueueDepth          = 256
+	DefaultShutdownTimeout     = 30 * time.Second
+	DefaultMaterializeInterval = 25 * time.Millisecond
+	DefaultStreamSegmentBytes  = 128 << 20
+	DefaultSparseIndexBytes    = 32 << 10
 )
 
 // SyncWrites selects whether acknowledged writes are fdatasync'd.
@@ -87,6 +90,21 @@ type Options struct {
 
 	// ShutdownTimeout bounds how long Close waits for workers to drain.
 	ShutdownTimeout time.Duration
+
+	// MaterializeInterval is how often each partition's materializer copies
+	// committed WAL records into per-stream segments, flushes manifests,
+	// advances the checkpoint, and reclaims fully-reflected WAL segments.
+	// -1 disables materialization: reads stay WAL-resident and the WAL is
+	// never reclaimed (useful for tests).
+	MaterializeInterval time.Duration
+
+	// StreamSegmentBytes is the size at which a stream's active segment is
+	// sealed and a new one started.
+	StreamSegmentBytes int64
+
+	// SparseIndexBytes is the spacing of sparse index entries within stream
+	// segments: one entry per this many payload-file bytes.
+	SparseIndexBytes int
 }
 
 func (o Options) withDefaults() Options {
@@ -113,6 +131,15 @@ func (o Options) withDefaults() Options {
 	}
 	if o.ShutdownTimeout == 0 {
 		o.ShutdownTimeout = DefaultShutdownTimeout
+	}
+	if o.MaterializeInterval == 0 {
+		o.MaterializeInterval = DefaultMaterializeInterval
+	}
+	if o.StreamSegmentBytes == 0 {
+		o.StreamSegmentBytes = DefaultStreamSegmentBytes
+	}
+	if o.SparseIndexBytes == 0 {
+		o.SparseIndexBytes = DefaultSparseIndexBytes
 	}
 	return o
 }
@@ -144,6 +171,16 @@ func (o Options) validate() error {
 	}
 	if _, err := o.SyncWrites.enabled(); err != nil {
 		errs = append(errs, err)
+	}
+	if o.MaterializeInterval < 0 && o.MaterializeInterval != -1 {
+		errs = append(errs, fmt.Errorf("option MaterializeInterval must be positive or -1, got %v", o.MaterializeInterval))
+	}
+	if o.StreamSegmentBytes < segmentHeaderSize+segmentRecordHeaderSize {
+		errs = append(errs, fmt.Errorf("option StreamSegmentBytes %d is below the minimum %d",
+			o.StreamSegmentBytes, segmentHeaderSize+segmentRecordHeaderSize))
+	}
+	if o.SparseIndexBytes < 512 {
+		errs = append(errs, fmt.Errorf("option SparseIndexBytes must be at least 512, got %d", o.SparseIndexBytes))
 	}
 	if len(errs) > 0 {
 		return fmt.Errorf("seglog: invalid options: %w", errors.Join(errs...))

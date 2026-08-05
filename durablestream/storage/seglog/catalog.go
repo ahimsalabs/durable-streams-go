@@ -5,6 +5,8 @@ import (
 	"encoding/hex"
 	"fmt"
 	"hash/fnv"
+	"os"
+	"slices"
 	"sync"
 
 	"github.com/ahimsalabs/durable-streams-go/durablestream"
@@ -41,11 +43,15 @@ type walLoc struct {
 
 // streamState is the in-memory state of one stream incarnation.
 //
-// Ownership: only the stream's partition worker mutates fields, always under
-// mu (invariant I5), so the worker may read them lock-free while readers take
-// mu.RLock for consistent snapshots. A new incarnation of the same stream ID
-// is a new *streamState; waiters pin the pointer they started with, so a
-// delete+recreate can never feed them the successor's data.
+// Ownership: two goroutines mutate disjoint field groups, both always under
+// mu, so each may read its own fields lock-free while readers take mu.RLock
+// for consistent snapshots (invariant I5). The partition worker owns the
+// logical state: cfg, closed, deleted, lastSeq, nextIndex, and walTail
+// appends. The partition's materializer owns the materialized state: sealed,
+// activeView, materializedThrough, and walTail pruning (firstLive). A new
+// incarnation of the same stream ID is a new *streamState; waiters pin the
+// pointer they started with, so a delete+recreate can never feed them the
+// successor's data.
 type streamState struct {
 	mu sync.RWMutex
 
@@ -60,14 +66,49 @@ type streamState struct {
 	lastSeq   string
 	nextIndex int64 // next logical index to assign; the first message gets 1
 
-	// walTail holds the location of every live message still served from the
-	// WAL. walTail[i] is the message at logical index firstLive+i.
+	// walTail holds the location of every message not yet materialized.
+	// walTail[i] is the message at logical index firstLive+i, and firstLive
+	// is always materializedThrough+1.
 	firstLive int64
 	walTail   []walLoc
+
+	// Materialized state: indices <= materializedThrough are served from
+	// sealed segments (immutable) and the published activeView (a stable
+	// prefix of the active segment). activeSeg is the materializer-private
+	// mutable handle behind activeView and is never touched under mu.
+	sealed              []*segmentFile
+	activeView          segmentView
+	materializedThrough int64
+	activeSeg           *segmentFile
 
 	// notifyCh releases WaitForData callers. It is closed and replaced on
 	// every wake, and closed permanently when the incarnation dies.
 	notifyCh chan struct{}
+}
+
+// segmentView is a read-only view of a segment prefix that is safe to read
+// concurrently with the materializer appending behind it: records below end
+// are never rewritten.
+type segmentView struct {
+	f          *os.File
+	name       string
+	firstIndex int64
+	lastIndex  int64
+	end        int64
+	sparse     []sparseEntry
+}
+
+// view publishes the segment's current committed prefix. The sparse slice is
+// cloned because the materializer keeps appending to its own copy.
+func (sf *segmentFile) view() segmentView {
+	return segmentView{
+		f:          sf.f,
+		name:       sf.name,
+		firstIndex: sf.firstIndex,
+		lastIndex:  sf.lastIndex,
+		end:        sf.bytes,
+		sparse:     slices.Clone(sf.sparse),
+	}
 }
 
 func newStreamState(id string, inc incarnation, partition uint32, cfg durablestream.StreamConfig) *streamState {
@@ -114,21 +155,30 @@ type readSnapshot struct {
 	cfg       durablestream.StreamConfig
 	closed    bool
 	deleted   bool
+	lastSeq   string
 	tail      int64
 	firstLive int64
 	walTail   []walLoc // shared read-only prefix; never mutated in place
+
+	sealed     []*segmentFile // immutable once sealed
+	activeView segmentView
+	through    int64 // materializedThrough
 }
 
 func (st *streamState) snapshot() readSnapshot {
 	st.mu.RLock()
 	defer st.mu.RUnlock()
 	return readSnapshot{
-		inc:       st.inc,
-		cfg:       st.cfg,
-		closed:    st.closed,
-		deleted:   st.deleted,
-		tail:      st.nextIndex - 1,
-		firstLive: st.firstLive,
-		walTail:   st.walTail,
+		inc:        st.inc,
+		cfg:        st.cfg,
+		closed:     st.closed,
+		deleted:    st.deleted,
+		lastSeq:    st.lastSeq,
+		tail:       st.nextIndex - 1,
+		firstLive:  st.firstLive,
+		walTail:    st.walTail,
+		sealed:     st.sealed,
+		activeView: st.activeView,
+		through:    st.materializedThrough,
 	}
 }

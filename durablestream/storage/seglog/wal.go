@@ -2,6 +2,7 @@ package seglog
 
 import (
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"hash/crc32"
 	"os"
@@ -125,6 +126,11 @@ func (w *walWriter) initSegment(f *os.File, seq uint64) error {
 	return nil
 }
 
+// errWALSegmentGone reports a read of a WAL segment that was reclaimed after
+// materialization. Readers holding a stale snapshot re-snapshot and retry:
+// the data is now served from stream segments.
+var errWALSegmentGone = errors.New("seglog: WAL segment reclaimed")
+
 // readPayload copies one committed payload into a fresh buffer, verifying its
 // checksum. It is safe concurrently with appends: committed bytes are never
 // rewritten.
@@ -133,10 +139,13 @@ func (w *walWriter) readPayload(loc walLoc) ([]byte, error) {
 	f := w.segments[loc.segmentSeq]
 	w.mu.RUnlock()
 	if f == nil {
-		return nil, fmt.Errorf("seglog: WAL segment %d is not open", loc.segmentSeq)
+		return nil, errWALSegmentGone
 	}
 	buf := make([]byte, int(loc.length)+4)
 	if _, err := f.ReadAt(buf, loc.off); err != nil {
+		if errors.Is(err, os.ErrClosed) {
+			return nil, errWALSegmentGone
+		}
 		return nil, fmt.Errorf("seglog: read WAL payload: %w", err)
 	}
 	payload := buf[:loc.length]
@@ -144,6 +153,36 @@ func (w *walWriter) readPayload(loc walLoc) ([]byte, error) {
 		return nil, fmt.Errorf("seglog: WAL payload checksum mismatch in segment %d at %d", loc.segmentSeq, loc.off)
 	}
 	return payload, nil
+}
+
+// removeBefore closes and unlinks every segment with a sequence below keep.
+// The caller guarantees every frame in those segments is reflected in durable
+// manifests and the checkpoint; concurrent readers with stale snapshots get
+// errWALSegmentGone and retry against stream segments.
+func (w *walWriter) removeBefore(keep uint64) error {
+	w.mu.Lock()
+	var victims []uint64
+	for seq := range w.segments {
+		if seq < keep {
+			victims = append(victims, seq)
+		}
+	}
+	for _, seq := range victims {
+		_ = w.segments[seq].Close()
+		delete(w.segments, seq)
+	}
+	w.mu.Unlock()
+
+	var firstErr error
+	for _, seq := range victims {
+		if err := os.Remove(walSegmentPath(w.dir, seq)); err != nil && firstErr == nil {
+			firstErr = fmt.Errorf("seglog: unlink WAL segment %d: %w", seq, err)
+		}
+	}
+	if len(victims) > 0 && firstErr == nil {
+		firstErr = syncDir(w.dir)
+	}
+	return firstErr
 }
 
 // close closes every segment descriptor.

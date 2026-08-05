@@ -118,6 +118,9 @@ func New(opts Options) (_ *Storage, retErr error) {
 	}
 	for _, p := range s.parts {
 		s.workers.Go(p.run)
+		if opts.MaterializeInterval != -1 {
+			s.workers.Go(func() { s.runMaterializer(p) })
+		}
 	}
 	return s, nil
 }
@@ -378,6 +381,10 @@ func (s *Storage) releaseResources() error {
 			firstErr = err
 		}
 	}
+	s.streams.Range(func(_ string, st *streamState) bool {
+		st.closeSegments()
+		return true
+	})
 	if err := s.releaseLock(); err != nil && firstErr == nil {
 		firstErr = fmt.Errorf("seglog: release lock: %w", err)
 	}
