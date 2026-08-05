@@ -35,10 +35,14 @@ func (s *Storage) WaitForData(ctx context.Context, streamID string, offset durab
 		// lost between the read and the select below.
 		state.mu.RLock()
 		deleted := state.deleted
+		softDeleted := state.softDeleted || (state.cfg.IsExpired() && state.refCount.Load() != 0)
 		notifyCh := state.notifyCh
 		state.mu.RUnlock()
 		if deleted {
 			return nil, notFoundErr(streamID)
+		}
+		if softDeleted {
+			return nil, softDeletedErr(streamID)
 		}
 
 		res, err := s.readState(ctx, state, pos, limit)

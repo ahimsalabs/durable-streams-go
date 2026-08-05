@@ -275,7 +275,11 @@ func buildManifest(st *streamState, snap readSnapshot, sealed []*segmentFile, ac
 		LastSeq:             snap.lastSeq,
 		Retention:           retentionManifest(snap.retention),
 		FloorIndex:          snap.floor,
+		SoftDeleted:         snap.softDeleted,
 		MaterializedThrough: through,
+	}
+	if snap.parent != nil {
+		m.Parent = &manifestParent{StreamID: snap.parent.id, IncarnationID: snap.parent.inc.String(), Fork: *st.fork}
 	}
 	for _, sf := range sealed {
 		m.Sealed = append(m.Sealed, manifestSegment{
@@ -389,6 +393,11 @@ func (s *Storage) sweepStreamRetention(p *partition, st *streamState, now time.T
 		return res.err
 	}
 	snap = st.snapshot()
+	if st.refCount.Load() != 0 {
+		// The logical floor is durable and visible immediately, while pinned
+		// manifests retain physical history needed by descendants.
+		return nil
+	}
 	_, err := s.completeTrimAgainstFloor(st, snap, sealed, st.activeSeg, snap.through)
 	return err
 }
@@ -405,6 +414,14 @@ func (s *Storage) completeTrimAgainstFloor(
 	active *segmentFile,
 	through int64,
 ) ([]*segmentFile, error) {
+	st.physicalMu.Lock()
+	defer st.physicalMu.Unlock()
+	// This check is deliberately inside the physical gate and immediately
+	// before rewrite/unlink. Pin acquisition takes the same gate before its
+	// increment, closing the check-then-unlink race.
+	if st.refCount.Load() != 0 {
+		return sealed, nil
+	}
 	drop := 0
 	for drop < len(sealed) && sealed[drop].lastIndex <= snap.floor {
 		drop++

@@ -86,6 +86,7 @@ const (
 	flagClose          = 1 << 0 // append group ends with permanent EOF
 	flagHasSeq         = 1 << 1 // meta carries a dedup sequence string
 	flagClosedAtCreate = 1 << 2 // stream created already at permanent EOF
+	flagSoftDelete     = 1 << 3
 )
 
 // incarnation is the raw 16-byte identity of one stream incarnation; its hex

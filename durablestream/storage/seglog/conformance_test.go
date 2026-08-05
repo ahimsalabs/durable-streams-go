@@ -73,5 +73,6 @@ func TestConformance(t *testing.T) {
 		RequireIncarnationID: true,
 		RequireAtomicBatches: true,
 		RequireAtomicClose:   true,
+		RequireForks:         true,
 	})
 }

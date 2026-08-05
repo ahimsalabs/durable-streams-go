@@ -32,6 +32,10 @@ type Storage struct {
 	streams hashtriemap.HashTrieMap[string, *streamState]
 	parts   []*partition
 
+	// topologyMu serializes path publication, source pinning, and delete
+	// cascades. Lock order is topologyMu -> partition submit -> stream mu.
+	topologyMu sync.RWMutex
+
 	// shutdownCh releases WaitForData callers when the storage closes.
 	shutdownCh chan struct{}
 	closed     atomic.Bool
@@ -45,6 +49,7 @@ var (
 	_ durablestream.Storage            = (*Storage)(nil)
 	_ durablestream.AtomicBatchStorage = (*Storage)(nil)
 	_ durablestream.AtomicCloseStorage = (*Storage)(nil)
+	_ durablestream.ForkStorage        = (*Storage)(nil)
 )
 
 // New opens (or initializes) a seglog storage rooted at opts.Dir, recovering
@@ -187,12 +192,28 @@ func notFoundErr(streamID string) error {
 	return fmt.Errorf("seglog: stream %q not found: %w", streamID, durablestream.ErrNotFound)
 }
 
+func softDeletedErr(streamID string) error {
+	return fmt.Errorf("seglog: stream %q is retained by forks: %w", streamID, durablestream.ErrSoftDeleted)
+}
+
 // validateBatch checks every message against per-message and aggregate
 // limits. The aggregate bound is the WAL segment capacity: one logical
 // mutation is one frame and a frame never spans segments. metaBound must be
 // the same overestimate group admission uses (estimateFrameBytes), so any
 // admitted request is guaranteed to encode within one segment.
 func (s *Storage) validateBatch(streamID string, messages [][]byte, allowEmptyBatch bool, metaBound int) error {
+	if err := s.validatePayloads(messages, allowEmptyBatch); err != nil {
+		return err
+	}
+	capacity := s.opts.WALSegmentBytes - walSegmentHeaderSize
+	if size := encodedFrameSize(len(streamID), metaBound, messages); size > capacity {
+		return fmt.Errorf("seglog: batch of %d bytes exceeds the %d-byte transaction capacity: %w",
+			size, capacity, durablestream.ErrPayloadTooLarge)
+	}
+	return nil
+}
+
+func (s *Storage) validatePayloads(messages [][]byte, allowEmptyBatch bool) error {
 	if len(messages) == 0 {
 		if allowEmptyBatch {
 			return nil
@@ -207,11 +228,6 @@ func (s *Storage) validateBatch(streamID string, messages [][]byte, allowEmptyBa
 			return fmt.Errorf("seglog: message %d of %d bytes exceeds limit %d: %w",
 				i, len(msg), s.opts.MaxMessageSize, durablestream.ErrPayloadTooLarge)
 		}
-	}
-	capacity := s.opts.WALSegmentBytes - walSegmentHeaderSize
-	if size := encodedFrameSize(len(streamID), metaBound, messages); size > capacity {
-		return fmt.Errorf("seglog: batch of %d bytes exceeds the %d-byte transaction capacity: %w",
-			size, capacity, durablestream.ErrPayloadTooLarge)
 	}
 	return nil
 }
@@ -232,6 +248,14 @@ func (s *Storage) CreateWithMessages(ctx context.Context, streamID string, cfg d
 	}
 	if err := s.validateBatch(streamID, messages, true, metaBoundForCreate(cfg.ContentType)); err != nil {
 		return false, "", err
+	}
+	s.topologyMu.RLock()
+	defer s.topologyMu.RUnlock()
+	if existing, ok := s.streams.Load(streamID); ok {
+		snap := existing.snapshot()
+		if snap.softDeleted || (snap.cfg.IsExpired() && existing.refCount.Load() != 0) {
+			return false, "", fmt.Errorf("seglog: stream path is retained by forks: %w", durablestream.ErrConflict)
+		}
 	}
 	res := s.partitionFor(streamID).submit(&request{
 		op:       opCreate,
@@ -271,6 +295,14 @@ func (s *Storage) append(streamID string, messages [][]byte, seq string, closeAf
 	if err := s.validateBatch(streamID, messages, allowEmptyBatch, len(seq)); err != nil {
 		return "", err
 	}
+	s.topologyMu.RLock()
+	defer s.topologyMu.RUnlock()
+	if st, ok := s.streams.Load(streamID); ok {
+		snap := st.snapshot()
+		if snap.softDeleted || (snap.cfg.IsExpired() && st.refCount.Load() != 0) {
+			return "", softDeletedErr(streamID)
+		}
+	}
 	res := s.partitionFor(streamID).submit(&request{
 		op:       opAppend,
 		streamID: streamID,
@@ -291,12 +323,22 @@ func (s *Storage) Delete(ctx context.Context, streamID string) error {
 	if err := validateStreamID(streamID); err != nil {
 		return err
 	}
-	res := s.partitionFor(streamID).submit(&request{
-		op:       opDelete,
-		streamID: streamID,
-		done:     make(chan result, 1),
-	})
-	return res.err
+	s.topologyMu.Lock()
+	defer s.topologyMu.Unlock()
+	st, ok := s.streams.Load(streamID)
+	if !ok {
+		return notFoundErr(streamID)
+	}
+	if st.snapshot().softDeleted {
+		return softDeletedErr(streamID)
+	}
+	soft := st.refCount.Load() != 0
+	res := s.partitionFor(streamID).submit(&request{op: opDelete, streamID: streamID, softDelete: soft, done: make(chan result, 1)})
+	if res.err != nil || soft {
+		return res.err
+	}
+	s.releaseParentCascade(st)
+	return nil
 }
 
 // Touch implements durablestream.Storage.
@@ -306,6 +348,14 @@ func (s *Storage) Touch(ctx context.Context, streamID string) error {
 	}
 	if err := validateStreamID(streamID); err != nil {
 		return err
+	}
+	s.topologyMu.RLock()
+	defer s.topologyMu.RUnlock()
+	if st, ok := s.streams.Load(streamID); ok {
+		snap := st.snapshot()
+		if snap.softDeleted || (snap.cfg.IsExpired() && st.refCount.Load() != 0) {
+			return softDeletedErr(streamID)
+		}
 	}
 	res := s.partitionFor(streamID).submit(&request{
 		op:       opTouch,
@@ -327,6 +377,8 @@ func (s *Storage) SetRetention(ctx context.Context, streamID string, r Retention
 	if err := validateStreamID(streamID); err != nil {
 		return err
 	}
+	s.topologyMu.RLock()
+	defer s.topologyMu.RUnlock()
 	res := s.partitionFor(streamID).submit(&request{
 		op:        opRetention,
 		streamID:  streamID,
@@ -349,6 +401,9 @@ func (s *Storage) Head(ctx context.Context, streamID string) (*durablestream.Str
 		return nil, notFoundErr(streamID)
 	}
 	snap := state.snapshot()
+	if snap.softDeleted || (snap.cfg.IsExpired() && state.refCount.Load() != 0) {
+		return nil, softDeletedErr(streamID)
+	}
 	if snap.deleted || snap.cfg.IsExpired() {
 		return nil, notFoundErr(streamID)
 	}

@@ -8,6 +8,7 @@ import (
 	"os"
 	"slices"
 	"sync"
+	"sync/atomic"
 
 	"github.com/ahimsalabs/durable-streams-go/durablestream"
 )
@@ -59,11 +60,25 @@ type streamState struct {
 	inc       incarnation
 	partition uint32
 
-	cfg       durablestream.StreamConfig
-	retention Retention
-	floor     int64 // highest trimmed index; messages at or below it are gone
-	closed    bool  // permanent EOF (protocol closure, not Storage.Close)
-	deleted   bool  // this incarnation was deleted or displaced
+	cfg         durablestream.StreamConfig
+	retention   Retention
+	floor       int64 // highest trimmed index; messages at or below it are gone
+	closed      bool  // permanent EOF (protocol closure, not Storage.Close)
+	deleted     bool  // this incarnation was deleted or displaced
+	softDeleted bool
+
+	// Fork topology is immutable except for the bounded direct-child count.
+	// parent and fork are published under Storage.topologyMu before the state
+	// becomes reachable. refCount includes provisional CreateFork pins. A pin
+	// is acquired while holding physicalMu; physical trimming holds the same
+	// gate through its final pin check, manifest rewrite, and unlink. Thus a
+	// newly effective pin can never race an unlink, without requiring the
+	// materializer to acquire topologyMu.
+	parent         *streamState
+	parentBoundary int64
+	fork           *forkMeta
+	refCount       atomic.Int64
+	physicalMu     sync.Mutex
 
 	lastSeq   string
 	nextIndex int64 // next logical index to assign; the first message gets 1
@@ -153,16 +168,19 @@ func (st *streamState) markDeleted() {
 // readSnapshot is a consistent view of the fields Read/Head/WaitForData need,
 // taken under RLock so file I/O can happen without holding any lock.
 type readSnapshot struct {
-	inc       incarnation
-	cfg       durablestream.StreamConfig
-	closed    bool
-	deleted   bool
-	lastSeq   string
-	retention Retention
-	floor     int64
-	tail      int64
-	firstLive int64
-	walTail   []walLoc // shared read-only prefix; never mutated in place
+	inc            incarnation
+	cfg            durablestream.StreamConfig
+	closed         bool
+	deleted        bool
+	softDeleted    bool
+	parent         *streamState
+	parentBoundary int64
+	lastSeq        string
+	retention      Retention
+	floor          int64
+	tail           int64
+	firstLive      int64
+	walTail        []walLoc // shared read-only prefix; never mutated in place
 
 	sealed     []*segmentFile // immutable once sealed
 	activeView segmentView
@@ -173,18 +191,21 @@ func (st *streamState) snapshot() readSnapshot {
 	st.mu.RLock()
 	defer st.mu.RUnlock()
 	return readSnapshot{
-		inc:        st.inc,
-		cfg:        st.cfg,
-		closed:     st.closed,
-		deleted:    st.deleted,
-		lastSeq:    st.lastSeq,
-		retention:  st.retention,
-		floor:      st.floor,
-		tail:       st.nextIndex - 1,
-		firstLive:  st.firstLive,
-		walTail:    st.walTail,
-		sealed:     st.sealed,
-		activeView: st.activeView,
-		through:    st.materializedThrough,
+		inc:            st.inc,
+		cfg:            st.cfg,
+		closed:         st.closed,
+		deleted:        st.deleted,
+		softDeleted:    st.softDeleted,
+		parent:         st.parent,
+		parentBoundary: st.parentBoundary,
+		lastSeq:        st.lastSeq,
+		retention:      st.retention,
+		floor:          st.floor,
+		tail:           st.nextIndex - 1,
+		firstLive:      st.firstLive,
+		walTail:        st.walTail,
+		sealed:         st.sealed,
+		activeView:     st.activeView,
+		through:        st.materializedThrough,
 	}
 }

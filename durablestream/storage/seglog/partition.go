@@ -14,22 +14,32 @@ import (
 // slices are borrowed: submit blocks until completion, so the worker may
 // encode them without copying.
 type request struct {
-	op        opKind
-	streamID  string
-	cfg       durablestream.StreamConfig // opCreate
-	messages  [][]byte
-	seq       string
-	hasSeq    bool
-	close     bool      // opAppend: stream reaches permanent EOF after messages
-	retention Retention // opRetention
-	floor     int64     // opTrim
-	done      chan result
+	op           opKind
+	streamID     string
+	cfg          durablestream.StreamConfig // opCreate
+	messages     [][]byte
+	seq          string
+	hasSeq       bool
+	close        bool      // opAppend: stream reaches permanent EOF after messages
+	retention    Retention // opRetention
+	floor        int64     // opTrim
+	softDelete   bool
+	hardCascade  bool
+	forkSource   *streamState
+	forkMeta     *forkMeta
+	forkMetaRaw  []byte
+	forkBoundary int64
+	prefixCount  int64
+	done         chan result
 }
 
 type result struct {
 	created bool
 	offset  durablestream.Offset
 	err     error
+	// ambiguous is set when a WAL write/sync failed after bytes may have
+	// reached durable media. Callers must conservatively retain topology pins.
+	ambiguous bool
 
 	// Barrier results: the WAL position and txnID with every prior frame
 	// committed and published.
@@ -205,6 +215,8 @@ func estimateFrameBytes(req *request) int64 {
 		metaLen = len(req.seq)
 	case opCreate:
 		metaLen = metaBoundForCreate(req.cfg.ContentType)
+	case opFork:
+		metaLen = len(req.forkMetaRaw)
 	default:
 		metaLen = touchMetaBound
 	}
@@ -287,6 +299,7 @@ type stagedOp struct {
 	applyTouch     *touchApply
 	applyRetention *retentionApply
 	applyTrim      *trimApply
+	applyFork      *createApply
 
 	// payloadOffs are each payload's offset relative to the group buffer,
 	// filled after encoding.
@@ -309,7 +322,10 @@ type appendApply struct {
 	close      bool
 }
 
-type deleteApply struct{ state *streamState }
+type deleteApply struct {
+	state *streamState
+	soft  bool
+}
 
 type touchApply struct {
 	state     *streamState
@@ -328,7 +344,7 @@ type trimApply struct {
 
 func (op *stagedOp) hasFrame() bool {
 	return op.applyCreate != nil || op.applyAppend != nil || op.applyDelete != nil || op.applyTouch != nil ||
-		op.applyRetention != nil || op.applyTrim != nil
+		op.applyRetention != nil || op.applyTrim != nil || op.applyFork != nil
 }
 
 // pendingStream is the staging overlay for one stream within a group: later
@@ -393,7 +409,7 @@ func (p *partition) processGroup(group []*request) {
 				"partition", p.id, "error", err)
 			for _, op := range staged {
 				if op.hasFrame() {
-					op.res = result{err: p.broken}
+					op.res = result{err: p.broken, ambiguous: true}
 				}
 				op.req.done <- op.res
 			}
@@ -449,6 +465,20 @@ func (p *partition) publish(op *stagedOp, segSeq uint64, base int64) {
 			p.markRemoval(a.displaced)
 		}
 		p.markDirty(st)
+	case op.applyFork != nil:
+		st := op.applyFork.newState
+		for i, rel := range op.payloadOffs {
+			batchFirst := st.parentBoundary + 1
+			if int64(i) >= op.req.prefixCount {
+				batchFirst += op.req.prefixCount
+			}
+			st.walTail = append(st.walTail, walLoc{
+				segmentSeq: segSeq, off: base + rel, length: op.payloadLens[i],
+				batchFirst: batchFirst, ts: op.ts,
+			})
+		}
+		p.st.streams.Store(st.id, st)
+		p.markDirty(st)
 	case op.applyAppend != nil:
 		a := op.applyAppend
 		st := a.state
@@ -476,6 +506,15 @@ func (p *partition) publish(op *stagedOp, segSeq uint64, base int64) {
 		p.markDirty(st)
 	case op.applyDelete != nil:
 		a := op.applyDelete
+		if a.soft {
+			a.state.mu.Lock()
+			a.state.softDeleted = true
+			close(a.state.notifyCh)
+			a.state.notifyCh = make(chan struct{})
+			a.state.mu.Unlock()
+			p.markDirty(a.state)
+			break
+		}
 		a.state.markDeleted()
 		p.st.streams.CompareAndDelete(a.state.id, a.state)
 		p.markRemoval(a.state)
@@ -547,6 +586,8 @@ func (p *partition) stage(req *request, pending map[string]*pendingStream, now t
 		return op, p.stageRetention(op, req, ps, expired, ts)
 	case opTrim:
 		return op, p.stageTrim(op, req, ps, expired, ts)
+	case opFork:
+		return op, p.stageFork(op, req, ps, now, ts)
 	default:
 		op.res = result{err: fmt.Errorf("seglog: unknown operation %d: %w", req.op, durablestream.ErrBadRequest)}
 		return op, frameSpec{}
@@ -656,6 +697,10 @@ func (p *partition) stageAppend(op *stagedOp, req *request, ps *pendingStream, e
 		op.res = result{err: fmt.Errorf("seglog: stream %q not found: %w", req.streamID, durablestream.ErrNotFound)}
 		return frameSpec{}
 	}
+	if ps.state.softDeleted {
+		op.res = result{err: softDeletedErr(req.streamID)}
+		return frameSpec{}
+	}
 	if ps.closed {
 		if req.close && len(req.messages) == 0 {
 			// Repeating a close-only mutation is idempotent.
@@ -722,6 +767,14 @@ func (p *partition) stageDelete(op *stagedOp, req *request, ps *pendingStream, t
 		return frameSpec{}
 	}
 	state := ps.state
+	if state.softDeleted && !req.hardCascade {
+		op.res = result{err: softDeletedErr(req.streamID)}
+		return frameSpec{}
+	}
+	if req.softDelete {
+		op.applyDelete = &deleteApply{state: state, soft: true}
+		return frameSpec{op: opDelete, flags: flagSoftDelete, streamID: req.streamID, inc: state.inc, ts: ts}
+	}
 	ps.exists = false
 	ps.state = nil
 
@@ -737,6 +790,10 @@ func (p *partition) stageDelete(op *stagedOp, req *request, ps *pendingStream, t
 func (p *partition) stageTouch(op *stagedOp, req *request, ps *pendingStream, expired bool, now time.Time, ts int64) frameSpec {
 	if !ps.exists || expired {
 		op.res = result{err: fmt.Errorf("seglog: stream %q not found: %w", req.streamID, durablestream.ErrNotFound)}
+		return frameSpec{}
+	}
+	if ps.state.softDeleted {
+		op.res = result{err: softDeletedErr(req.streamID)}
 		return frameSpec{}
 	}
 	slid, moved := ps.cfg.SlideExpiry(now)
@@ -764,6 +821,10 @@ func (p *partition) stageTouch(op *stagedOp, req *request, ps *pendingStream, ex
 func (p *partition) stageRetention(op *stagedOp, req *request, ps *pendingStream, expired bool, ts int64) frameSpec {
 	if !ps.exists || expired {
 		op.res = result{err: notFoundErr(req.streamID)}
+		return frameSpec{}
+	}
+	if ps.state.softDeleted {
+		op.res = result{err: softDeletedErr(req.streamID)}
 		return frameSpec{}
 	}
 	meta, err := json.Marshal(retentionMeta{MaxBytes: req.retention.MaxBytes, MaxAgeNanos: int64(req.retention.MaxAge)})

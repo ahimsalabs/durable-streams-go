@@ -26,9 +26,10 @@ type identityKey struct {
 
 // recoveredDir is one stream directory with a valid manifest.
 type recoveredDir struct {
-	key identityKey
-	dir string
-	st  *streamState
+	key      identityKey
+	dir      string
+	st       *streamState
+	manifest manifest
 }
 
 // recoveryScan is the result of the manifest pass.
@@ -57,6 +58,9 @@ func (s *Storage) recoverAll() error {
 		if err := s.recoverPartition(p, scan); err != nil {
 			return err
 		}
+	}
+	if err := s.rebuildTopology(scan); err != nil {
+		return err
 	}
 	s.sweepStreamDirs(scan)
 	// Replay may have advanced logical state beyond its manifest. Mark every
@@ -116,7 +120,7 @@ func (s *Storage) scanStreamDirs() (*recoveryScan, error) {
 				return nil, err
 			}
 			key := identityKey{id: st.id, inc: st.inc}
-			scan.dirs = append(scan.dirs, recoveredDir{key: key, dir: dir, st: st})
+			scan.dirs = append(scan.dirs, recoveredDir{key: key, dir: dir, st: st, manifest: m})
 			scan.byIdentity[key] = st
 		}
 	}
@@ -171,21 +175,33 @@ func (s *Storage) stateFromManifest(dir string, m manifest) (*streamState, error
 	st.lastSeq = m.LastSeq
 	st.retention = m.Retention.retention()
 	st.floor = m.FloorIndex
+	st.softDeleted = m.SoftDeleted
+	if m.Parent != nil {
+		fork := m.Parent.Fork
+		if m.Parent.StreamID == "" || m.Parent.IncarnationID == "" ||
+			m.Parent.StreamID != fork.SourceID || m.Parent.IncarnationID != fork.SourceIncarnationID ||
+			fork.Request.SourceStreamID != fork.SourceID || fork.Boundary < 0 || fork.PrefixCount < 0 {
+			return nil, fmt.Errorf("%w: manifest in %s has inconsistent fork parent identity", errCorrupt, dir)
+		}
+		st.fork = &fork
+		st.parentBoundary = fork.Boundary
+	}
 	st.nextIndex = m.MaterializedThrough + 1
 	st.firstLive = m.MaterializedThrough + 1
 	st.materializedThrough = m.MaterializedThrough
 
-	if st.retention.MaxBytes < 0 || st.retention.MaxAge < 0 || st.floor < 0 || st.floor > m.MaterializedThrough {
+	if st.retention.MaxBytes < 0 || st.retention.MaxAge < 0 || st.floor < 0 || st.floor > m.MaterializedThrough ||
+		(st.fork != nil && m.MaterializedThrough < st.parentBoundary) {
 		return nil, fmt.Errorf("%w: manifest in %s has invalid retention state", errCorrupt, dir)
 	}
-	prevLast := st.floor
+	prevLast := int64(0)
 	for _, ms := range m.Sealed {
 		sf, err := openSealedSegment(filepath.Join(dir, ms.File), ms.File, inc)
 		if err != nil {
 			return nil, fmt.Errorf("%w: %v", errCorrupt, err)
 		}
 		if sf.firstIndex != ms.FirstIndex || sf.lastIndex != ms.LastIndex || sf.bytes != ms.Bytes ||
-			sf.firstIndex != prevLast+1 {
+			(len(st.sealed) > 0 && sf.firstIndex != prevLast+1) {
 			return nil, fmt.Errorf("%w: sealed segment %s disagrees with manifest in %s", errCorrupt, ms.File, dir)
 		}
 		prevLast = sf.lastIndex
@@ -196,7 +212,7 @@ func (s *Storage) stateFromManifest(dir string, m manifest) (*streamState, error
 		if err != nil {
 			return nil, fmt.Errorf("%w: %v", errCorrupt, err)
 		}
-		if sf.firstIndex != m.Active.FirstIndex || sf.firstIndex != prevLast+1 ||
+		if sf.firstIndex != m.Active.FirstIndex || (len(st.sealed) > 0 && sf.firstIndex != prevLast+1) ||
 			sf.lastIndex != m.MaterializedThrough {
 			return nil, fmt.Errorf("%w: active segment %s disagrees with manifest in %s", errCorrupt, m.Active.File, dir)
 		}
@@ -205,11 +221,86 @@ func (s *Storage) stateFromManifest(dir string, m manifest) (*streamState, error
 	} else if len(m.Sealed) > 0 && prevLast != m.MaterializedThrough {
 		return nil, fmt.Errorf("%w: manifest in %s: segments end at %d, materializedThrough %d",
 			errCorrupt, dir, prevLast, m.MaterializedThrough)
-	} else if len(m.Sealed) == 0 && st.floor != m.MaterializedThrough {
+	} else if len(m.Sealed) == 0 && st.floor != m.MaterializedThrough &&
+		(st.fork == nil || m.MaterializedThrough != st.parentBoundary) {
 		return nil, fmt.Errorf("%w: manifest in %s: no segments at floor %d, materializedThrough %d",
 			errCorrupt, dir, st.floor, m.MaterializedThrough)
 	}
 	return st, nil
+}
+
+// rebuildTopology resolves generation-fenced parent identities after all WAL
+// partitions have replayed, derives direct-child pins, and rejects malformed
+// or over-deep persisted graphs before workers or retention start.
+func (s *Storage) rebuildTopology(scan *recoveryScan) error {
+	s.streams.Range(func(_ string, st *streamState) bool { st.refCount.Store(0); st.parent = nil; return true })
+	var firstErr error
+	s.streams.Range(func(_ string, st *streamState) bool {
+		if st.fork == nil {
+			return true
+		}
+		inc, err := parseIncarnationID(st.fork.SourceIncarnationID)
+		if err != nil {
+			firstErr = fmt.Errorf("%w: fork %q has invalid parent identity", errCorrupt, st.id)
+			return false
+		}
+		// Resolve only through the surviving catalog incarnation. A stale scan
+		// directory must never resurrect a displaced parent.
+		parent, ok := s.streams.Load(st.fork.SourceID)
+		if !ok || parent.inc != inc || st.parentBoundary < 0 || st.parentBoundary > parent.snapshot().tail {
+			firstErr = fmt.Errorf("%w: fork %q references unavailable parent boundary", errCorrupt, st.id)
+			return false
+		}
+		st.parent = parent
+		parent.refCount.Add(1)
+		return true
+	})
+	if firstErr != nil {
+		return firstErr
+	}
+	s.streams.Range(func(_ string, st *streamState) bool {
+		seen := make(map[*streamState]struct{})
+		for cur, depth := st, 0; cur != nil; cur, depth = cur.parent, depth+1 {
+			if depth > maxLineageDepth {
+				firstErr = fmt.Errorf("%w: fork lineage exceeds %d", errCorrupt, maxLineageDepth)
+				return false
+			}
+			if _, ok := seen[cur]; ok {
+				firstErr = fmt.Errorf("%w: cycle in fork lineage at %q", errCorrupt, cur.id)
+				return false
+			}
+			seen[cur] = struct{}{}
+		}
+		return true
+	})
+	if firstErr != nil {
+		return firstErr
+	}
+	// Finish a cascade interrupted after the child's hard-delete frame but
+	// before a retained ancestor's delete frame. Refcounts are derived from
+	// surviving edges, so zero-pinned soft nodes are now unambiguously dead.
+	for depth := 0; depth <= maxLineageDepth; depth++ {
+		removed := false
+		s.streams.Range(func(id string, st *streamState) bool {
+			if (!st.softDeleted && !st.cfg.IsExpired()) || st.refCount.Load() != 0 {
+				return true
+			}
+			s.streams.CompareAndDelete(id, st)
+			st.deleted = true
+			s.parts[st.partition].markRemoval(st)
+			if st.parent != nil {
+				if st.parent.refCount.Add(-1) < 0 {
+					return false
+				}
+			}
+			removed = true
+			return true
+		})
+		if !removed {
+			return nil
+		}
+	}
+	return fmt.Errorf("%w: recovery removal cascade exceeds %d", errCorrupt, maxLineageDepth)
 }
 
 // sweepStreamDirs removes every scanned directory whose incarnation did not
@@ -477,6 +568,38 @@ func (s *Storage) applyRecovered(p *partition, scan *recoveryScan, segSeq uint64
 		}
 		s.streams.Store(frame.streamID, st)
 
+	case opFork:
+		key := identityKey{id: frame.streamID, inc: frame.inc}
+		if st, ok := scan.byIdentity[key]; ok {
+			s.streams.Store(frame.streamID, st)
+			return nil
+		}
+		var m forkFrameMeta
+		if err := json.Unmarshal(frame.meta, &m); err != nil {
+			return fmt.Errorf("%w: undecodable fork meta for %q: %v", errCorrupt, frame.streamID, err)
+		}
+		if err := validateRecoveredFork(frame, m); err != nil {
+			return err
+		}
+		cfg := durablestream.StreamConfig{ContentType: m.Create.ContentType, TTL: time.Duration(m.Create.TTLNanos), ExpiresAt: m.Create.ExpiresAt, IsPrivate: m.Create.IsPrivate, Closed: m.Create.Closed}
+		st := newStreamState(frame.streamID, frame.inc, p.id, cfg)
+		st.fork = &m.Fork
+		st.parentBoundary, st.floor, st.materializedThrough, st.firstLive = m.Fork.Boundary, 0, m.Fork.Boundary, m.Fork.Boundary+1
+		st.nextIndex = frame.firstIndex + int64(len(frame.payloads))
+		st.closed = cfg.Closed
+		st.retention = s.opts.DefaultRetention
+		if m.Create.Retention != nil {
+			st.retention = Retention{MaxBytes: m.Create.Retention.MaxBytes, MaxAge: time.Duration(m.Create.Retention.MaxAgeNanos)}
+		}
+		for i, pl := range frame.payloads {
+			batchFirst := m.Fork.Boundary + 1
+			if int64(i) >= m.Fork.PrefixCount {
+				batchFirst += m.Fork.PrefixCount
+			}
+			st.walTail = append(st.walTail, walLoc{segmentSeq: segSeq, off: pl.off, length: pl.length, batchFirst: batchFirst, ts: frame.ts})
+		}
+		s.streams.Store(frame.streamID, st)
+
 	case opAppend:
 		st, ok := s.recoveredState(frame)
 		if !ok {
@@ -513,7 +636,11 @@ func (s *Storage) applyRecovered(p *partition, scan *recoveryScan, segSeq uint64
 
 	case opDelete:
 		if st, ok := s.recoveredState(frame); ok {
-			s.streams.CompareAndDelete(frame.streamID, st)
+			if frame.flags&flagSoftDelete != 0 {
+				st.softDeleted = true
+			} else {
+				s.streams.CompareAndDelete(frame.streamID, st)
+			}
 		}
 
 	case opTouch:
@@ -557,6 +684,17 @@ func (s *Storage) applyRecovered(p *partition, scan *recoveryScan, segSeq uint64
 
 	default:
 		return fmt.Errorf("%w: unknown frame op %d (written by a newer version?)", errCorrupt, frame.op)
+	}
+	return nil
+}
+
+func validateRecoveredFork(frame walFrame, m forkFrameMeta) error {
+	if m.Fork.SourceID == "" || m.Fork.SourceIncarnationID == "" || m.Fork.Boundary < 0 ||
+		m.Fork.PrefixCount < 0 || m.Fork.PrefixCount > int64(len(frame.payloads)) ||
+		frame.firstIndex != m.Fork.Boundary+1 || m.Create.Retention == nil ||
+		m.Create.Retention.MaxBytes < 0 || m.Create.Retention.MaxAgeNanos < 0 ||
+		m.Fork.Request.SourceStreamID != m.Fork.SourceID {
+		return fmt.Errorf("%w: invalid fork geometry or metadata for %q", errCorrupt, frame.streamID)
 	}
 	return nil
 }

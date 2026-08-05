@@ -28,16 +28,24 @@ type manifest struct {
 	ExpiresAt   time.Time `json:"expiresAt,omitzero"`
 	IsPrivate   bool      `json:"isPrivate,omitempty"`
 
-	Closed     bool              `json:"closed,omitempty"`
-	LastSeq    string            `json:"lastSeq,omitempty"`
-	Retention  manifestRetention `json:"retention,omitzero"`
-	FloorIndex int64             `json:"floorIndex,omitempty"`
+	Closed      bool              `json:"closed,omitempty"`
+	LastSeq     string            `json:"lastSeq,omitempty"`
+	Retention   manifestRetention `json:"retention,omitzero"`
+	FloorIndex  int64             `json:"floorIndex,omitempty"`
+	SoftDeleted bool              `json:"softDeleted,omitempty"`
+	Parent      *manifestParent   `json:"parent,omitempty"`
 
 	// MaterializedThrough is the highest logical index present in segments.
 	MaterializedThrough int64 `json:"materializedThrough"`
 
 	Sealed []manifestSegment `json:"sealed,omitempty"`
 	Active *manifestActive   `json:"active,omitempty"`
+}
+
+type manifestParent struct {
+	StreamID      string   `json:"streamId"`
+	IncarnationID string   `json:"incarnationId"`
+	Fork          forkMeta `json:"fork"`
 }
 
 type manifestRetention struct {
