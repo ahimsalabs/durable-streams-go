@@ -59,6 +59,13 @@ func (s *Storage) recoverAll() error {
 		}
 	}
 	s.sweepStreamDirs(scan)
+	// Replay may have advanced logical state beyond its manifest. Mark every
+	// survivor dirty before workers start so the first checkpoint cannot move
+	// past replayed mutations until their derived state is durable.
+	s.streams.Range(func(_ string, st *streamState) bool {
+		s.parts[st.partition].markDirty(st)
+		return true
+	})
 	return nil
 }
 
@@ -101,6 +108,9 @@ func (s *Storage) scanStreamDirs() (*recoveryScan, error) {
 			if err != nil {
 				return nil, fmt.Errorf("%w: %v", errCorrupt, err)
 			}
+			if err := removeOrphanSegments(dir, m); err != nil {
+				return nil, err
+			}
 			st, err := s.stateFromManifest(dir, m)
 			if err != nil {
 				return nil, err
@@ -111,6 +121,41 @@ func (s *Storage) scanStreamDirs() (*recoveryScan, error) {
 		}
 	}
 	return scan, nil
+}
+
+// removeOrphanSegments finishes a trim interrupted after its manifest rewrite
+// but before unlink. The manifest is authoritative derived state, so an
+// unreferenced segment cannot contain live records.
+func removeOrphanSegments(dir string, m manifest) error {
+	referenced := make(map[string]struct{}, len(m.Sealed)+1)
+	for _, seg := range m.Sealed {
+		referenced[seg.File] = struct{}{}
+	}
+	if m.Active != nil {
+		referenced[m.Active.File] = struct{}{}
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return fmt.Errorf("seglog: read stream dir for orphan cleanup: %w", err)
+	}
+	removed := false
+	for _, entry := range entries {
+		name := entry.Name()
+		if entry.IsDir() || !strings.HasPrefix(name, "seg-") || !strings.HasSuffix(name, ".seg") {
+			continue
+		}
+		if _, ok := referenced[name]; ok {
+			continue
+		}
+		if err := os.Remove(filepath.Join(dir, name)); err != nil {
+			return fmt.Errorf("seglog: remove orphan segment %s: %w", name, err)
+		}
+		removed = true
+	}
+	if removed {
+		return syncDir(dir)
+	}
+	return nil
 }
 
 // stateFromManifest opens a manifest's segments and rebuilds the stream's
@@ -124,18 +169,23 @@ func (s *Storage) stateFromManifest(dir string, m manifest) (*streamState, error
 	st := newStreamState(m.StreamID, inc, part, m.config())
 	st.closed = m.Closed
 	st.lastSeq = m.LastSeq
+	st.retention = m.Retention.retention()
+	st.floor = m.FloorIndex
 	st.nextIndex = m.MaterializedThrough + 1
 	st.firstLive = m.MaterializedThrough + 1
 	st.materializedThrough = m.MaterializedThrough
 
-	prevLast := int64(0)
-	for i, ms := range m.Sealed {
+	if st.retention.MaxBytes < 0 || st.retention.MaxAge < 0 || st.floor < 0 || st.floor > m.MaterializedThrough {
+		return nil, fmt.Errorf("%w: manifest in %s has invalid retention state", errCorrupt, dir)
+	}
+	prevLast := st.floor
+	for _, ms := range m.Sealed {
 		sf, err := openSealedSegment(filepath.Join(dir, ms.File), ms.File, inc)
 		if err != nil {
 			return nil, fmt.Errorf("%w: %v", errCorrupt, err)
 		}
 		if sf.firstIndex != ms.FirstIndex || sf.lastIndex != ms.LastIndex || sf.bytes != ms.Bytes ||
-			(i > 0 && sf.firstIndex != prevLast+1) {
+			sf.firstIndex != prevLast+1 {
 			return nil, fmt.Errorf("%w: sealed segment %s disagrees with manifest in %s", errCorrupt, ms.File, dir)
 		}
 		prevLast = sf.lastIndex
@@ -146,8 +196,7 @@ func (s *Storage) stateFromManifest(dir string, m manifest) (*streamState, error
 		if err != nil {
 			return nil, fmt.Errorf("%w: %v", errCorrupt, err)
 		}
-		if sf.firstIndex != m.Active.FirstIndex ||
-			(len(m.Sealed) > 0 && sf.firstIndex != prevLast+1) ||
+		if sf.firstIndex != m.Active.FirstIndex || sf.firstIndex != prevLast+1 ||
 			sf.lastIndex != m.MaterializedThrough {
 			return nil, fmt.Errorf("%w: active segment %s disagrees with manifest in %s", errCorrupt, m.Active.File, dir)
 		}
@@ -156,6 +205,9 @@ func (s *Storage) stateFromManifest(dir string, m manifest) (*streamState, error
 	} else if len(m.Sealed) > 0 && prevLast != m.MaterializedThrough {
 		return nil, fmt.Errorf("%w: manifest in %s: segments end at %d, materializedThrough %d",
 			errCorrupt, dir, prevLast, m.MaterializedThrough)
+	} else if len(m.Sealed) == 0 && st.floor != m.MaterializedThrough {
+		return nil, fmt.Errorf("%w: manifest in %s: no segments at floor %d, materializedThrough %d",
+			errCorrupt, dir, st.floor, m.MaterializedThrough)
 	}
 	return st, nil
 }
@@ -405,6 +457,13 @@ func (s *Storage) applyRecovered(p *partition, scan *recoveryScan, segSeq uint64
 			IsPrivate:   m.IsPrivate,
 			Closed:      m.Closed,
 		})
+		st.retention = s.opts.DefaultRetention
+		if m.Retention != nil {
+			if m.Retention.MaxBytes < 0 || m.Retention.MaxAgeNanos < 0 {
+				return fmt.Errorf("%w: negative create retention for stream %q", errCorrupt, frame.streamID)
+			}
+			st.retention = Retention{MaxBytes: m.Retention.MaxBytes, MaxAge: time.Duration(m.Retention.MaxAgeNanos)}
+		}
 		st.closed = m.Closed
 		st.nextIndex = 1 + int64(len(frame.payloads))
 		for _, pl := range frame.payloads {
@@ -467,6 +526,34 @@ func (s *Storage) applyRecovered(p *partition, scan *recoveryScan, segSeq uint64
 			return fmt.Errorf("%w: undecodable touch meta for stream %q: %v", errCorrupt, frame.streamID, err)
 		}
 		st.cfg.ExpiresAt = m.ExpiresAt
+
+	case opRetention:
+		st, ok := s.recoveredState(frame)
+		if !ok {
+			return nil
+		}
+		var m retentionMeta
+		if err := json.Unmarshal(frame.meta, &m); err != nil {
+			return fmt.Errorf("%w: undecodable retention meta for stream %q: %v", errCorrupt, frame.streamID, err)
+		}
+		if m.MaxBytes < 0 || m.MaxAgeNanos < 0 {
+			return fmt.Errorf("%w: negative retention meta for stream %q", errCorrupt, frame.streamID)
+		}
+		st.retention = Retention{MaxBytes: m.MaxBytes, MaxAge: time.Duration(m.MaxAgeNanos)}
+
+	case opTrim:
+		st, ok := s.recoveredState(frame)
+		if !ok {
+			return nil
+		}
+		var m trimMeta
+		if err := json.Unmarshal(frame.meta, &m); err != nil {
+			return fmt.Errorf("%w: undecodable trim meta for stream %q: %v", errCorrupt, frame.streamID, err)
+		}
+		if m.FloorIndex < 0 || m.FloorIndex > st.materializedThrough {
+			return fmt.Errorf("%w: invalid trim floor %d for stream %q", errCorrupt, m.FloorIndex, frame.streamID)
+		}
+		st.floor = max(st.floor, m.FloorIndex)
 
 	default:
 		return fmt.Errorf("%w: unknown frame op %d (written by a newer version?)", errCorrupt, frame.op)

@@ -14,14 +14,16 @@ import (
 // slices are borrowed: submit blocks until completion, so the worker may
 // encode them without copying.
 type request struct {
-	op       opKind
-	streamID string
-	cfg      durablestream.StreamConfig // opCreate
-	messages [][]byte
-	seq      string
-	hasSeq   bool
-	close    bool // opAppend: stream reaches permanent EOF after messages
-	done     chan result
+	op        opKind
+	streamID  string
+	cfg       durablestream.StreamConfig // opCreate
+	messages  [][]byte
+	seq       string
+	hasSeq    bool
+	close     bool      // opAppend: stream reaches permanent EOF after messages
+	retention Retention // opRetention
+	floor     int64     // opTrim
+	done      chan result
 }
 
 type result struct {
@@ -183,7 +185,7 @@ func (p *partition) run() {
 // covers every fixed field (timestamps in RFC 3339 with nanoseconds); the
 // content type is bounded separately at 6x for worst-case \uXXXX escaping.
 const (
-	createMetaBound = 192
+	createMetaBound = 288
 	touchMetaBound  = 96
 )
 
@@ -279,10 +281,12 @@ type stagedOp struct {
 
 	barrier bool
 
-	applyCreate *createApply
-	applyAppend *appendApply
-	applyDelete *deleteApply
-	applyTouch  *touchApply
+	applyCreate    *createApply
+	applyAppend    *appendApply
+	applyDelete    *deleteApply
+	applyTouch     *touchApply
+	applyRetention *retentionApply
+	applyTrim      *trimApply
 
 	// payloadOffs are each payload's offset relative to the group buffer,
 	// filled after encoding.
@@ -312,8 +316,19 @@ type touchApply struct {
 	expiresAt time.Time
 }
 
+type retentionApply struct {
+	state     *streamState
+	retention Retention
+}
+
+type trimApply struct {
+	state *streamState
+	floor int64
+}
+
 func (op *stagedOp) hasFrame() bool {
-	return op.applyCreate != nil || op.applyAppend != nil || op.applyDelete != nil || op.applyTouch != nil
+	return op.applyCreate != nil || op.applyAppend != nil || op.applyDelete != nil || op.applyTouch != nil ||
+		op.applyRetention != nil || op.applyTrim != nil
 }
 
 // pendingStream is the staging overlay for one stream within a group: later
@@ -326,6 +341,8 @@ type pendingStream struct {
 	closed    bool
 	nextIndex int64
 	lastSeq   string
+	retention Retention
+	floor     int64
 }
 
 // processGroup validates and encodes every request, commits the encoded
@@ -469,6 +486,19 @@ func (p *partition) publish(op *stagedOp, segSeq uint64, base int64) {
 		a.state.mu.Unlock()
 		a.state.wake()
 		p.markDirty(a.state)
+	case op.applyRetention != nil:
+		a := op.applyRetention
+		a.state.mu.Lock()
+		a.state.retention = a.retention
+		a.state.mu.Unlock()
+		p.markDirty(a.state)
+	case op.applyTrim != nil:
+		a := op.applyTrim
+		a.state.mu.Lock()
+		a.state.floor = max(a.state.floor, a.floor)
+		a.state.mu.Unlock()
+		a.state.wake()
+		p.markDirty(a.state)
 	}
 }
 
@@ -486,6 +516,8 @@ func (p *partition) loadPending(pending map[string]*pendingStream, streamID stri
 		ps.closed = state.closed
 		ps.nextIndex = state.nextIndex
 		ps.lastSeq = state.lastSeq
+		ps.retention = state.retention
+		ps.floor = state.floor
 	}
 	pending[streamID] = ps
 	return ps
@@ -511,6 +543,10 @@ func (p *partition) stage(req *request, pending map[string]*pendingStream, now t
 		return op, p.stageDelete(op, req, ps, ts)
 	case opTouch:
 		return op, p.stageTouch(op, req, ps, expired, now, ts)
+	case opRetention:
+		return op, p.stageRetention(op, req, ps, expired, ts)
+	case opTrim:
+		return op, p.stageTrim(op, req, ps, expired, ts)
 	default:
 		op.res = result{err: fmt.Errorf("seglog: unknown operation %d: %w", req.op, durablestream.ErrBadRequest)}
 		return op, frameSpec{}
@@ -519,16 +555,26 @@ func (p *partition) stage(req *request, pending map[string]*pendingStream, now t
 
 // createMeta is the JSON meta document of an opCreate frame.
 type createMeta struct {
-	ContentType string    `json:"contentType,omitempty"`
-	TTLNanos    int64     `json:"ttlNanos,omitempty"`
-	ExpiresAt   time.Time `json:"expiresAt,omitzero"`
-	IsPrivate   bool      `json:"isPrivate,omitempty"`
-	Closed      bool      `json:"closed,omitempty"`
+	ContentType string         `json:"contentType,omitempty"`
+	TTLNanos    int64          `json:"ttlNanos,omitempty"`
+	ExpiresAt   time.Time      `json:"expiresAt,omitzero"`
+	IsPrivate   bool           `json:"isPrivate,omitempty"`
+	Closed      bool           `json:"closed,omitempty"`
+	Retention   *retentionMeta `json:"retention,omitempty"`
 }
 
 // touchMeta is the JSON meta document of an opTouch frame.
 type touchMeta struct {
 	ExpiresAt time.Time `json:"expiresAt"`
+}
+
+type retentionMeta struct {
+	MaxBytes    int64 `json:"maxBytes"`
+	MaxAgeNanos int64 `json:"maxAgeNanos"`
+}
+
+type trimMeta struct {
+	FloorIndex int64 `json:"floorIndex"`
 }
 
 func (p *partition) stageCreate(op *stagedOp, req *request, ps *pendingStream, expired bool, now time.Time, ts int64) frameSpec {
@@ -550,12 +596,17 @@ func (p *partition) stageCreate(op *stagedOp, req *request, ps *pendingStream, e
 	if cfg.TTL > 0 && cfg.ExpiresAt.IsZero() {
 		cfg.ExpiresAt = now.Add(cfg.TTL)
 	}
+	defaultRetention := p.st.opts.DefaultRetention
 	meta, err := json.Marshal(createMeta{
 		ContentType: cfg.ContentType,
 		TTLNanos:    int64(cfg.TTL),
 		ExpiresAt:   cfg.ExpiresAt,
 		IsPrivate:   cfg.IsPrivate,
 		Closed:      cfg.Closed,
+		Retention: &retentionMeta{
+			MaxBytes:    defaultRetention.MaxBytes,
+			MaxAgeNanos: int64(defaultRetention.MaxAge),
+		},
 	})
 	if err != nil {
 		op.res = result{err: fmt.Errorf("seglog: encode create meta: %w", err)}
@@ -572,6 +623,7 @@ func (p *partition) stageCreate(op *stagedOp, req *request, ps *pendingStream, e
 	}
 
 	newState := newStreamState(req.streamID, inc, p.id, cfg)
+	newState.retention = defaultRetention
 	newState.closed = cfg.Closed
 	newState.nextIndex = 1 + int64(len(req.messages))
 
@@ -584,6 +636,8 @@ func (p *partition) stageCreate(op *stagedOp, req *request, ps *pendingStream, e
 	ps.closed = cfg.Closed
 	ps.nextIndex = newState.nextIndex
 	ps.lastSeq = ""
+	ps.retention = newState.retention
+	ps.floor = 0
 
 	return frameSpec{
 		op:         opCreate,
@@ -705,4 +759,37 @@ func (p *partition) stageTouch(op *stagedOp, req *request, ps *pendingStream, ex
 		meta:     meta,
 		ts:       ts,
 	}
+}
+
+func (p *partition) stageRetention(op *stagedOp, req *request, ps *pendingStream, expired bool, ts int64) frameSpec {
+	if !ps.exists || expired {
+		op.res = result{err: notFoundErr(req.streamID)}
+		return frameSpec{}
+	}
+	meta, err := json.Marshal(retentionMeta{MaxBytes: req.retention.MaxBytes, MaxAgeNanos: int64(req.retention.MaxAge)})
+	if err != nil {
+		op.res = result{err: fmt.Errorf("seglog: encode retention meta: %w", err)}
+		return frameSpec{}
+	}
+	op.applyRetention = &retentionApply{state: ps.state, retention: req.retention}
+	ps.retention = req.retention
+	return frameSpec{op: opRetention, streamID: req.streamID, inc: ps.state.inc, meta: meta, ts: ts}
+}
+
+func (p *partition) stageTrim(op *stagedOp, req *request, ps *pendingStream, expired bool, ts int64) frameSpec {
+	if !ps.exists || expired {
+		op.res = result{err: notFoundErr(req.streamID)}
+		return frameSpec{}
+	}
+	if req.floor <= ps.floor {
+		return frameSpec{}
+	}
+	meta, err := json.Marshal(trimMeta{FloorIndex: req.floor})
+	if err != nil {
+		op.res = result{err: fmt.Errorf("seglog: encode trim meta: %w", err)}
+		return frameSpec{}
+	}
+	op.applyTrim = &trimApply{state: ps.state, floor: req.floor}
+	ps.floor = req.floor
+	return frameSpec{op: opTrim, streamID: req.streamID, inc: ps.state.inc, meta: meta, ts: ts}
 }

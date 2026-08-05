@@ -28,14 +28,29 @@ type manifest struct {
 	ExpiresAt   time.Time `json:"expiresAt,omitzero"`
 	IsPrivate   bool      `json:"isPrivate,omitempty"`
 
-	Closed  bool   `json:"closed,omitempty"`
-	LastSeq string `json:"lastSeq,omitempty"`
+	Closed     bool              `json:"closed,omitempty"`
+	LastSeq    string            `json:"lastSeq,omitempty"`
+	Retention  manifestRetention `json:"retention,omitzero"`
+	FloorIndex int64             `json:"floorIndex,omitempty"`
 
 	// MaterializedThrough is the highest logical index present in segments.
 	MaterializedThrough int64 `json:"materializedThrough"`
 
 	Sealed []manifestSegment `json:"sealed,omitempty"`
 	Active *manifestActive   `json:"active,omitempty"`
+}
+
+type manifestRetention struct {
+	MaxBytes    int64 `json:"maxBytes,omitempty"`
+	MaxAgeNanos int64 `json:"maxAgeNanos,omitempty"`
+}
+
+func retentionManifest(r Retention) manifestRetention {
+	return manifestRetention{MaxBytes: r.MaxBytes, MaxAgeNanos: int64(r.MaxAge)}
+}
+
+func (r manifestRetention) retention() Retention {
+	return Retention{MaxBytes: r.MaxBytes, MaxAge: time.Duration(r.MaxAgeNanos)}
 }
 
 type manifestSegment struct {

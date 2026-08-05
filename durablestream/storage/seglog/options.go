@@ -17,9 +17,18 @@ const (
 	DefaultQueueDepth          = 256
 	DefaultShutdownTimeout     = 30 * time.Second
 	DefaultMaterializeInterval = 25 * time.Millisecond
+	DefaultRetentionInterval   = 30 * time.Second
 	DefaultStreamSegmentBytes  = 128 << 20
+	DefaultStreamSegmentAge    = 10 * time.Minute
 	DefaultSparseIndexBytes    = 32 << 10
 )
+
+// Retention limits the history retained for one stream. Zero values mean
+// unlimited. Age is measured from the commit timestamp of each record.
+type Retention struct {
+	MaxBytes int64
+	MaxAge   time.Duration
+}
 
 // SyncWrites selects whether acknowledged writes are fdatasync'd.
 //
@@ -98,9 +107,21 @@ type Options struct {
 	// never reclaimed (useful for tests).
 	MaterializeInterval time.Duration
 
+	// DefaultRetention is copied to each stream when it is created.
+	DefaultRetention Retention
+
+	// RetentionInterval is how often each partition's materializer evaluates
+	// stream retention after its normal materialization round. -1 disables
+	// retention sweeps.
+	RetentionInterval time.Duration
+
 	// StreamSegmentBytes is the size at which a stream's active segment is
 	// sealed and a new one started.
 	StreamSegmentBytes int64
+
+	// StreamSegmentAge seals a non-empty, idle active segment after this age
+	// so age retention can eventually remove it. -1 disables age sealing.
+	StreamSegmentAge time.Duration
 
 	// SparseIndexBytes is the spacing of sparse index entries within stream
 	// segments: one entry per this many payload-file bytes.
@@ -135,8 +156,14 @@ func (o Options) withDefaults() Options {
 	if o.MaterializeInterval == 0 {
 		o.MaterializeInterval = DefaultMaterializeInterval
 	}
+	if o.RetentionInterval == 0 {
+		o.RetentionInterval = DefaultRetentionInterval
+	}
 	if o.StreamSegmentBytes == 0 {
 		o.StreamSegmentBytes = DefaultStreamSegmentBytes
+	}
+	if o.StreamSegmentAge == 0 {
+		o.StreamSegmentAge = DefaultStreamSegmentAge
 	}
 	if o.SparseIndexBytes == 0 {
 		o.SparseIndexBytes = DefaultSparseIndexBytes
@@ -175,9 +202,21 @@ func (o Options) validate() error {
 	if o.MaterializeInterval < 0 && o.MaterializeInterval != -1 {
 		errs = append(errs, fmt.Errorf("option MaterializeInterval must be positive or -1, got %v", o.MaterializeInterval))
 	}
+	if o.RetentionInterval < 0 && o.RetentionInterval != -1 {
+		errs = append(errs, fmt.Errorf("option RetentionInterval must be positive or -1, got %v", o.RetentionInterval))
+	}
+	if o.DefaultRetention.MaxBytes < 0 {
+		errs = append(errs, fmt.Errorf("option DefaultRetention.MaxBytes cannot be negative, got %d", o.DefaultRetention.MaxBytes))
+	}
+	if o.DefaultRetention.MaxAge < 0 {
+		errs = append(errs, fmt.Errorf("option DefaultRetention.MaxAge cannot be negative, got %v", o.DefaultRetention.MaxAge))
+	}
 	if o.StreamSegmentBytes < segmentHeaderSize+segmentRecordHeaderSize {
 		errs = append(errs, fmt.Errorf("option StreamSegmentBytes %d is below the minimum %d",
 			o.StreamSegmentBytes, segmentHeaderSize+segmentRecordHeaderSize))
+	}
+	if o.StreamSegmentAge < 0 && o.StreamSegmentAge != -1 {
+		errs = append(errs, fmt.Errorf("option StreamSegmentAge must be positive or -1, got %v", o.StreamSegmentAge))
 	}
 	if o.SparseIndexBytes < 512 {
 		errs = append(errs, fmt.Errorf("option SparseIndexBytes must be at least 512, got %d", o.SparseIndexBytes))

@@ -46,7 +46,7 @@ type walLoc struct {
 // Ownership: two goroutines mutate disjoint field groups, both always under
 // mu, so each may read its own fields lock-free while readers take mu.RLock
 // for consistent snapshots (invariant I5). The partition worker owns the
-// logical state: cfg, closed, deleted, lastSeq, nextIndex, and walTail
+// logical state: cfg, retention, floor, closed, deleted, lastSeq, nextIndex, and walTail
 // appends. The partition's materializer owns the materialized state: sealed,
 // activeView, materializedThrough, and walTail pruning (firstLive). A new
 // incarnation of the same stream ID is a new *streamState; waiters pin the
@@ -59,9 +59,11 @@ type streamState struct {
 	inc       incarnation
 	partition uint32
 
-	cfg     durablestream.StreamConfig
-	closed  bool // permanent EOF (protocol closure, not Storage.Close)
-	deleted bool // this incarnation was deleted or displaced
+	cfg       durablestream.StreamConfig
+	retention Retention
+	floor     int64 // highest trimmed index; messages at or below it are gone
+	closed    bool  // permanent EOF (protocol closure, not Storage.Close)
+	deleted   bool  // this incarnation was deleted or displaced
 
 	lastSeq   string
 	nextIndex int64 // next logical index to assign; the first message gets 1
@@ -156,6 +158,8 @@ type readSnapshot struct {
 	closed    bool
 	deleted   bool
 	lastSeq   string
+	retention Retention
+	floor     int64
 	tail      int64
 	firstLive int64
 	walTail   []walLoc // shared read-only prefix; never mutated in place
@@ -174,6 +178,8 @@ func (st *streamState) snapshot() readSnapshot {
 		closed:     st.closed,
 		deleted:    st.deleted,
 		lastSeq:    st.lastSeq,
+		retention:  st.retention,
+		floor:      st.floor,
 		tail:       st.nextIndex - 1,
 		firstLive:  st.firstLive,
 		walTail:    st.walTail,

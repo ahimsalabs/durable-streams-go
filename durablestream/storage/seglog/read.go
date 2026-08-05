@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 
 	"github.com/ahimsalabs/durable-streams-go/durablestream"
 	"github.com/ahimsalabs/durable-streams-go/durablestream/storage"
@@ -57,7 +58,7 @@ func (s *Storage) readState(ctx context.Context, state *streamState, pos int64, 
 	for range attempts {
 		var res *durablestream.ReadResult
 		res, err = s.readSnapshotted(ctx, state, pos, limit)
-		if err == nil || !errors.Is(err, errWALSegmentGone) {
+		if err == nil || (!errors.Is(err, errWALSegmentGone) && !errors.Is(err, os.ErrClosed)) {
 			return res, err
 		}
 	}
@@ -75,6 +76,9 @@ func (s *Storage) readSnapshotted(ctx context.Context, state *streamState, pos i
 	}
 	if snap.cfg.IsExpired() {
 		return nil, notFoundErr(state.id)
+	}
+	if pos < snap.floor {
+		return nil, fmt.Errorf("seglog: stream %q retained floor is %d: %w", state.id, snap.floor, durablestream.ErrGone)
 	}
 
 	res := &durablestream.ReadResult{

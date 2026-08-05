@@ -315,6 +315,27 @@ func (s *Storage) Touch(ctx context.Context, streamID string) error {
 	return res.err
 }
 
+// SetRetention changes the history limits for an existing stream. The policy
+// becomes effective asynchronously on the owning partition's next sweep.
+func (s *Storage) SetRetention(ctx context.Context, streamID string, r Retention) error {
+	if err := s.checkClosed(); err != nil {
+		return err
+	}
+	if r.MaxBytes < 0 || r.MaxAge < 0 {
+		return fmt.Errorf("seglog: negative retention limit: %w", durablestream.ErrBadRequest)
+	}
+	if err := validateStreamID(streamID); err != nil {
+		return err
+	}
+	res := s.partitionFor(streamID).submit(&request{
+		op:        opRetention,
+		streamID:  streamID,
+		retention: r,
+		done:      make(chan result, 1),
+	})
+	return res.err
+}
+
 // Head implements durablestream.Storage.
 func (s *Storage) Head(ctx context.Context, streamID string) (*durablestream.StreamInfo, error) {
 	if err := s.checkClosed(); err != nil {

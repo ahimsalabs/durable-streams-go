@@ -44,12 +44,17 @@ func loadCheckpoint(dir string) (checkpoint, bool, error) {
 func (s *Storage) runMaterializer(p *partition) {
 	ticker := time.NewTicker(s.opts.MaterializeInterval)
 	defer ticker.Stop()
+	lastSweep := time.Now()
 	for {
 		select {
 		case <-s.shutdownCh:
 			return
 		case <-ticker.C:
 			s.materializeRound(p)
+			if s.opts.RetentionInterval != -1 && time.Since(lastSweep) >= s.opts.RetentionInterval {
+				s.retentionSweep(p)
+				lastSweep = time.Now()
+			}
 		}
 	}
 }
@@ -190,7 +195,10 @@ func (s *Storage) materializeStream(p *partition, st *streamState) error {
 		}
 	}
 
-	sealed := st.sealed
+	sealed, err := s.completeTrimAgainstFloor(st, snap, st.sealed, st.activeSeg, snap.through)
+	if err != nil {
+		return err
+	}
 	active := st.activeSeg
 	activeDirty := false
 	for i, loc := range snap.walTail {
@@ -231,6 +239,30 @@ func (s *Storage) materializeStream(p *partition, st *streamState) error {
 	}
 
 	newThrough := max(snap.through, snap.firstLive+int64(len(snap.walTail))-1)
+	m := buildManifest(st, snap, sealed, active, newThrough)
+	if err := writeManifest(dir, m); err != nil {
+		return err
+	}
+
+	// Publish the new materialized frontier and prune the WAL tail.
+	st.mu.Lock()
+	st.sealed = sealed
+	st.activeSeg = active
+	if active != nil {
+		st.activeView = active.view()
+	} else {
+		st.activeView = segmentView{}
+	}
+	st.materializedThrough = newThrough
+	if k := newThrough - st.firstLive + 1; k > 0 {
+		st.walTail = st.walTail[k:]
+		st.firstLive = newThrough + 1
+	}
+	st.mu.Unlock()
+	return nil
+}
+
+func buildManifest(st *streamState, snap readSnapshot, sealed []*segmentFile, active *segmentFile, through int64) manifest {
 	m := manifest{
 		FormatVersion:       manifestFormatVersion,
 		StreamID:            st.id,
@@ -241,7 +273,9 @@ func (s *Storage) materializeStream(p *partition, st *streamState) error {
 		IsPrivate:           snap.cfg.IsPrivate,
 		Closed:              snap.closed,
 		LastSeq:             snap.lastSeq,
-		MaterializedThrough: newThrough,
+		Retention:           retentionManifest(snap.retention),
+		FloorIndex:          snap.floor,
+		MaterializedThrough: through,
 	}
 	for _, sf := range sealed {
 		m.Sealed = append(m.Sealed, manifestSegment{
@@ -255,22 +289,155 @@ func (s *Storage) materializeStream(p *partition, st *streamState) error {
 	if active != nil {
 		m.Active = &manifestActive{File: active.name, FirstIndex: active.firstIndex, Bytes: active.bytes}
 	}
-	if err := writeManifest(dir, m); err != nil {
-		return err
+	return m
+}
+
+// retentionSweep runs on the partition materializer goroutine so manifests
+// and segment files retain a single writer. A per-partition stream registry
+// can replace this all-stream scan if catalog scale makes it necessary.
+func (s *Storage) retentionSweep(p *partition) {
+	now := time.Now()
+	s.streams.Range(func(_ string, st *streamState) bool {
+		if st.partition != p.id {
+			return true
+		}
+		if err := s.sweepStreamRetention(p, st, now); err != nil {
+			s.opts.SLogger.Error("seglog: retention sweep failed", "stream", st.id, "error", err)
+		}
+		return true
+	})
+}
+
+func (s *Storage) sweepStreamRetention(p *partition, st *streamState, now time.Time) error {
+	snap := st.snapshot()
+	if snap.deleted || snap.cfg.IsExpired() {
+		return nil
 	}
 
-	// Publish the new materialized frontier and prune the WAL tail.
+	active := st.activeSeg
+	if s.opts.StreamSegmentAge != -1 && active != nil && active.lastIndex >= active.firstIndex &&
+		active.lastIndex == snap.through && active.maxTS > 0 && now.Sub(time.Unix(0, active.maxTS)) > s.opts.StreamSegmentAge {
+		if err := active.seal(); err != nil {
+			return err
+		}
+		sealed := append(st.sealed[:len(st.sealed):len(st.sealed)], active)
+		// Publish both views atomically: the newly sealed view must cover the
+		// same records when the old active view disappears.
+		st.mu.Lock()
+		st.sealed = sealed
+		st.activeSeg = nil
+		st.activeView = segmentView{}
+		st.mu.Unlock()
+		p.markDirty(st)
+		snap = st.snapshot()
+	}
+
+	if snap.retention == (Retention{}) && snap.floor == 0 {
+		return nil
+	}
+	sealed := snap.sealed
+	maxDrop := len(sealed)
+	if snap.activeView.f == nil && len(snap.walTail) == 0 && maxDrop > 0 {
+		// Whole-segment retention is a soft bound: preserve the newest record
+		// even when age sealing left no active segment.
+		maxDrop--
+	}
+	drop := 0
+	for drop < maxDrop && sealed[drop].lastIndex <= snap.floor {
+		drop++
+	}
+	floor := snap.floor
+
+	if snap.retention.MaxAge > 0 {
+		for i := drop; i < maxDrop; i++ {
+			if now.Sub(time.Unix(0, sealed[i].maxTS)) <= snap.retention.MaxAge {
+				break
+			}
+			floor = sealed[i].lastIndex
+			drop = i + 1
+		}
+	}
+
+	if snap.retention.MaxBytes > 0 {
+		retainedBytes := int64(0)
+		for _, sf := range sealed {
+			retainedBytes += segmentPayloadBytes(sf)
+		}
+		if active := st.activeSeg; active != nil {
+			retainedBytes += segmentPayloadBytes(active)
+		}
+		for _, loc := range snap.walTail {
+			retainedBytes += int64(loc.length)
+		}
+		for i := range drop {
+			retainedBytes -= segmentPayloadBytes(sealed[i])
+		}
+		for drop < maxDrop && retainedBytes > snap.retention.MaxBytes {
+			retainedBytes -= segmentPayloadBytes(sealed[drop])
+			floor = max(floor, sealed[drop].lastIndex)
+			drop++
+		}
+	}
+	if drop == 0 {
+		return nil
+	}
+
+	// The floor WAL frame must commit before the manifest can forget files;
+	// the files remain linked until both durable records exclude their data.
+	res := p.submit(&request{op: opTrim, streamID: st.id, floor: floor, done: make(chan result, 1)})
+	if res.err != nil {
+		return res.err
+	}
+	snap = st.snapshot()
+	_, err := s.completeTrimAgainstFloor(st, snap, sealed, st.activeSeg, snap.through)
+	return err
+}
+
+// completeTrimAgainstFloor finishes the physical side of an already-durable
+// trim. The manifest drops the prefix before readers stop seeing it, and files
+// are closed and unlinked only after both durable and in-memory views exclude
+// them. Ordinary materialization also calls this to recover when a crash lands
+// between the trim WAL frame and the sweep's manifest rewrite.
+func (s *Storage) completeTrimAgainstFloor(
+	st *streamState,
+	snap readSnapshot,
+	sealed []*segmentFile,
+	active *segmentFile,
+	through int64,
+) ([]*segmentFile, error) {
+	drop := 0
+	for drop < len(sealed) && sealed[drop].lastIndex <= snap.floor {
+		drop++
+	}
+	if drop == 0 {
+		return sealed, nil
+	}
+
+	retained := append([]*segmentFile(nil), sealed[drop:]...)
+	dir := streamDir(s.dir, st.id, st.inc)
+	if err := writeManifest(dir, buildManifest(st, snap, retained, active, through)); err != nil {
+		return sealed, err
+	}
+
 	st.mu.Lock()
-	st.sealed = sealed
-	st.activeSeg = active
-	if active != nil {
-		st.activeView = active.view()
-	}
-	st.materializedThrough = newThrough
-	if k := newThrough - st.firstLive + 1; k > 0 {
-		st.walTail = st.walTail[k:]
-		st.firstLive = newThrough + 1
-	}
+	st.sealed = retained
 	st.mu.Unlock()
-	return nil
+	var firstErr error
+	for _, sf := range sealed[:drop] {
+		if err := sf.f.Close(); err != nil && firstErr == nil {
+			firstErr = fmt.Errorf("close segment %s: %w", sf.name, err)
+		}
+		if err := os.Remove(filepath.Join(dir, sf.name)); err != nil && !os.IsNotExist(err) && firstErr == nil {
+			firstErr = fmt.Errorf("unlink segment %s: %w", sf.name, err)
+		}
+	}
+	if err := syncDir(dir); err != nil && firstErr == nil {
+		firstErr = err
+	}
+	return retained, firstErr
+}
+
+func segmentPayloadBytes(sf *segmentFile) int64 {
+	records := max(int64(0), sf.lastIndex-sf.firstIndex+1)
+	return sf.bytes - segmentHeaderSize - records*segmentRecordHeaderSize
 }
