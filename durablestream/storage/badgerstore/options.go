@@ -109,4 +109,13 @@ type Options struct {
 	// rather than hanging indefinitely or closing storage they may still use.
 	// Default: 30 seconds. Set to 0 to use default.
 	ShutdownTimeout time.Duration
+
+	// AppendCommitMaxInFlight bounds how many grouped append transactions may
+	// commit concurrently in durable SyncWrites mode. The default (0 → 1)
+	// serializes commits, which batches adaptively and minimizes fsyncs; it is
+	// the right choice for ordinary disks, where concurrent commits fragment
+	// groups and multiply fsyncs. Raise it only on storage with very cheap
+	// fsync, and only after measuring. Ignored when the group committer is
+	// disabled (unsynced or in-memory stores).
+	AppendCommitMaxInFlight int
 }

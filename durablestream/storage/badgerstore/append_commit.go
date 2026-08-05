@@ -24,6 +24,20 @@ const (
 	defaultAppendCommitMaxEntries  = 16 * 1024
 	defaultAppendCommitMaxBytes    = 4 * 1024 * 1024
 	defaultAppendCommitMaxWait     = 200 * time.Microsecond
+
+	// defaultAppendCommitMaxInFlight bounds how many group transactions may be
+	// committing concurrently. The default is 1 — fully serialized — because a
+	// serialized committer batches adaptively: while one group's fsync runs,
+	// the queue backs up, so the next group grows to match commit latency and
+	// the fsync count stays low. Concurrent commits split that backlog into
+	// smaller groups whose fsyncs Badger does not reliably merge; on fsync-
+	// bound storage (measured on btrfs/NVMe at c256) every value above 1
+	// reduced throughput, roughly in proportion to the group-size split.
+	// Values above 1 helped only when fsync was nearly free (tmpfs), which no
+	// durable deployment resembles. Same-stream ordering is safe at any value:
+	// streamState.appendMu admits one outstanding request per stream
+	// generation, so concurrent groups always touch disjoint keys.
+	defaultAppendCommitMaxInFlight = 1
 )
 
 type appendCommitConfig struct {
@@ -31,6 +45,7 @@ type appendCommitConfig struct {
 	maxEntries  int
 	maxBytes    int
 	maxWait     time.Duration
+	maxInFlight int
 }
 
 func defaultAppendCommitConfig() appendCommitConfig {
@@ -39,6 +54,7 @@ func defaultAppendCommitConfig() appendCommitConfig {
 		maxEntries:  defaultAppendCommitMaxEntries,
 		maxBytes:    defaultAppendCommitMaxBytes,
 		maxWait:     defaultAppendCommitMaxWait,
+		maxInFlight: defaultAppendCommitMaxInFlight,
 	}
 }
 
@@ -132,6 +148,9 @@ func newAppendCommitter(storage *Storage, config appendCommitConfig) *appendComm
 	if config.maxWait < 0 {
 		config.maxWait = 0
 	}
+	if config.maxInFlight <= 0 {
+		config.maxInFlight = 1
+	}
 	return &appendCommitter{
 		storage:   storage,
 		config:    config,
@@ -184,8 +203,18 @@ func (c *appendCommitter) close() {
 	close(c.queue)
 }
 
+// run collects groups and commits them on worker goroutines, at most
+// maxInFlight at a time. Collection continues while earlier groups are still
+// fsyncing, and Badger's write channel can merge the WAL sync of concurrently
+// committing groups, so throughput is no longer one group per fsync latency.
+// In-flight commits are drained before done closes, keeping Storage.Close's
+// "committer finished before db.Close" invariant intact.
 func (c *appendCommitter) run() {
 	defer close(c.done)
+	inFlight := make(chan struct{}, c.config.maxInFlight)
+	var commits sync.WaitGroup
+	defer commits.Wait()
+
 	var carry *appendCommitRequest
 	for {
 		first := carry
@@ -197,8 +226,22 @@ func (c *appendCommitter) run() {
 			}
 		}
 
+		// Acquire the commit slot BEFORE collecting. While every slot is busy
+		// fsyncing, requests accumulate in the queue, so the collect below
+		// drains a large group the moment a slot frees. This keeps the
+		// adaptive batching of a serialized committer — group size grows with
+		// commit latency — while still overlapping the next group's write path
+		// with the previous group's sync. Collecting first instead would
+		// produce many tiny groups (each waiting only maxWait) and multiply
+		// fsyncs on slow storage.
+		inFlight <- struct{}{}
 		batch, queueClosed, next := c.collect(first)
-		c.commit(batch)
+		commits.Add(1)
+		go func() {
+			defer commits.Done()
+			defer func() { <-inFlight }()
+			c.commit(batch)
+		}()
 		if queueClosed {
 			return
 		}

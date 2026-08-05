@@ -286,6 +286,25 @@ func (h *Handler) touch(r *http.Request, streamID string) error {
 	return h.storage.Touch(r.Context(), streamID)
 }
 
+// touchHead snapshots stream metadata and restarts the sliding TTL window, as
+// one storage operation when the backend supports it. Every origin-reaching
+// request that needs the stream snapshot also counts as activity (Section 5.1),
+// so the hot paths fuse the pair; semantics are identical to Head followed by
+// touch.
+func (h *Handler) touchHead(r *http.Request, streamID string) (*StreamInfo, error) {
+	if ths, ok := h.storage.(TouchHeadStorage); ok {
+		return ths.TouchHead(r.Context(), streamID)
+	}
+	info, err := h.storage.Head(r.Context(), streamID)
+	if err != nil {
+		return nil, err
+	}
+	if err := h.touch(r, streamID); err != nil {
+		return nil, err
+	}
+	return info, nil
+}
+
 // handleCreate implements PUT (Create Stream) - Section 5.1
 func (h *Handler) handleCreate(w http.ResponseWriter, r *http.Request, streamID string) {
 	// A fork is a distinct, atomic form of creation. Detect header presence
@@ -868,17 +887,12 @@ func (h *Handler) handleAppend(w http.ResponseWriter, r *http.Request, streamID 
 	unlock := h.mutations.lock(streamID)
 	defer unlock()
 
-	// Get stream info to validate content type and closure state.
-	info, err := h.storage.Head(r.Context(), streamID)
+	// Get stream info to validate content type and closure state. A write
+	// request reaching the origin is what resets the TTL window — including for
+	// an append this handler goes on to reject, and for a POST that closes the
+	// stream without appending anything — so the snapshot and renewal are fused.
+	info, err := h.touchHead(r, streamID)
 	if err != nil {
-		writeStorageError(w, err)
-		return
-	}
-
-	// The stream exists and a write request has reached the origin, which is what
-	// resets the window — including for an append this handler goes on to reject,
-	// and for a POST that closes the stream without appending anything.
-	if err := h.touch(r, streamID); err != nil {
 		writeStorageError(w, err)
 		return
 	}
@@ -1228,16 +1242,11 @@ func (h *Handler) handleCatchupRead(w http.ResponseWriter, r *http.Request, stre
 	}
 	defer releaseMutation()
 
-	// Get stream info for content type
-	info, err := h.storage.Head(r.Context(), streamID)
+	// Get stream info for content type. A catch-up read that reaches the origin
+	// resets the window; one served from a CDN never gets here, and per Section
+	// 5.1 must not reset it.
+	info, err := h.touchHead(r, streamID)
 	if err != nil {
-		writeStorageError(w, err)
-		return
-	}
-
-	// A catch-up read that reaches the origin resets the window; one served from
-	// a CDN never gets here, and per Section 5.1 must not reset it.
-	if err := h.touch(r, streamID); err != nil {
 		writeStorageError(w, err)
 		return
 	}
@@ -1356,16 +1365,12 @@ func (h *Handler) handleLongPoll(w http.ResponseWriter, r *http.Request, streamI
 	}
 	defer releaseMutation()
 
-	// Fetch stream info once at the start - needed for offset=now and ContentType/IsPrivate
-	info, err := h.storage.Head(r.Context(), streamID)
+	// Fetch stream info once at the start - needed for offset=now and
+	// ContentType/IsPrivate. The window resets now that processing has begun,
+	// so a poll that waits and returns no data still counts as activity
+	// (Section 5.1).
+	info, err := h.touchHead(r, streamID)
 	if err != nil {
-		writeStorageError(w, err)
-		return
-	}
-
-	// Reset the window now that processing has begun, so a poll that waits and
-	// returns no data still counts as activity (Section 5.1).
-	if err := h.touch(r, streamID); err != nil {
 		writeStorageError(w, err)
 		return
 	}
@@ -1582,8 +1587,10 @@ func (h *Handler) handleSSE(w http.ResponseWriter, r *http.Request, streamID str
 	}
 	defer releaseMutation()
 
-	// Get stream info
-	info, err := h.storage.Head(r.Context(), streamID)
+	// Get stream info and renew the TTL window before committing the streaming
+	// response. Once the headers have been flushed, a renewal failure can only
+	// be represented by terminating the stream.
+	info, err := h.touchHead(r, streamID)
 	if err != nil {
 		writeStorageError(w, err)
 		return
@@ -1593,13 +1600,6 @@ func (h *Handler) handleSSE(w http.ResponseWriter, r *http.Request, streamID str
 	// carried as UTF-8 text; anything else is base64-encoded and announced with the
 	// Stream-SSE-Data-Encoding response header so clients know to decode it.
 	base64Data := protocol.SSERequiresBase64(info.ContentType)
-
-	// Renew before committing the streaming response. Once the headers have been
-	// flushed, a Touch failure can only be represented by terminating the stream.
-	if err := h.touch(r, streamID); err != nil {
-		writeStorageError(w, err)
-		return
-	}
 
 	// Handle offset=now sentinel (Section 8)
 	// Start from tail position, sending initial control event with upToDate

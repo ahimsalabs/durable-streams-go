@@ -378,6 +378,27 @@ type AtomicCloseStorage interface {
 	CloseStream(ctx context.Context, streamID string, messages [][]byte, seq string) (Offset, error)
 }
 
+// TouchHeadStorage is the optional Storage capability for reading a stream's
+// metadata snapshot and restarting its sliding TTL window as one operation.
+// Every origin-reaching read and write performs [Storage.Head] followed by
+// [Storage.Touch], so a backend that can do both in one transaction halves
+// the per-request metadata work. Callers discover the capability with a type
+// assertion and fall back to the two separate calls when it is absent.
+type TouchHeadStorage interface {
+	Storage
+
+	// TouchHead behaves exactly like a successful Head immediately followed by
+	// Touch, executed atomically against the stream's record: no concurrent
+	// mutation can be observed between the snapshot and the renewal. The
+	// returned StreamInfo carries the pre-renewal ExpiresAt, matching what the
+	// separate Head call would have reported.
+	//
+	// Errors are the union of Storage.Head and Storage.Touch errors. On error
+	// the TTL window may or may not have been restarted, exactly as when the
+	// separate Touch call fails.
+	TouchHead(ctx context.Context, streamID string) (*StreamInfo, error)
+}
+
 // ForkRequest describes an atomic fork creation. It deliberately records
 // whether optional protocol fields were present: omission has different
 // inheritance and idempotency semantics from an explicitly supplied zero

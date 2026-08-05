@@ -88,6 +88,7 @@ var (
 	_ durablestream.AtomicBatchStorage = (*Storage)(nil)
 	_ durablestream.AtomicCloseStorage = (*Storage)(nil)
 	_ durablestream.ForkStorage        = (*Storage)(nil)
+	_ durablestream.TouchHeadStorage   = (*Storage)(nil)
 )
 
 // streamState holds in-memory notification state for a stream.
@@ -233,6 +234,13 @@ type Storage struct {
 	// never remove or wake the state of a replacement generation.
 	streams hashtriemap.HashTrieMap[string, *streamState]
 
+	// gens caches each stream's current generation so the append hot path can
+	// skip a read transaction and JSON record decode per request. Entries may
+	// be stale: appends re-validate the generation inside their transaction and
+	// retry on mismatch, so a stale hit costs one retry, never correctness.
+	// Only the append path consumes this cache; reads stay authoritative.
+	gens hashtriemap.HashTrieMap[string, generation]
+
 	// Configuration
 	maxMessageSize  int
 	shutdownTimeout time.Duration
@@ -327,6 +335,9 @@ func New(opts Options) (*Storage, error) {
 		return nil, err
 	}
 	badgerOpts = badgerOpts.WithSyncWrites(syncWrites)
+	// Badger's expvar counters cost measurable atomic traffic on the append
+	// hot path (~5% CPU at saturation) and nothing here consumes them.
+	badgerOpts = badgerOpts.WithMetricsEnabled(false)
 	if opts.Logger != nil {
 		badgerOpts = badgerOpts.WithLogger(opts.Logger)
 	}
@@ -376,7 +387,11 @@ func New(opts Options) (*Storage, error) {
 		tempDir:         tempDir,
 	}
 	if syncWrites && !useInMemory {
-		s.appendCommits = newAppendCommitter(s, defaultAppendCommitConfig())
+		commitCfg := defaultAppendCommitConfig()
+		if opts.AppendCommitMaxInFlight > 0 {
+			commitCfg.maxInFlight = opts.AppendCommitMaxInFlight
+		}
+		s.appendCommits = newAppendCommitter(s, commitCfg)
 		go s.appendCommits.run()
 	}
 
@@ -759,7 +774,7 @@ func (s *Storage) CloseStream(ctx context.Context, streamID string, messages [][
 // known generation. It returns errGenerationChanged if the stream was replaced
 // before the write committed.
 func (s *Storage) appendBatchOnce(streamID string, messages [][]byte, seq string, closeStream bool) (durablestream.Offset, error) {
-	gen, err := s.generationFor(streamID)
+	gen, err := s.cachedGenerationFor(streamID)
 	if err != nil {
 		return "", err
 	}
@@ -781,6 +796,10 @@ func (s *Storage) appendBatchOnce(streamID string, messages [][]byte, seq string
 	}
 	err = result.err
 	if err != nil {
+		// Any failure may mean the cached generation is dead (deleted,
+		// replaced, or expired). Dropping it is cheap and makes the next
+		// attempt re-read the authoritative record.
+		s.gens.CompareAndDelete(streamID, gen)
 		err = mapTransactionSizeError(err)
 		if errors.Is(err, errGenerationChanged) {
 			return "", err
@@ -856,6 +875,23 @@ func (s *Storage) generationFor(streamID string) (generation, error) {
 	return gen, nil
 }
 
+// cachedGenerationFor returns the stream's generation from the in-memory
+// cache, falling back to the persisted record on a miss. Callers must
+// re-validate the generation transactionally before trusting it: the cache is
+// only dropped on append failure and stream removal, so it can briefly serve a
+// generation that a concurrent delete or recreate has already replaced.
+func (s *Storage) cachedGenerationFor(streamID string) (generation, error) {
+	if gen, ok := s.gens.Load(streamID); ok {
+		return gen, nil
+	}
+	gen, err := s.generationFor(streamID)
+	if err != nil {
+		return "", err
+	}
+	s.gens.Store(streamID, gen)
+	return gen, nil
+}
+
 // expiryForGeneration returns the current deadline for one exact incarnation.
 // WaitForData uses it after an empty read to arm an expiry wakeup. Touch wakes
 // the same generation's notification state when it moves this deadline.
@@ -902,6 +938,9 @@ func (s *Storage) dropNotificationState(streamID string, gen generation, state *
 // forgetStream drops all in-memory state for a dead generation of a stream and
 // wakes any waiters so they observe the deletion.
 func (s *Storage) forgetStream(streamID string, gen generation) {
+	// Only the exact dead generation is evicted; a replacement incarnation may
+	// already have cached its own generation under the same stream ID.
+	s.gens.CompareAndDelete(streamID, gen)
 	if state, ok := s.streams.Load(streamStateKey(streamID, gen)); ok {
 		s.dropNotificationState(streamID, gen, state)
 	}
@@ -1086,6 +1125,85 @@ func (s *Storage) Touch(ctx context.Context, streamID string) error {
 		state.wake()
 	}
 	return nil
+}
+
+// TouchHead snapshots stream metadata and restarts the sliding TTL window in
+// one transaction. It is Head and Touch fused: handlers call the pair on every
+// origin-reaching request, and separately each call costs a transaction and a
+// record decode. The returned ExpiresAt is the pre-renewal deadline, matching
+// what a separate Head would have reported.
+func (s *Storage) TouchHead(ctx context.Context, streamID string) (*durablestream.StreamInfo, error) {
+	if err := s.checkClosed(); err != nil {
+		return nil, err
+	}
+	if err := validateStreamID(streamID); err != nil {
+		return nil, err
+	}
+
+	// Create and Delete write the same config key, so this transaction can lose
+	// a conflict to either; retrying settles it against whichever record is
+	// committed by then. See Touch for the sliding-window rules preserved here.
+	var info *durablestream.StreamInfo
+	var gen generation
+	var moved bool
+	err := s.updateWithRetry(func(txn *badger.Txn) error {
+		info, gen, moved = nil, "", false
+		rec, found, err := getRecord(txn, streamID)
+		if err != nil {
+			return err
+		}
+		if !found {
+			return durablestream.ErrNotFound
+		}
+		if err := directRecordError(rec); err != nil {
+			return err
+		}
+
+		tailOffset, err := getTailOffset(txn, streamID, rec.Gen)
+		if err != nil {
+			return fmt.Errorf("badgerstore: get tail offset: %w", err)
+		}
+		info = &durablestream.StreamInfo{
+			ContentType:   rec.ContentType,
+			NextOffset:    tailOffset,
+			TTL:           rec.TTL,
+			ExpiresAt:     rec.ExpiresAt,
+			IsPrivate:     rec.IsPrivate,
+			Closed:        rec.Closed,
+			IncarnationID: string(rec.Gen),
+		}
+
+		cfg, didMove := rec.SlideExpiry(time.Now())
+		if !didMove {
+			// TTL-less (or absolute-expiry) streams write nothing: the commit of
+			// a read-only update transaction is free, so the fused call costs
+			// the same as Head alone.
+			return nil
+		}
+		gen = rec.Gen
+		moved = true
+		rec.StreamConfig = cfg
+
+		encoded, err := json.Marshal(rec)
+		if err != nil {
+			return fmt.Errorf("badgerstore: marshal config: %w", err)
+		}
+		if err := txn.Set(configKey(streamID), encoded); err != nil {
+			return fmt.Errorf("badgerstore: set config: %w", err)
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	if moved {
+		// Wake existing waiters armed against the previous deadline, exactly as
+		// Touch does. No notification state is created solely for a renewal.
+		if state, ok := s.streams.Load(streamStateKey(streamID, gen)); ok {
+			state.wake()
+		}
+	}
+	return info, nil
 }
 
 // Delete removes a stream (Section 5.4).
