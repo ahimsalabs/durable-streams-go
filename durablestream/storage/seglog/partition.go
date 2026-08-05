@@ -225,9 +225,13 @@ func estimateFrameBytes(req *request) int64 {
 	return encodedFrameSize(len(req.streamID), metaLen, req.messages)
 }
 
-// collect gathers requests for one commit group, waiting at most GroupLinger
-// from the first request and stopping at GroupMaxBytes. A request that would
-// cross the byte bound is carried into the next group rather than split.
+// collect gathers requests for one commit group, stopping at GroupMaxBytes.
+// With the default zero GroupLinger it drains only the requests already
+// queued and commits immediately: batching under concurrency comes from
+// arrivals during the previous group's fdatasync, so sequential callers never
+// pay an artificial wait. A positive GroupLinger holds the group open for
+// that long after the first request. A request that would cross the byte
+// bound is carried into the next group rather than split.
 func (p *partition) collect(first *request) (group []*request, queueClosed bool, carry *request) {
 	group = []*request{first}
 	groupBytes := estimateFrameBytes(first)

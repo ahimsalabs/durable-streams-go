@@ -9,10 +9,15 @@ import (
 
 // Defaults for Options fields left at their zero values.
 const (
-	DefaultPartitions          = 32
-	DefaultMaxMessageSize      = 10 << 20 // 10 MiB
-	DefaultWALSegmentBytes     = 256 << 20
-	DefaultGroupLinger         = 500 * time.Microsecond
+	DefaultPartitions      = 32
+	DefaultMaxMessageSize  = 10 << 20 // 10 MiB
+	DefaultWALSegmentBytes = 256 << 20
+	// DefaultGroupLinger is zero: a commit group closes as soon as the queue
+	// has no more waiting requests. Group commit still batches under load —
+	// requests arriving during the previous group's fdatasync form the next
+	// group — so an artificial linger only taxes sequential-caller latency
+	// (measured at ~140x on stream creation with the previous 500µs default).
+	DefaultGroupLinger         = time.Duration(0)
 	DefaultGroupMaxBytes       = 4 << 20
 	DefaultQueueDepth          = 256
 	DefaultShutdownTimeout     = 30 * time.Second
@@ -82,7 +87,11 @@ type Options struct {
 	WALSegmentBytes int64
 
 	// GroupLinger is how long a partition worker waits for more requests
-	// after the first one before committing a group.
+	// after the first one before committing a group. Zero (the default)
+	// commits as soon as the queue is drained: the previous group's fdatasync
+	// is the natural batching window, so concurrent load still forms large
+	// groups. A positive linger trades single-caller latency for potentially
+	// larger groups on bursty low-concurrency workloads.
 	GroupLinger time.Duration
 
 	// GroupMaxBytes bounds the encoded bytes of one commit group. A single
@@ -140,9 +149,6 @@ func (o Options) withDefaults() Options {
 	}
 	if o.WALSegmentBytes == 0 {
 		o.WALSegmentBytes = DefaultWALSegmentBytes
-	}
-	if o.GroupLinger == 0 {
-		o.GroupLinger = DefaultGroupLinger
 	}
 	if o.GroupMaxBytes == 0 {
 		o.GroupMaxBytes = DefaultGroupMaxBytes
