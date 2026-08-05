@@ -56,8 +56,9 @@
 // JSON fork sub-offset cannot be reconstructed from individual messages.
 //
 // New also rejects malformed generation fences, reference counts, or cyclic
-// lineage. Every rejected open closes Badger and leaves all bytes intact for an
-// explicit migration or repair; this package never guesses at durable history.
+// lineage. Every rejected open closes Badger and leaves all bytes intact so the
+// operator can inspect, drain, or discard them; this package never guesses at
+// durable history and ships no migration tool (see [ErrLegacyFormat]).
 package badgerstore
 
 import (
@@ -139,8 +140,10 @@ var ErrClosed = fmt.Errorf("badgerstore: storage closed: %w", durablestream.ErrC
 
 // ErrLegacyFormat is returned by New when a Badger directory contains stream
 // records that do not use this package's complete versioned lineage and batch
-// format. New closes the database and leaves every incompatible key intact;
-// callers must migrate or explicitly discard that directory before reopening.
+// format. New closes the database and leaves every incompatible key intact.
+// No in-place migration exists: legacy records lack the batch-boundary
+// metadata this format requires, so callers must either discard the directory
+// or drain its streams through the protocol using the binary that wrote it.
 var ErrLegacyFormat = errors.New("badgerstore: legacy on-disk format")
 
 // errGenerationChanged is an internal sentinel: the stream was deleted and
