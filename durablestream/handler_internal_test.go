@@ -326,12 +326,12 @@ func TestSplitBySSELineTerminators(t *testing.T) {
 }
 
 func TestMakeETag(t *testing.T) {
-	if got := makeETag("", "start", "end"); got != "" {
+	if got := makeETag("", "start", "end", false); got != "" {
 		t.Fatalf("makeETag with no incarnation ID = %q, want empty", got)
 	}
 
 	const opaqueID = "opaque\x00\r\n\xffid"
-	got := makeETag(opaqueID, "start", "end")
+	got := makeETag(opaqueID, "start", "end", false)
 	if len(got) != 66 || got[0] != '"' || got[len(got)-1] != '"' {
 		t.Fatalf("makeETag() = %q, want a quoted SHA-256 digest", got)
 	}
@@ -340,14 +340,15 @@ func TestMakeETag(t *testing.T) {
 			t.Fatalf("makeETag() exposed unsafe opaque-ID byte %#x: %q", forbidden, got)
 		}
 	}
-	if again := makeETag(opaqueID, "start", "end"); again != got {
+	if again := makeETag(opaqueID, "start", "end", false); again != got {
 		t.Fatalf("makeETag() is not stable: first %q, second %q", got, again)
 	}
 
 	for name, changed := range map[string]string{
-		"incarnation": makeETag("replacement", "start", "end"),
-		"start":       makeETag(opaqueID, "different", "end"),
-		"end":         makeETag(opaqueID, "start", "different"),
+		"incarnation": makeETag("replacement", "start", "end", false),
+		"start":       makeETag(opaqueID, "different", "end", false),
+		"end":         makeETag(opaqueID, "start", "different", false),
+		"closure":     makeETag(opaqueID, "start", "end", true),
 	} {
 		if changed == got {
 			t.Errorf("makeETag() did not change when %s changed", name)
@@ -641,6 +642,23 @@ func TestHandler_SlowPOSTBodyDoesNotBlockStreamMutation(t *testing.T) {
 }
 
 func TestHandler_RequiresAtomicStorageForRequestBatches(t *testing.T) {
+	t.Run("PUT creating a closed stream", func(t *testing.T) {
+		base := newTestStorage()
+		handler := NewHandler(&baseStorageOnly{Storage: base}, nil)
+		req := httptest.NewRequest(http.MethodPut, "/stream", nil)
+		req.Header.Set(protocol.HeaderStreamClosed, "true")
+		rec := httptest.NewRecorder()
+
+		handler.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusNotImplemented {
+			t.Fatalf("PUT status = %d, want 501 (body %q)", rec.Code, rec.Body.String())
+		}
+		if _, err := base.Head(t.Context(), "/stream"); !errors.Is(err, ErrNotFound) {
+			t.Fatalf("Head after rejected PUT error = %v, want ErrNotFound", err)
+		}
+	})
+
 	t.Run("PUT with initial content", func(t *testing.T) {
 		base := newTestStorage()
 		handler := NewHandler(&baseStorageOnly{Storage: base}, nil)

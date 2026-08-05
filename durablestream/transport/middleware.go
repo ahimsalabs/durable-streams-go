@@ -133,10 +133,11 @@ func defaultRetryable(err error) bool {
 }
 
 // WithRetry wraps a transport with retry logic and exponential backoff for
-// retry-safe operations. Plain appends and deletes are passed through exactly
-// once: an ambiguous first attempt may already have appended data or deleted an
-// older incarnation, and retrying could duplicate the append or delete a stream
-// recreated at the same path.
+// retry-safe operations. Plain appends, append-and-close requests without
+// producer headers, and deletes are passed through exactly once: an ambiguous
+// first attempt may already have appended data or deleted an older incarnation,
+// and retrying could duplicate the append or delete a stream recreated at the
+// same path. Empty close-only requests are idempotent and may be retried.
 //
 // Example:
 //
@@ -207,15 +208,16 @@ func (t *retryTransport) SSE(ctx context.Context, req SSERequest) (EventStream, 
 	return stream, err
 }
 
-// Append retries only when the request carries idempotent producer headers
-// (Section 5.2.1).
+// Append retries only when the request carries idempotent producer headers or
+// is a close-only request (Sections 5.2.1 and 5.3).
 //
 // A plain append is not idempotent: a 502 or 503 from an intermediary can arrive
 // after the origin has already committed the data, so retrying would append the
 // same bytes twice. With producer headers the server deduplicates by
-// (producer, epoch, seq) and the retry is safe.
+// (producer, epoch, seq), and an empty close-only request is independently
+// idempotent, so those requests are safe to retry.
 func (t *retryTransport) Append(ctx context.Context, req AppendRequest) (*AppendResponse, error) {
-	if !req.HasProducerHeaders {
+	if !req.HasProducerHeaders && !(req.Close && len(req.Data) == 0) {
 		return t.next.Append(ctx, req)
 	}
 

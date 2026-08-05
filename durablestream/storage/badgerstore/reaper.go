@@ -175,10 +175,10 @@ func (s *Storage) reapTombstones(ctx context.Context) error {
 	}
 }
 
-// purgeGeneration deletes all messages and the offset sequence belonging to one
-// generation of a stream. It is safe to run concurrently with any operation on
-// the same stream ID: a later incarnation has a different generation and
-// therefore disjoint keys.
+// purgeGeneration deletes all messages, batch boundaries, and the offset
+// sequence belonging to one generation. It is safe to run concurrently with
+// any operation on the same stream ID: a later incarnation has a different
+// generation and therefore disjoint keys.
 func (s *Storage) purgeGeneration(ctx context.Context, streamID string, gen generation) error {
 	// Defensive: never purge the live generation, and never purge a stream
 	// whose record cannot be read (its state is unknown).
@@ -202,6 +202,9 @@ func (s *Storage) purgeGeneration(ctx context.Context, streamID string, gen gene
 	if err := s.deletePrefix(ctx, messagePrefix(streamID, gen)); err != nil {
 		return fmt.Errorf("badgerstore: purge messages for %q: %w", streamID, err)
 	}
+	if err := s.deletePrefix(ctx, batchPrefix(streamID, gen)); err != nil {
+		return fmt.Errorf("badgerstore: purge batch boundaries for %q: %w", streamID, err)
+	}
 	if err := s.deleteKeys(ctx, [][]byte{seqKey(streamID, gen)}); err != nil {
 		return fmt.Errorf("badgerstore: purge sequence for %q: %w", streamID, err)
 	}
@@ -217,6 +220,9 @@ func (s *Storage) purgeGeneration(ctx context.Context, streamID string, gen gene
 // deletion transaction re-reads the configuration before removing a key.
 func (s *Storage) reapOrphans(ctx context.Context) error {
 	if err := s.sweepPrefix(ctx, prefixMessage, 3); err != nil {
+		return err
+	}
+	if err := s.sweepPrefix(ctx, prefixBatch, 3); err != nil {
 		return err
 	}
 	return s.sweepPrefix(ctx, prefixSeq, 2)

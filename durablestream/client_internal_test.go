@@ -833,6 +833,7 @@ type fakeTransport struct {
 	readFunc     func(context.Context, transport.ReadRequest) (*transport.ReadResponse, error)
 	longPollFunc func(context.Context, transport.LongPollRequest) (*transport.ReadResponse, error)
 	appendFunc   func(context.Context, transport.AppendRequest) (*transport.AppendResponse, error)
+	createFunc   func(context.Context, transport.CreateRequest) (*transport.CreateResponse, error)
 	headFunc     func(context.Context, transport.HeadRequest) (*transport.HeadResponse, error)
 	sseFunc      func(context.Context, transport.SSERequest) (transport.EventStream, error)
 }
@@ -866,6 +867,9 @@ func (f *fakeTransport) Append(ctx context.Context, req transport.AppendRequest)
 }
 
 func (f *fakeTransport) Create(ctx context.Context, req transport.CreateRequest) (*transport.CreateResponse, error) {
+	if f.createFunc != nil {
+		return f.createFunc(ctx, req)
+	}
 	return &transport.CreateResponse{}, nil
 }
 
@@ -958,6 +962,44 @@ func TestReader_Messages_RetriesTransientError(t *testing.T) {
 	}
 	if got != "hello" {
 		t.Errorf("message = %q, want %q", got, "hello")
+	}
+}
+
+func TestReader_Messages_ReconnectsAfterOpenSSEEOF(t *testing.T) {
+	var opens atomic.Int32
+	ft := &fakeTransport{
+		headFunc: func(context.Context, transport.HeadRequest) (*transport.HeadResponse, error) {
+			return &transport.HeadResponse{ContentType: "text/plain"}, nil
+		},
+		sseFunc: func(ctx context.Context, _ transport.SSERequest) (transport.EventStream, error) {
+			if opens.Add(1) == 1 {
+				return &scriptedEventStream{requestCtx: ctx, terminalErr: io.EOF}, nil
+			}
+			return &scriptedEventStream{
+				requestCtx: ctx,
+				events: []*transport.Event{
+					{Type: "data", Data: []byte("after rotation")},
+					{Type: "control", NextOffset: "0_14", Closed: true, UpToDate: true},
+				},
+			}, nil
+		},
+	}
+
+	reader := NewClientWithTransport(ft, &TransportClientConfig{ReadMode: ReadModeSSE}).Reader("/test", ZeroOffset)
+	defer reader.Close()
+
+	var messages []string
+	for msg, err := range reader.Messages(t.Context()) {
+		if err != nil {
+			t.Fatalf("Messages() surfaced SSE rotation as an error: %v", err)
+		}
+		messages = append(messages, msg.String())
+	}
+	if len(messages) != 1 || messages[0] != "after rotation" {
+		t.Fatalf("messages = %v, want [after rotation]", messages)
+	}
+	if got := opens.Load(); got != 2 {
+		t.Fatalf("SSE opens = %d, want 2", got)
 	}
 }
 

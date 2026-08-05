@@ -62,9 +62,10 @@ type ClientConfig struct {
 	// This is the primary customization point for authentication.
 	Headers HeaderProvider
 
-	// Timeout bounds each non-streaming operation (Create, Head, Delete,
-	// Send, and catch-up reads). It is applied as a context deadline, so it
-	// does not affect long-poll or SSE reads, which have their own deadlines.
+	// Timeout bounds each non-streaming operation (Create, Head, Delete, Send,
+	// StreamWriter.Close, and catch-up reads). It is applied as a context
+	// deadline, so it does not affect long-poll or SSE reads, which have their
+	// own deadlines.
 	// Zero or negative values default to 30s.
 	Timeout time.Duration
 
@@ -98,7 +99,9 @@ type Client struct {
 // with exponential backoff for retry-safe operations. Bare appends made by
 // StreamWriter are intentionally not retried because the server cannot
 // deduplicate them; transport-level appends carrying idempotent producer headers
-// are retryable. Deletes are also not retried because the path could be recreated
+// are retryable. Empty close-only requests are also retried because protocol
+// closure is idempotent, while append-and-close requests without producer
+// headers are not. Deletes are not retried because the path could be recreated
 // between attempts, causing a retry to delete the replacement. For custom retry
 // behavior or to disable retry, use NewClientWithTransport.
 //
@@ -177,6 +180,7 @@ type StreamData struct {
 	NextOffset Offset // Next offset to read from
 	Cursor     string // Opaque cursor for long-poll
 	UpToDate   bool   // True if caught up to tail
+	Closed     bool   // True at permanent EOF; unlike UpToDate, no more data can arrive
 }
 
 // Message represents a single message from a stream.
@@ -217,6 +221,10 @@ type CreateOptions struct {
 
 	// InitialData sets the initial stream data.
 	InitialData []byte
+
+	// Closed creates the stream in its terminal state. InitialData, if any, is
+	// its complete and final content.
+	Closed bool
 }
 
 // withTimeout applies the client's configured operation timeout to ctx.
@@ -247,16 +255,21 @@ func (c *Client) Create(ctx context.Context, path string, opts *CreateOptions) (
 		req.TTL = opts.TTL
 		req.ExpiresAt = opts.ExpiresAt
 		req.InitialData = opts.InitialData
+		req.Closed = opts.Closed
 	}
 
 	resp, err := c.transport.Create(ctx, req)
 	if err != nil {
 		return nil, convertTransportErrorWithPath(err, path)
 	}
+	if req.Closed && !resp.Closed {
+		return nil, wrapSentinelWithPath("create response did not confirm stream closure", ErrParseError, path)
+	}
 
 	return &StreamInfo{
 		ContentType: contentType,
 		NextOffset:  Offset(resp.NextOffset),
+		Closed:      resp.Closed,
 	}, nil
 }
 
@@ -275,6 +288,7 @@ func (c *Client) Head(ctx context.Context, path string) (*StreamInfo, error) {
 		NextOffset:  Offset(resp.NextOffset),
 		TTL:         resp.TTL,
 		ExpiresAt:   resp.ExpiresAt,
+		Closed:      resp.Closed,
 	}, nil
 }
 
@@ -293,7 +307,7 @@ func (c *Client) Delete(ctx context.Context, path string) error {
 // writer, or serialize access with a mutex: concurrent Send calls would race on
 // the cached offset and interleave appends in an unspecified order.
 //
-// See PROTOCOL.md Section 5.2: Append to Stream.
+// See PROTOCOL.md Sections 5.2-5.3: Append and Close Stream.
 type StreamWriter struct {
 	client      *Client
 	ctx         context.Context
@@ -329,6 +343,11 @@ type SendOptions struct {
 	// Seq is an optional monotonic sequence number for writer coordination.
 	// If provided and less than or equal to the last sequence, returns ErrConflict.
 	Seq string
+
+	// Close atomically closes the stream after this append. An empty data slice
+	// is valid when Close is true. Use this form instead of StreamWriter.Close
+	// when the closing mutation also needs Seq.
+	Close bool
 }
 
 // Send appends raw bytes to the stream (Section 5.2: Append to Stream).
@@ -349,6 +368,31 @@ func (w *StreamWriter) Send(data []byte, opts *SendOptions) error {
 // The append is bounded by the client's configured timeout in addition to any
 // deadline on ctx.
 func (w *StreamWriter) SendContext(ctx context.Context, data []byte, opts *SendOptions) error {
+	return w.appendContext(ctx, data, opts, opts != nil && opts.Close)
+}
+
+// Close atomically appends finalData, if non-empty, and permanently closes the
+// stream. It uses the context passed to [Client.Writer]. A close with no final
+// data is idempotent and may be retried. A close with final data is sent only
+// once because retrying an ambiguous response could append it twice. Therefore,
+// an error from a close with final data does not prove that the server failed to
+// commit it; callers needing safe retries must use idempotent producer headers.
+func (w *StreamWriter) Close(finalData []byte) error {
+	ctx := w.ctx
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return w.CloseContext(ctx, finalData)
+}
+
+// CloseContext atomically appends finalData, if non-empty, and permanently
+// closes the stream using ctx. The operation is bounded by the client's
+// configured timeout.
+func (w *StreamWriter) CloseContext(ctx context.Context, finalData []byte) error {
+	return w.appendContext(ctx, finalData, nil, true)
+}
+
+func (w *StreamWriter) appendContext(ctx context.Context, data []byte, opts *SendOptions, closeStream bool) error {
 	var seq string
 	if opts != nil {
 		seq = opts.Seq
@@ -362,9 +406,19 @@ func (w *StreamWriter) SendContext(ctx context.Context, data []byte, opts *SendO
 		Data:        data,
 		ContentType: w.contentType,
 		Seq:         seq,
+		Close:       closeStream,
 	})
 	if err != nil {
+		var transportErr *transport.Error
+		if errors.As(err, &transportErr) &&
+			(transportErr.Code == "STREAM_CLOSED" || transportErr.Code == "stream_closed") &&
+			transportErr.FinalOffset != "" {
+			w.offset = Offset(transportErr.FinalOffset)
+		}
 		return convertTransportErrorWithPath(err, w.path)
+	}
+	if closeStream && !resp.Closed {
+		return wrapSentinelWithPath("append response did not confirm stream closure", ErrParseError, w.path)
 	}
 
 	w.offset = Offset(resp.NextOffset)
@@ -453,6 +507,12 @@ func convertTransportErrorWithPath(err error, path string) error {
 			return wrapSentinelWithPath(tErr.Message, ErrSequenceConflict, path)
 		case "CONFLICT", "conflict":
 			return wrapSentinelWithPath(tErr.Message, ErrConflict, path)
+		case "STREAM_CLOSED", "stream_closed":
+			return &StreamClosedError{
+				Path:        path,
+				FinalOffset: Offset(tErr.FinalOffset),
+				Message:     tErr.Message,
+			}
 		case "GONE", "gone":
 			return wrapSentinelWithPath(tErr.Message, ErrGone, path)
 		case "BAD_REQUEST", "bad_request":

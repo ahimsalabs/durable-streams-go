@@ -18,6 +18,7 @@ const (
 	prefixConfig    = "c:" // c:{streamID} -> JSON-encoded streamRecord
 	prefixLastSeq   = "q:" // q:{streamID} -> last sequence number (for dedup)
 	prefixMessage   = "m:" // m:{streamID}:{generation}:{offset} -> message data
+	prefixBatch     = "b:" // b:{streamID}:{generation}:{startOffset} -> end offset
 	prefixSeq       = "s:" // s:{streamID}:{generation} -> Badger sequence for offset generation
 	prefixTombstone = "t:" // t:{streamID}:{generation} -> generation awaiting purge (empty value)
 )
@@ -59,6 +60,18 @@ func messageKey(streamID string, gen generation, offset durablestream.Offset) []
 	return []byte(prefixMessage + streamID + ":" + string(gen) + ":" + offset.String())
 }
 
+// batchPrefix covers the append-batch boundaries for one generation. Boundary
+// metadata is required to interpret JSON fork sub-offsets: flattened messages
+// remain individually readable, while the batch key records which messages
+// came from one atomic append.
+func batchPrefix(streamID string, gen generation) []byte {
+	return []byte(prefixBatch + streamID + ":" + string(gen) + ":")
+}
+
+func batchKey(streamID string, gen generation, start durablestream.Offset) []byte {
+	return []byte(prefixBatch + streamID + ":" + string(gen) + ":" + start.String())
+}
+
 func seqKey(streamID string, gen generation) []byte {
 	return []byte(prefixSeq + streamID + ":" + string(gen))
 }
@@ -72,9 +85,9 @@ func tombstoneKey(streamID string, gen generation) []byte {
 // including keys written by versions that predate generation scoping.
 //
 // segments is the number of ':'-separated segments after the prefix: 2 for
-// sequence and tombstone keys ({streamID}:{generation}), 3 for message keys
-// ({streamID}:{generation}:{offset}). Stream IDs may not contain ':' (see
-// validateStreamID), so the split is unambiguous.
+// sequence and tombstone keys ({streamID}:{generation}), 3 for message and
+// batch-boundary keys ({streamID}:{generation}:{offset}). Stream IDs may not
+// contain ':' (see validateStreamID), so the split is unambiguous.
 func splitScopedKey(prefix string, key []byte, segments int) (streamID string, gen generation, ok bool) {
 	rest, found := strings.CutPrefix(string(key), prefix)
 	if !found {

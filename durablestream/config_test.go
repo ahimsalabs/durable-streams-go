@@ -43,3 +43,15 @@ func TestStreamConfigSlideExpiryLeavesAbsoluteDeadline(t *testing.T) {
 		t.Fatalf("absolute deadline = %v after SlideExpiry, want %v", got.ExpiresAt, want)
 	}
 }
+
+func TestStreamConfigMatchesIncludesClosedState(t *testing.T) {
+	open := StreamConfig{ContentType: "text/plain"}
+	closed := StreamConfig{ContentType: "text/plain", Closed: true}
+
+	if open.Matches(closed) || closed.Matches(open) {
+		t.Fatal("open and closed stream configurations matched")
+	}
+	if !closed.Matches(closed) {
+		t.Fatal("identical closed stream configurations did not match")
+	}
+}

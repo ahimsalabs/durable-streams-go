@@ -11,6 +11,7 @@ import (
 	"io"
 	"math"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 	"time"
@@ -59,7 +60,11 @@ var (
 		protocol.HeaderStreamTTL,
 		protocol.HeaderStreamExpiresAt,
 		protocol.HeaderStreamSeq,
+		protocol.HeaderStreamClosed,
 		protocol.HeaderStreamPrivate,
+		protocol.HeaderStreamForkedFrom,
+		protocol.HeaderStreamForkOffset,
+		protocol.HeaderStreamForkSubOffset,
 		protocol.HeaderProducerID,
 		protocol.HeaderProducerEpoch,
 		protocol.HeaderProducerSeq,
@@ -71,6 +76,7 @@ var (
 		protocol.HeaderStreamNextOffset,
 		protocol.HeaderStreamCursor,
 		protocol.HeaderStreamUpToDate,
+		protocol.HeaderStreamClosed,
 		protocol.HeaderStreamTTL,
 		protocol.HeaderStreamExpiresAt,
 		protocol.HeaderStreamSSEDataEncoding,
@@ -87,13 +93,23 @@ type HandlerConfig struct {
 	// Default: uses r.URL.Path.
 	PathExtractor func(*http.Request) string
 
+	// ForkPathExtractor maps the path from a Stream-Forked-From request header
+	// to the Storage stream ID used by this Handler. The input path has already
+	// been validated as an absolute, same-server path without a query, fragment,
+	// or dot segments. The default infers the mounted stream-root prefix from
+	// RequestURI and PathExtractor, including the common http.StripPrefix case.
+	// Set this when a custom PathExtractor does not preserve a suffix of the
+	// externally visible request path.
+	ForkPathExtractor func(r *http.Request, sourcePath string) (string, error)
+
 	// LongPollTimeout is the maximum wait time for long-poll requests. Default: 30s.
 	LongPollTimeout time.Duration
 
 	// SSECloseAfter is the duration after which SSE connections are closed. Default: 60s.
 	SSECloseAfter time.Duration
 
-	// MaxAppendSize is the maximum allowed size for append operations. Default: 10MB.
+	// MaxAppendSize is the maximum request body size for stream creation, fork
+	// creation, and append operations. Default: 10MB.
 	MaxAppendSize int64
 
 	// ChunkSize is the maximum response size (in bytes) for read operations.
@@ -131,12 +147,14 @@ type HandlerConfig struct {
 // implementations additionally expose incarnation identity so in-flight reads
 // can reject a cross-Handler replacement; a custom Storage that leaves
 // IncarnationID empty cannot provide that cross-Handler protection. Initial
-// content and multi-message JSON appends require [AtomicBatchStorage]; a custom
-// backend without that optional capability receives 501 for those requests
-// rather than exposing a partial commit.
+// content and multi-message JSON appends require [AtomicBatchStorage], and
+// closing a stream requires [AtomicCloseStorage]. Fork creation requires
+// [ForkStorage]. A custom backend without the relevant optional capability
+// receives 501 rather than exposing a partial or non-atomic commit.
 type Handler struct {
 	storage         Storage
 	pathExtractor   func(*http.Request) string
+	forkPathExtract func(*http.Request, string, string) (string, error)
 	longPollTimeout time.Duration
 	sseCloseAfter   time.Duration
 	maxAppendSize   int64
@@ -161,6 +179,7 @@ func NewHandler(storage Storage, cfg *HandlerConfig) *Handler {
 	h := &Handler{
 		storage:         storage,
 		pathExtractor:   func(r *http.Request) string { return r.URL.Path },
+		forkPathExtract: defaultForkPathExtractor,
 		longPollTimeout: defaultLongPollTimeout,
 		sseCloseAfter:   defaultSSECloseAfter,
 		maxAppendSize:   defaultMaxAppendSize,
@@ -170,6 +189,15 @@ func NewHandler(storage Storage, cfg *HandlerConfig) *Handler {
 	if cfg != nil {
 		if cfg.PathExtractor != nil {
 			h.pathExtractor = cfg.PathExtractor
+		}
+		if cfg.ForkPathExtractor != nil {
+			h.forkPathExtract = func(r *http.Request, _ string, sourcePath string) (string, error) {
+				path, err := validatedForkSourcePath(sourcePath)
+				if err != nil {
+					return "", err
+				}
+				return cfg.ForkPathExtractor(r, path)
+			}
 		}
 		if cfg.LongPollTimeout > 0 {
 			h.longPollTimeout = cfg.LongPollTimeout
@@ -260,6 +288,16 @@ func (h *Handler) touch(r *http.Request, streamID string) error {
 
 // handleCreate implements PUT (Create Stream) - Section 5.1
 func (h *Handler) handleCreate(w http.ResponseWriter, r *http.Request, streamID string) {
+	// A fork is a distinct, atomic form of creation. Detect header presence
+	// rather than a non-empty value so an empty or orphaned fork header is
+	// rejected instead of silently creating an ordinary stream.
+	if hasRequestHeader(r.Header, protocol.HeaderStreamForkedFrom) ||
+		hasRequestHeader(r.Header, protocol.HeaderStreamForkOffset) ||
+		hasRequestHeader(r.Header, protocol.HeaderStreamForkSubOffset) {
+		h.handleForkCreate(w, r, streamID)
+		return
+	}
+
 	// Parse Content-Type header (default: application/octet-stream)
 	contentType := r.Header.Get("Content-Type")
 	if contentType == "" {
@@ -269,6 +307,7 @@ func (h *Handler) handleCreate(w http.ResponseWriter, r *http.Request, streamID 
 	// Parse TTL and Expires-At headers
 	cfg := StreamConfig{
 		ContentType: contentType,
+		Closed:      strings.EqualFold(r.Header.Get(protocol.HeaderStreamClosed), "true"),
 	}
 
 	hasTTL := r.Header.Get(protocol.HeaderStreamTTL) != ""
@@ -345,6 +384,10 @@ func (h *Handler) handleCreate(w http.ResponseWriter, r *http.Request, streamID 
 	batchStorage, hasAtomicBatch := h.storage.(AtomicBatchStorage)
 	if len(initialMessages) > 0 && !hasAtomicBatch {
 		writeError(w, newError(codeNotImplemented, "storage does not support atomic stream creation with initial content"))
+		return
+	}
+	if _, hasAtomicClose := h.storage.(AtomicCloseStorage); cfg.Closed && !hasAtomicClose {
+		writeError(w, newError(codeNotImplemented, "storage does not support atomic stream closure"))
 		return
 	}
 	// From the Create commit through producer-state reset and initial appends,
@@ -427,8 +470,291 @@ func (h *Handler) handleCreate(w http.ResponseWriter, r *http.Request, streamID 
 	}
 	w.Header().Set("Content-Type", contentType)
 	w.Header().Set(protocol.HeaderStreamNextOffset, nextOffset.String())
+	if cfg.Closed {
+		w.Header().Set(protocol.HeaderStreamClosed, "true")
+	}
 
 	// 201 Created for new streams, 200 OK for idempotent match
+	if created {
+		w.WriteHeader(http.StatusCreated)
+	} else {
+		w.WriteHeader(http.StatusOK)
+	}
+}
+
+// handleForkCreate implements the fork variant of PUT (Section 4.2). Storage
+// atomically resolves the source and target. Metadata inspection is needed only
+// to decode an initial body whose Content-Type was omitted; in that case the
+// inspected source incarnation is fenced when the target does not yet exist.
+func (h *Handler) handleForkCreate(w http.ResponseWriter, r *http.Request, streamID string) {
+	forkStorage, ok := h.storage.(ForkStorage)
+	if !ok {
+		writeError(w, newError(codeNotImplemented, "storage does not support stream forking"))
+		return
+	}
+
+	sourcePath, sourceSet, err := singleRequestHeader(r.Header, protocol.HeaderStreamForkedFrom)
+	if err != nil {
+		writeError(w, newError(codeBadRequest, err.Error()))
+		return
+	}
+	offsetValue, offsetSet, err := singleRequestHeader(r.Header, protocol.HeaderStreamForkOffset)
+	if err != nil {
+		writeError(w, newError(codeBadRequest, err.Error()))
+		return
+	}
+	subOffsetValue, subOffsetSet, err := singleRequestHeader(r.Header, protocol.HeaderStreamForkSubOffset)
+	if err != nil {
+		writeError(w, newError(codeBadRequest, err.Error()))
+		return
+	}
+	if !sourceSet || sourcePath == "" {
+		writeError(w, newError(codeBadRequest, "Stream-Forked-From is required for fork creation"))
+		return
+	}
+
+	sourceID, err := h.forkPathExtract(r, streamID, sourcePath)
+	if err != nil {
+		writeError(w, newError(codeBadRequest, err.Error()))
+		return
+	}
+	if sourceID == "" || hasReservedSegment(sourceID) {
+		writeError(w, newError(codeBadRequest, "Stream-Forked-From does not identify a valid stream"))
+		return
+	}
+
+	req := ForkRequest{
+		SourceStreamID: sourceID,
+		OffsetSet:      offsetSet,
+		Config: StreamConfig{
+			Closed: strings.EqualFold(r.Header.Get(protocol.HeaderStreamClosed), "true"),
+		},
+	}
+	if offsetSet {
+		if offsetValue == "" || offsetValue == protocol.OffsetStart || offsetValue == protocol.OffsetNow {
+			writeError(w, newError(codeBadRequest, "invalid Stream-Fork-Offset header"))
+			return
+		}
+		if err := validateOffset(offsetValue); err != nil {
+			writeError(w, newError(codeBadRequest, "invalid Stream-Fork-Offset header: "+err.Error()))
+			return
+		}
+		req.Offset = Offset(offsetValue)
+	}
+
+	if subOffsetSet {
+		if subOffsetValue == "" || subOffsetValue[0] == '+' || subOffsetValue[0] == '-' ||
+			(len(subOffsetValue) > 1 && subOffsetValue[0] == '0') {
+			writeError(w, newError(codeBadRequest, "invalid Stream-Fork-Sub-Offset header"))
+			return
+		}
+		req.SubOffset, err = strconv.ParseUint(subOffsetValue, 10, 64)
+		if err != nil {
+			writeError(w, newError(codeBadRequest, "invalid Stream-Fork-Sub-Offset header"))
+			return
+		}
+		if req.SubOffset > 0 && !offsetSet {
+			writeError(w, newError(codeBadRequest, "Stream-Fork-Sub-Offset greater than zero requires Stream-Fork-Offset"))
+			return
+		}
+	}
+
+	contentType, contentTypeSet, err := singleRequestHeader(r.Header, "Content-Type")
+	if err != nil {
+		writeError(w, newError(codeBadRequest, err.Error()))
+		return
+	}
+	if contentTypeSet && strings.TrimSpace(contentType) == "" {
+		writeError(w, newError(codeBadRequest, "invalid empty Content-Type header"))
+		return
+	}
+	req.ContentTypeSet = contentTypeSet
+
+	ttlValue, ttlSet, err := singleRequestHeader(r.Header, protocol.HeaderStreamTTL)
+	if err != nil {
+		writeError(w, newError(codeBadRequest, err.Error()))
+		return
+	}
+	expiresAtValue, expiresAtSet, err := singleRequestHeader(r.Header, protocol.HeaderStreamExpiresAt)
+	if err != nil {
+		writeError(w, newError(codeBadRequest, err.Error()))
+		return
+	}
+	if ttlSet && expiresAtSet {
+		writeError(w, newError(codeBadRequest, "cannot specify both Stream-TTL and Stream-Expires-At"))
+		return
+	}
+	if ttlSet {
+		if ttlValue == "" || ttlValue[0] == '+' || ttlValue[0] == '-' ||
+			(len(ttlValue) > 1 && ttlValue[0] == '0') {
+			writeError(w, newError(codeBadRequest, "invalid Stream-TTL header"))
+			return
+		}
+		ttlSeconds, parseErr := strconv.ParseInt(ttlValue, 10, 64)
+		if parseErr != nil || ttlSeconds < 0 || ttlSeconds > math.MaxInt64/int64(time.Second) {
+			writeError(w, newError(codeBadRequest, "invalid Stream-TTL header"))
+			return
+		}
+		req.TTLSet = true
+		req.Config.TTL = time.Duration(ttlSeconds) * time.Second
+	}
+	if expiresAtSet {
+		expiresAt, parseErr := time.Parse(time.RFC3339, expiresAtValue)
+		if parseErr != nil {
+			writeError(w, newError(codeBadRequest, "invalid Stream-Expires-At header (must be RFC3339)"))
+			return
+		}
+		req.ExpiresAtSet = true
+		req.Config.ExpiresAt = expiresAt
+	}
+
+	if privateValue, privateSet, privateErr := singleRequestHeader(r.Header, protocol.HeaderStreamPrivate); privateErr != nil {
+		writeError(w, newError(codeBadRequest, privateErr.Error()))
+		return
+	} else if privateSet {
+		switch privateValue {
+		case "true":
+			req.Config.IsPrivate = true
+		case "false":
+		default:
+			writeError(w, newError(codeBadRequest, "invalid Stream-Private header (must be 'true' or 'false')"))
+			return
+		}
+	}
+
+	body, protoErr := h.readBoundedBody(r)
+	if protoErr != nil {
+		writeError(w, protoErr)
+		return
+	}
+	if contentTypeSet {
+		req.Config.ContentType = contentType
+	} else if len(body) > 0 {
+		// Decoding an inherited JSON representation requires its content type.
+		// Prefer target metadata so an exact PUT retry remains decodable after
+		// its source was deleted, expired, or replaced. CreateFork is still the
+		// authority on whether that target is an equivalent fork. A new target
+		// falls back to the current source snapshot, and CreateFork verifies the
+		// resolved type atomically before committing.
+		info, targetErr := h.storage.Head(r.Context(), streamID)
+		if targetErr != nil && !errors.Is(targetErr, ErrNotFound) && !errors.Is(targetErr, ErrSoftDeleted) {
+			writeStorageError(w, targetErr)
+			return
+		}
+		if targetErr != nil {
+			var sourceErr error
+			info, sourceErr = h.storage.Head(r.Context(), sourceID)
+			if sourceErr != nil {
+				// Another equivalent PUT may have committed after the first target
+				// lookup and then deleted the source. Recheck the target before
+				// rejecting: an existing target is durable evidence that lets
+				// CreateFork decide whether this request is an exact replay.
+				var retryTargetErr error
+				info, retryTargetErr = h.storage.Head(r.Context(), streamID)
+				if retryTargetErr != nil {
+					if errors.Is(targetErr, ErrSoftDeleted) || errors.Is(sourceErr, ErrSoftDeleted) ||
+						errors.Is(retryTargetErr, ErrSoftDeleted) {
+						writeError(w, newError(codeConflict, "fork source is soft-deleted"))
+						return
+					}
+					writeStorageError(w, sourceErr)
+					return
+				}
+			} else {
+				req.SourceIncarnationID = info.IncarnationID
+			}
+		}
+		contentType = info.ContentType
+		req.Config.ContentType = contentType
+	}
+
+	var initialMessages [][]byte
+	if len(body) > 0 {
+		if protocol.IsJSONContentType(contentType) {
+			initialMessages, err = protocol.ProcessJSONCreate(body)
+			if err != nil {
+				writeError(w, newError(codeBadRequest, err.Error()))
+				return
+			}
+		} else {
+			initialMessages = [][]byte{body}
+		}
+	}
+
+	// Bind publication and producer-state reset to the target incarnation.
+	// CreateFork itself atomically binds the source reference and target body.
+	unlock := h.mutations.lock(streamID)
+	defer unlock()
+
+	created, info, err := forkStorage.CreateFork(r.Context(), streamID, req, initialMessages)
+	if err != nil {
+		writeStorageError(w, err)
+		return
+	}
+	if info == nil {
+		writeError(w, newError(codeInternal, "storage returned no fork metadata"))
+		return
+	}
+
+	if created {
+		h.mutations.bump(streamID)
+		h.producers.forget(streamID)
+	} else if err := h.touch(r, streamID); err != nil {
+		writeStorageError(w, err)
+		return
+	}
+
+	writeCreateSuccess(w, r, created, info.ContentType, info.NextOffset, info.Closed)
+}
+
+// hasRequestHeader distinguishes an omitted header from an explicitly empty
+// one. Header.Get cannot make that distinction.
+func hasRequestHeader(header http.Header, name string) bool {
+	for key := range header {
+		if strings.EqualFold(key, name) {
+			return true
+		}
+	}
+	return false
+}
+
+// singleRequestHeader returns one exact request-header field value. Repeating a
+// control header is ambiguous and therefore rejected instead of choosing an
+// arbitrary value.
+func singleRequestHeader(header http.Header, name string) (string, bool, error) {
+	var values []string
+	for key, current := range header {
+		if strings.EqualFold(key, name) {
+			values = append(values, current...)
+		}
+	}
+	if len(values) == 0 {
+		return "", false, nil
+	}
+	if len(values) != 1 {
+		return "", true, fmt.Errorf("duplicate %s header", name)
+	}
+	return values[0], true, nil
+}
+
+func writeCreateSuccess(w http.ResponseWriter, r *http.Request, created bool, contentType string, nextOffset Offset, closed bool) {
+	setSecurityHeaders(w)
+	if created {
+		scheme := "http"
+		if r.TLS != nil || r.Header.Get("X-Forwarded-Proto") == "https" {
+			scheme = "https"
+		}
+		path := r.RequestURI
+		if idx := strings.Index(path, "?"); idx != -1 {
+			path = path[:idx]
+		}
+		w.Header().Set("Location", scheme+"://"+r.Host+path)
+	}
+	w.Header().Set("Content-Type", contentType)
+	w.Header().Set(protocol.HeaderStreamNextOffset, nextOffset.String())
+	if closed {
+		w.Header().Set(protocol.HeaderStreamClosed, "true")
+	}
 	if created {
 		w.WriteHeader(http.StatusCreated)
 	} else {
@@ -486,6 +812,24 @@ func writeProducerRejection(w http.ResponseWriter, decision producerDecision, ta
 	}
 }
 
+func setStreamClosedHeaders(w http.ResponseWriter, tailOffset Offset) {
+	w.Header().Set(protocol.HeaderStreamClosed, "true")
+	w.Header().Set(protocol.HeaderStreamNextOffset, tailOffset.String())
+}
+
+func writeStreamClosedConflict(w http.ResponseWriter, tailOffset Offset) {
+	setStreamClosedHeaders(w, tailOffset)
+	writeError(w, newError(codeConflict, "stream is closed"))
+}
+
+func writeClosedProducerDuplicate(w http.ResponseWriter, epoch, seq int64, tailOffset Offset) {
+	setSecurityHeaders(w)
+	setStreamClosedHeaders(w, tailOffset)
+	w.Header().Set(protocol.HeaderProducerEpoch, strconv.FormatInt(epoch, 10))
+	w.Header().Set(protocol.HeaderProducerSeq, strconv.FormatInt(seq, 10))
+	w.WriteHeader(http.StatusNoContent)
+}
+
 // handleAppend implements POST (Append) - Section 5.2
 func (h *Handler) handleAppend(w http.ResponseWriter, r *http.Request, streamID string) {
 	// Validate request-local metadata and buffer the bounded body before taking
@@ -493,6 +837,7 @@ func (h *Handler) handleAppend(w http.ResponseWriter, r *http.Request, streamID 
 	// DELETE, PUT, or another POST for the stream. Once the body is ready, the
 	// metadata snapshot, producer decision, and append are serialized together.
 	contentType := r.Header.Get("Content-Type")
+	closeRequested := strings.EqualFold(r.Header.Get(protocol.HeaderStreamClosed), "true")
 
 	// Parse and validate producer headers (Section 5.2.1)
 	producerID, producerEpoch, producerSeq, hasProducer, producerErr := h.parseProducerHeaders(r)
@@ -523,7 +868,7 @@ func (h *Handler) handleAppend(w http.ResponseWriter, r *http.Request, streamID 
 	unlock := h.mutations.lock(streamID)
 	defer unlock()
 
-	// Get stream info to validate content type.
+	// Get stream info to validate content type and closure state.
 	info, err := h.storage.Head(r.Context(), streamID)
 	if err != nil {
 		writeStorageError(w, err)
@@ -538,17 +883,6 @@ func (h *Handler) handleAppend(w http.ResponseWriter, r *http.Request, streamID 
 		return
 	}
 
-	if contentType == "" {
-		writeError(w, newError(codeBadRequest, "Content-Type header required"))
-		return
-	}
-
-	// Per Section 5.2, Content-Type must match the existing stream. A valid but
-	// mismatched type receives 409 Conflict.
-	if !protocol.ContentTypesMatch(contentType, info.ContentType) {
-		writeError(w, newError(codeConflict, "content type mismatch"))
-		return
-	}
 	if producerErr != nil {
 		writeError(w, newError(codeBadRequest, producerErr.Error()))
 		return
@@ -561,20 +895,6 @@ func (h *Handler) handleAppend(w http.ResponseWriter, r *http.Request, streamID 
 		writeError(w, protoErr)
 		return
 	}
-	if len(body) == 0 {
-		writeError(w, newError(codeBadRequest, "empty body not allowed"))
-		return
-	}
-	if jsonErr != nil {
-		writeError(w, newError(codeBadRequest, jsonErr.Error()))
-		return
-	}
-
-	batchStorage, hasAtomicBatch := h.storage.(AtomicBatchStorage)
-	if len(messages) > 1 && !hasAtomicBatch {
-		writeError(w, newError(codeNotImplemented, "storage does not support atomic multi-message appends"))
-		return
-	}
 
 	// Per Section 5.2.1 "Concurrency Requirements", validation, append, and the state
 	// update MUST be serialized per (stream, producerId). The entry lock acquired here
@@ -583,24 +903,107 @@ func (h *Handler) handleAppend(w http.ResponseWriter, r *http.Request, streamID 
 	// seq=N has not yet committed, which reports a spurious sequence gap and wedges
 	// the producer for good.
 	var entry *producerEntry
-	if hasProducer {
+	acquireProducer := func() (*producerEntry, producerDecision, bool) {
 		entry = h.producers.acquire(producerKey{streamID: streamID, producerID: producerID})
 		if entry == nil {
 			writeError(w, newError(codeTooManyRequests, "producer state capacity reached"))
+			return nil, producerDecision{}, false
+		}
+		decision := entry.validate(producerEpoch, producerSeq)
+		return entry, decision, true
+	}
+
+	// Consult existing producer state before the closed-stream conflict so an
+	// exact retry of the tuple that performed the close remains an idempotent
+	// success. Never admit producer state after closure: every unknown or other
+	// tuple receives the closure conflict regardless of registry capacity.
+	if info.Closed {
+		if hasProducer {
+			entry = h.producers.acquireExisting(producerKey{streamID: streamID, producerID: producerID})
+			if entry != nil {
+				defer h.producers.release(entry)
+				decision := entry.validate(producerEpoch, producerSeq)
+				if decision.outcome == producerDuplicate && entry.closedBy(producerEpoch, producerSeq) {
+					current, headErr := h.storage.Head(r.Context(), streamID)
+					if headErr != nil {
+						writeStorageError(w, headErr)
+						return
+					}
+					writeClosedProducerDuplicate(w, producerEpoch, producerSeq, current.NextOffset)
+					return
+				}
+			}
+
+			// Closure takes precedence over every producer outcome except the
+			// exact tuple that performed the close. In particular, do not expose
+			// stale-epoch or sequence-gap reconciliation for a stream that can no
+			// longer accept another producer mutation.
+			writeStreamClosedConflict(w, info.NextOffset)
+			return
+		}
+
+		if !hasProducer && closeRequested && len(body) == 0 {
+			setSecurityHeaders(w)
+			setStreamClosedHeaders(w, info.NextOffset)
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		writeStreamClosedConflict(w, info.NextOffset)
+		return
+	}
+
+	// Close-only requests deliberately ignore Content-Type. Any request carrying
+	// data remains a normal append for validation purposes.
+	if len(body) > 0 {
+		if contentType == "" {
+			writeError(w, newError(codeBadRequest, "Content-Type header required"))
+			return
+		}
+		if !protocol.ContentTypesMatch(contentType, info.ContentType) {
+			writeError(w, newError(codeConflict, "content type mismatch"))
+			return
+		}
+		if jsonErr != nil {
+			writeError(w, newError(codeBadRequest, jsonErr.Error()))
+			return
+		}
+		if len(messages) == 0 {
+			writeError(w, newError(codeBadRequest, "append contains no messages"))
+			return
+		}
+	} else if !closeRequested {
+		writeError(w, newError(codeBadRequest, "empty body not allowed"))
+		return
+	}
+
+	batchStorage, hasAtomicBatch := h.storage.(AtomicBatchStorage)
+	closeStorage, hasAtomicClose := h.storage.(AtomicCloseStorage)
+	if closeRequested && !hasAtomicClose {
+		writeError(w, newError(codeNotImplemented, "storage does not support atomic stream closure"))
+		return
+	}
+	if !closeRequested && len(messages) > 1 && !hasAtomicBatch {
+		writeError(w, newError(codeNotImplemented, "storage does not support atomic multi-message appends"))
+		return
+	}
+
+	if hasProducer {
+		var decision producerDecision
+		var ok bool
+		entry, decision, ok = acquireProducer()
+		if !ok {
 			return
 		}
 		defer h.producers.release(entry)
-
-		decision := entry.validate(producerEpoch, producerSeq)
 		if decision.outcome != producerAccept {
 			tailOffset := info.NextOffset
 			if decision.outcome == producerDuplicate {
 				// The initial Head happened before waiting for this producer's
 				// in-flight append. Refresh it so an idempotent retry cannot report
 				// the pre-append tail.
-				current, err := h.storage.Head(r.Context(), streamID)
-				if err != nil {
-					writeStorageError(w, err)
+				current, headErr := h.storage.Head(r.Context(), streamID)
+				if headErr != nil {
+					writeStorageError(w, headErr)
 					return
 				}
 				tailOffset = current.NextOffset
@@ -611,31 +1014,53 @@ func (h *Handler) handleAppend(w http.ResponseWriter, r *http.Request, streamID 
 	}
 
 	var nextOffset Offset
-
-	if len(messages) > 1 {
+	if closeRequested {
+		nextOffset, err = closeStorage.CloseStream(r.Context(), streamID, messages, seq)
+	} else if len(messages) > 1 {
 		nextOffset, err = batchStorage.AppendBatch(r.Context(), streamID, messages, seq)
 	} else {
 		nextOffset, err = h.storage.Append(r.Context(), streamID, messages[0], seq)
 	}
 	if err != nil {
+		if errors.Is(err, ErrStreamClosed) {
+			current, headErr := h.storage.Head(r.Context(), streamID)
+			if headErr != nil {
+				writeStorageError(w, headErr)
+				return
+			}
+			writeStreamClosedConflict(w, current.NextOffset)
+			return
+		}
 		writeStorageError(w, err)
 		return
 	}
 
 	// Commit producer state after successful append
 	if hasProducer {
-		entry.commit(producerEpoch, producerSeq)
+		if closeRequested {
+			entry.commitClose(producerEpoch, producerSeq)
+		} else {
+			entry.commit(producerEpoch, producerSeq)
+		}
 	}
 
 	// Return success
 	setSecurityHeaders(w)
 	w.Header().Set(protocol.HeaderStreamNextOffset, nextOffset.String())
+	if closeRequested {
+		w.Header().Set(protocol.HeaderStreamClosed, "true")
+	}
 
 	if hasProducer {
-		// With producer headers: return 200 OK for new data
+		// A producer append returns 200. A close-only mutation has no new data,
+		// so it retains the close endpoint's 204 response while echoing the tuple.
 		w.Header().Set(protocol.HeaderProducerEpoch, strconv.FormatInt(producerEpoch, 10))
 		w.Header().Set(protocol.HeaderProducerSeq, strconv.FormatInt(producerSeq, 10))
-		w.WriteHeader(http.StatusOK)
+		if len(messages) == 0 {
+			w.WriteHeader(http.StatusNoContent)
+		} else {
+			w.WriteHeader(http.StatusOK)
+		}
 	} else {
 		// Without producer headers: return 204 No Content
 		w.WriteHeader(http.StatusNoContent)
@@ -828,6 +1253,9 @@ func (h *Handler) handleCatchupRead(w http.ResponseWriter, r *http.Request, stre
 		w.Header().Set(protocol.HeaderStreamNextOffset, info.NextOffset.String())
 		w.Header().Set(protocol.HeaderStreamCursor, protocol.GenerateCursor(clientCursor))
 		w.Header().Set(protocol.HeaderStreamUpToDate, "true")
+		if info.Closed {
+			w.Header().Set(protocol.HeaderStreamClosed, "true")
+		}
 		// Per spec: SHOULD return Cache-Control: no-store for offset=now
 		w.Header().Set("Cache-Control", "no-store")
 
@@ -855,7 +1283,7 @@ func (h *Handler) handleCatchupRead(w http.ResponseWriter, r *http.Request, stre
 	// replacement that happens to have the same offsets. Custom Storage
 	// implementations may omit identity; in that case no safe validator exists,
 	// so omit ETag and ignore If-None-Match rather than risk a false 304.
-	etag := makeETag(info.IncarnationID, offset, result.NextOffset)
+	etag := makeETag(info.IncarnationID, offset, result.NextOffset, result.Closed)
 
 	// Check If-None-Match for 304 Not Modified (Section 10.1)
 	// Per spec: "When a client provides a valid If-None-Match header that matches
@@ -866,6 +1294,12 @@ func (h *Handler) handleCatchupRead(w http.ResponseWriter, r *http.Request, stre
 			w.Header().Set("ETag", etag)
 			w.Header().Set(protocol.HeaderStreamCursor, protocol.GenerateCursor(clientCursor))
 			w.Header().Set("Cache-Control", cacheControlHeader(info.IsPrivate))
+			if result.NextOffset.Compare(result.TailOffset) >= 0 {
+				w.Header().Set(protocol.HeaderStreamUpToDate, "true")
+				if result.Closed {
+					w.Header().Set(protocol.HeaderStreamClosed, "true")
+				}
+			}
 			w.WriteHeader(http.StatusNotModified)
 			return
 		}
@@ -885,8 +1319,11 @@ func (h *Handler) handleCatchupRead(w http.ResponseWriter, r *http.Request, stre
 	}
 
 	// Set Stream-Up-To-Date if at tail (Section 5.6)
-	if result.NextOffset.Compare(result.TailOffset) == 0 {
+	if result.NextOffset.Compare(result.TailOffset) >= 0 {
 		w.Header().Set(protocol.HeaderStreamUpToDate, "true")
+		if result.Closed {
+			w.Header().Set(protocol.HeaderStreamClosed, "true")
+		}
 	}
 
 	// Format response based on content type
@@ -939,6 +1376,16 @@ func (h *Handler) handleLongPoll(w http.ResponseWriter, r *http.Request, streamI
 	isOffsetNow := offset == Offset(protocol.OffsetNow)
 	if isOffsetNow {
 		offset = info.NextOffset
+		if info.Closed {
+			releaseMutation()
+			setSecurityHeaders(w)
+			w.Header().Set(protocol.HeaderStreamNextOffset, info.NextOffset.String())
+			w.Header().Set(protocol.HeaderStreamCursor, protocol.GenerateCursor(clientCursor))
+			w.Header().Set(protocol.HeaderStreamUpToDate, "true")
+			w.Header().Set(protocol.HeaderStreamClosed, "true")
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
 	}
 
 	// Try immediate read first (skip for offset=now per spec)
@@ -954,7 +1401,8 @@ func (h *Handler) handleLongPoll(w http.ResponseWriter, r *http.Request, streamI
 		}
 		timeoutOffset = result.TailOffset
 
-		// If messages available, return immediately
+		// If messages are available, return immediately. Closure is exposed only
+		// on the page that reaches the final offset.
 		if len(result.Messages) > 0 {
 			releaseMutation()
 			setSecurityHeaders(w)
@@ -964,14 +1412,27 @@ func (h *Handler) handleLongPoll(w http.ResponseWriter, r *http.Request, streamI
 			w.Header().Set("Cache-Control", cacheControlHeader(info.IsPrivate))
 
 			// Set Stream-Up-To-Date if at tail (per spec Section 5.7)
-			if result.NextOffset.Compare(result.TailOffset) == 0 {
+			if result.NextOffset.Compare(result.TailOffset) >= 0 {
 				w.Header().Set(protocol.HeaderStreamUpToDate, "true")
+				if result.Closed {
+					w.Header().Set(protocol.HeaderStreamClosed, "true")
+				}
 			}
 
 			responseBody := formatResponseBody(result.Messages, info.ContentType)
 
 			w.WriteHeader(http.StatusOK)
 			_, _ = w.Write(responseBody)
+			return
+		}
+		if result.Closed {
+			releaseMutation()
+			setSecurityHeaders(w)
+			w.Header().Set(protocol.HeaderStreamNextOffset, result.NextOffset.String())
+			w.Header().Set(protocol.HeaderStreamCursor, protocol.GenerateCursor(clientCursor))
+			w.Header().Set(protocol.HeaderStreamUpToDate, "true")
+			w.Header().Set(protocol.HeaderStreamClosed, "true")
+			w.WriteHeader(http.StatusNoContent)
 			return
 		}
 	}
@@ -1028,6 +1489,7 @@ func (h *Handler) handleLongPoll(w http.ResponseWriter, r *http.Request, streamI
 			// the request context itself is canceled, no further storage operation is
 			// possible (and the client cannot receive the response), so retain the
 			// last known tail.
+			timeoutClosed := false
 			if r.Context().Err() == nil {
 				refreshUnlock := h.mutations.lock(streamID)
 				if epoch.invalidated() {
@@ -1046,6 +1508,7 @@ func (h *Handler) handleLongPoll(w http.ResponseWriter, r *http.Request, streamI
 					return
 				}
 				timeoutOffset = current.NextOffset
+				timeoutClosed = current.Closed
 			}
 			setSecurityHeaders(w)
 			// A timeout reports the current tail, never the request's -1/now
@@ -1053,6 +1516,9 @@ func (h *Handler) handleLongPoll(w http.ResponseWriter, r *http.Request, streamI
 			w.Header().Set(protocol.HeaderStreamNextOffset, timeoutOffset.String())
 			w.Header().Set(protocol.HeaderStreamCursor, protocol.GenerateCursor(clientCursor))
 			w.Header().Set(protocol.HeaderStreamUpToDate, "true")
+			if timeoutClosed {
+				w.Header().Set(protocol.HeaderStreamClosed, "true")
+			}
 			w.WriteHeader(http.StatusNoContent)
 			return
 		}
@@ -1076,12 +1542,18 @@ func (h *Handler) handleLongPoll(w http.ResponseWriter, r *http.Request, streamI
 	w.Header().Set("Cache-Control", cacheControlHeader(info.IsPrivate))
 
 	// Set Stream-Up-To-Date if at tail (per spec Section 5.7)
-	if result.NextOffset.Compare(result.TailOffset) == 0 {
+	if result.NextOffset.Compare(result.TailOffset) >= 0 {
 		w.Header().Set(protocol.HeaderStreamUpToDate, "true")
+		if result.Closed {
+			w.Header().Set(protocol.HeaderStreamClosed, "true")
+		}
 	}
 
 	responseBody := formatResponseBody(result.Messages, info.ContentType)
-
+	if len(result.Messages) == 0 && result.Closed {
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write(responseBody)
 }
@@ -1191,8 +1663,15 @@ func (h *Handler) handleSSE(w http.ResponseWriter, r *http.Request, streamID str
 
 	// For offset=now, send initial control event with upToDate: true (per spec Section 8)
 	if isOffsetNow {
-		writeSSEControlEvent(w, currentOffset.String(), true, protocol.GenerateCursor(clientCursor))
+		cursor := protocol.GenerateCursor(clientCursor)
+		if info.Closed {
+			cursor = ""
+		}
+		writeSSEControlEvent(w, currentOffset.String(), true, info.Closed, cursor)
 		flusher.Flush()
+		if info.Closed {
+			return
+		}
 	}
 
 	// Track whether we've sent the initial control event for non-offset=now cases.
@@ -1239,14 +1718,20 @@ func (h *Handler) handleSSE(w http.ResponseWriter, r *http.Request, streamID str
 		if !incarnationMatches(info.IncarnationID, result.IncarnationID) {
 			return
 		}
+		atTail := result.NextOffset.Compare(result.TailOffset) >= 0
+		if len(result.Messages) == 0 && result.Closed && atTail {
+			writeSSEControlEvent(w, result.NextOffset.String(), true, true, "")
+			flusher.Flush()
+			return
+		}
 
 		// If no messages, wait for data or send keepalive
 		if len(result.Messages) == 0 {
 			// Send initial control if not yet sent (empty stream or starting at tail)
 			if !sentInitialControl {
-				if currentOffset.Compare(result.TailOffset) == 0 || result.NextOffset.Compare(result.TailOffset) == 0 {
+				if currentOffset.Compare(result.TailOffset) >= 0 || result.NextOffset.Compare(result.TailOffset) >= 0 {
 					sentInitialControl = true
-					writeSSEControlEvent(w, result.NextOffset.String(), true, protocol.GenerateCursor(clientCursor))
+					writeSSEControlEvent(w, result.NextOffset.String(), true, false, protocol.GenerateCursor(clientCursor))
 					flusher.Flush()
 				}
 			}
@@ -1304,6 +1789,12 @@ func (h *Handler) handleSSE(w http.ResponseWriter, r *http.Request, streamID str
 			// Reuse waitResult directly instead of re-reading
 			result = waitResult
 		}
+		atTail = result.NextOffset.Compare(result.TailOffset) >= 0
+		if len(result.Messages) == 0 && result.Closed && atTail {
+			writeSSEControlEvent(w, result.NextOffset.String(), true, true, "")
+			flusher.Flush()
+			return
+		}
 
 		// If we have messages, send them
 		if len(result.Messages) > 0 {
@@ -1341,11 +1832,19 @@ func (h *Handler) handleSSE(w http.ResponseWriter, r *http.Request, streamID str
 
 			// Send control event with cursor (Section 5.8: streamCursor is required
 			// while the stream is open).
-			upToDate := result.NextOffset.Compare(result.TailOffset) == 0
-			writeSSEControlEvent(w, result.NextOffset.String(), upToDate, protocol.GenerateCursor(clientCursor))
+			upToDate := result.NextOffset.Compare(result.TailOffset) >= 0
+			closedAtTail := result.Closed && upToDate
+			cursor := protocol.GenerateCursor(clientCursor)
+			if closedAtTail {
+				cursor = ""
+			}
+			writeSSEControlEvent(w, result.NextOffset.String(), upToDate, closedAtTail, cursor)
 
 			flusher.Flush()
 			currentOffset = result.NextOffset
+			if closedAtTail {
+				return
+			}
 		}
 	}
 }
@@ -1363,6 +1862,9 @@ func (h *Handler) handleHead(w http.ResponseWriter, r *http.Request, streamID st
 	setSecurityHeaders(w)
 	w.Header().Set("Content-Type", info.ContentType)                          // Per spec: stream's content type
 	w.Header().Set(protocol.HeaderStreamNextOffset, info.NextOffset.String()) // Per spec: current tail offset
+	if info.Closed {
+		w.Header().Set(protocol.HeaderStreamClosed, "true")
+	}
 
 	// Set TTL/Expires-At if present (Section 5.5)
 	if info.TTL > 0 {
@@ -1491,6 +1993,7 @@ func splitBySSELineTerminators(s string) []string {
 type sseControlEvent struct {
 	StreamNextOffset string `json:"streamNextOffset"`
 	UpToDate         bool   `json:"upToDate,omitempty"`
+	StreamClosed     bool   `json:"streamClosed,omitempty"`
 	// StreamCursor is required while the stream is open and may only be omitted
 	// once the stream is closed, so it is empty only in that case.
 	StreamCursor string `json:"streamCursor,omitempty"`
@@ -1498,10 +2001,11 @@ type sseControlEvent struct {
 
 // writeSSEControlEvent writes a complete SSE control event, including the
 // blank line that terminates it. Callers flush afterwards.
-func writeSSEControlEvent(w io.Writer, nextOffset string, upToDate bool, cursor string) {
+func writeSSEControlEvent(w io.Writer, nextOffset string, upToDate, closed bool, cursor string) {
 	payload, err := json.Marshal(sseControlEvent{
 		StreamNextOffset: nextOffset,
 		UpToDate:         upToDate,
+		StreamClosed:     closed,
 		StreamCursor:     cursor,
 	})
 	if err != nil {
@@ -1586,8 +2090,12 @@ func writeStorageError(w http.ResponseWriter, err error) {
 	switch {
 	case errors.Is(err, ErrNotFound):
 		writeError(w, newError(codeNotFound, err.Error()))
+	case errors.Is(err, ErrSoftDeleted):
+		writeError(w, newError(codeGone, err.Error()))
 	case errors.Is(err, ErrGone):
 		writeError(w, newError(codeGone, err.Error()))
+	case errors.Is(err, ErrStreamClosed):
+		writeError(w, newError(codeConflict, err.Error()))
 	case errors.Is(err, ErrConflict):
 		writeError(w, newError(codeConflict, err.Error()))
 	case errors.Is(err, ErrBadRequest):
@@ -1652,11 +2160,13 @@ func incarnationMatches(infoID, resultID string) bool {
 	return infoID == resultID
 }
 
-// makeETag returns an opaque, header-safe validator for one immutable range of
-// one stream incarnation. Length prefixes avoid ambiguity even though
-// incarnation IDs are arbitrary bytes. An empty incarnation ID cannot safely
-// distinguish delete/recreate cycles, so it produces no validator.
-func makeETag(incarnationID string, start, end Offset) string {
+// makeETag returns an opaque, header-safe validator for one range and closure
+// snapshot of one stream incarnation. Including closure prevents a cached open
+// tail response from hiding a later EOF transition. Length prefixes avoid
+// ambiguity even though incarnation IDs are arbitrary bytes. An empty
+// incarnation ID cannot safely distinguish delete/recreate cycles, so it
+// produces no validator.
+func makeETag(incarnationID string, start, end Offset, closed bool) string {
 	if incarnationID == "" {
 		return ""
 	}
@@ -1671,8 +2181,66 @@ func makeETag(incarnationID string, start, end Offset) string {
 	writePart(incarnationID)
 	writePart(start.String())
 	writePart(end.String())
+	writePart(strconv.FormatBool(closed))
 
 	return fmt.Sprintf(`"%x"`, digest.Sum(nil))
+}
+
+// defaultForkPathExtractor converts the same-server URL path carried by
+// Stream-Forked-From into the Storage ID used for the current request. Middleware
+// such as http.StripPrefix changes URL.Path but preserves RequestURI, so the
+// externally visible root can be recovered by removing the already-extracted
+// target ID from the original path.
+func defaultForkPathExtractor(r *http.Request, targetID, sourcePath string) (string, error) {
+	sourcePath, err := validatedForkSourcePath(sourcePath)
+	if err != nil {
+		return "", err
+	}
+
+	externalTargetPath := r.URL.Path
+	if r.RequestURI != "" {
+		requestTarget, parseErr := url.ParseRequestURI(r.RequestURI)
+		if parseErr != nil {
+			return "", errors.New("request target is not a valid path")
+		}
+		externalTargetPath = requestTarget.Path
+	}
+	if targetID == "" || !strings.HasSuffix(externalTargetPath, targetID) {
+		return "", errors.New("cannot infer stream root; configure HandlerConfig.ForkPathExtractor")
+	}
+
+	root := strings.TrimSuffix(externalTargetPath, targetID)
+	// A suffix match in the middle of a path segment is ambiguous (for example,
+	// targetID "item" against external path "/myitem"). A custom extractor can
+	// define such mappings explicitly.
+	if root != "" && !strings.HasSuffix(root, "/") && !strings.HasPrefix(targetID, "/") {
+		return "", errors.New("cannot infer stream root; configure HandlerConfig.ForkPathExtractor")
+	}
+	if !strings.HasPrefix(sourcePath, root) ||
+		(root != "" && !strings.HasSuffix(root, "/") && len(sourcePath) > len(root) && sourcePath[len(root)] != '/') {
+		return "", errors.New("Stream-Forked-From is outside this handler's stream root")
+	}
+
+	sourceID := strings.TrimPrefix(sourcePath, root)
+	if sourceID == "" {
+		return "", errors.New("Stream-Forked-From does not identify a stream")
+	}
+	return sourceID, nil
+}
+
+func validatedForkSourcePath(sourcePath string) (string, error) {
+	parsed, err := url.ParseRequestURI(sourcePath)
+	if err != nil || parsed.Scheme != "" || parsed.Host != "" || parsed.Opaque != "" ||
+		parsed.RawQuery != "" || parsed.Fragment != "" || !strings.HasPrefix(parsed.Path, "/") ||
+		strings.HasPrefix(parsed.Path, "//") {
+		return "", errors.New("Stream-Forked-From must be an absolute path on this server")
+	}
+	for _, segment := range strings.Split(parsed.Path, "/") {
+		if segment == "." || segment == ".." {
+			return "", errors.New("Stream-Forked-From must not contain dot segments")
+		}
+	}
+	return parsed.Path, nil
 }
 
 // reservedPathSegment is the path prefix reserved for Durable Streams control APIs

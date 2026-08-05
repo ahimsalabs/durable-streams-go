@@ -11,9 +11,17 @@ var (
 	// ErrNotFound indicates the requested stream does not exist.
 	ErrNotFound = errors.New("stream not found")
 
-	// ErrGone indicates the requested offset is before the earliest
-	// retained position due to retention/compaction.
+	// ErrGone indicates an HTTP 410 response. Storage implementations reserve
+	// it for an offset before the earliest retained position, but the wire
+	// protocol also uses 410 for a soft-deleted stream, which Client cannot
+	// distinguish from retention without an additional protocol error code.
 	ErrGone = errors.New("offset before earliest retained position")
+
+	// ErrSoftDeleted is the storage-level error for a stream deleted by its owner
+	// but retained internally because forks still reference its data. Handler
+	// maps it to HTTP 410; Client consequently reports [ErrGone]. Direct storage
+	// operations fail with ErrSoftDeleted until the last fork releases the data.
+	ErrSoftDeleted = errors.New("stream is soft-deleted")
 
 	// ErrConflict indicates a conflict occurred:
 	// - Stream exists with different configuration (on create)
@@ -26,8 +34,15 @@ var (
 	// the last accepted value. Generic HTTP 409 responses use [ErrConflict].
 	ErrSequenceConflict = errors.New("sequence conflict")
 
-	// ErrClosed indicates the stream or connection has been closed.
+	// ErrClosed indicates a client, reader, connection, or Storage has been
+	// shut down. It is distinct from ErrStreamClosed, which is the durable EOF
+	// state of one protocol stream.
 	ErrClosed = errors.New("stream closed")
+
+	// ErrStreamClosed indicates an append was rejected because the durable
+	// stream has reached its permanent EOF. Reads and metadata operations still
+	// succeed for a closed stream; they expose the closed state in their result.
+	ErrStreamClosed = errors.New("durable stream is closed")
 
 	// ErrBadRequest indicates a malformed or invalid request.
 	ErrBadRequest = errors.New("bad request")
@@ -39,6 +54,35 @@ var (
 	// such as invalid JSON, SSE framing, or required response metadata.
 	ErrParseError = errors.New("parse error: malformed protocol response")
 )
+
+// StreamClosedError reports an append rejected because another mutation has
+// permanently closed the stream. It unwraps to [ErrStreamClosed], so callers
+// can use errors.Is for the general condition and errors.As when they need the
+// server's final stream position.
+type StreamClosedError struct {
+	// Path is the stream path supplied to Client or StreamWriter.
+	Path string
+
+	// FinalOffset is the permanent tail reported by Stream-Next-Offset.
+	FinalOffset Offset
+
+	// Message is the server's diagnostic text, when provided.
+	Message string
+}
+
+func (e *StreamClosedError) Error() string {
+	message := e.Message
+	if message == "" {
+		message = ErrStreamClosed.Error()
+	}
+	if e.Path != "" {
+		return fmt.Sprintf("[%s] %s", e.Path, message)
+	}
+	return message
+}
+
+// Unwrap makes StreamClosedError match [ErrStreamClosed].
+func (e *StreamClosedError) Unwrap() error { return ErrStreamClosed }
 
 // errorCode represents an internal error code for HTTP status mapping.
 // This is not exported - use sentinel errors for error checking.

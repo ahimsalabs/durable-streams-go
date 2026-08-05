@@ -22,6 +22,18 @@ const (
 	// HeaderStreamUpToDate indicates the response includes all data available in the stream.
 	HeaderStreamUpToDate = "Stream-Up-To-Date"
 
+	// HeaderStreamClosed requests closure or indicates that a stream has reached permanent EOF.
+	HeaderStreamClosed = "Stream-Closed"
+
+	// HeaderStreamForkedFrom names the source stream when creating a fork.
+	HeaderStreamForkedFrom = "Stream-Forked-From"
+
+	// HeaderStreamForkOffset identifies the source position where a fork diverges.
+	HeaderStreamForkOffset = "Stream-Fork-Offset"
+
+	// HeaderStreamForkSubOffset refines a fork boundary within the next data batch.
+	HeaderStreamForkSubOffset = "Stream-Fork-Sub-Offset"
+
 	// HeaderStreamSSEDataEncoding declares the encoding applied to SSE data events.
 	// Per Section 5.8, servers set this to "base64" for streams whose content type is
 	// neither text/* nor application/json.

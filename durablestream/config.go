@@ -24,6 +24,9 @@ func (c StreamConfig) Matches(other StreamConfig) bool {
 	if c.IsPrivate != other.IsPrivate {
 		return false
 	}
+	if c.Closed != other.Closed {
+		return false
+	}
 	return true
 }
 

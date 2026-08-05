@@ -33,6 +33,7 @@ type producerState struct {
 	epoch   int64 // Current epoch for this producer
 	lastSeq int64 // Highest accepted sequence number in current epoch
 	known   bool  // False until the first append for this producer commits
+	closed  bool  // The highest accepted tuple atomically closed the stream
 }
 
 // producerKey uniquely identifies a producer on a stream.
@@ -115,6 +116,22 @@ func (e *producerEntry) commit(epoch, seq int64) {
 	case epoch == e.state.epoch && seq > e.state.lastSeq:
 		e.state.lastSeq = seq
 	}
+}
+
+// commitClose records a successful append-and-close or close-only mutation.
+// Closure is tied to the exact producer tuple so only a retry of that tuple can
+// be reported as an idempotent success after the stream is closed.
+func (e *producerEntry) commitClose(epoch, seq int64) {
+	e.commit(epoch, seq)
+	if e.state.known && e.state.epoch == epoch && e.state.lastSeq == seq {
+		e.state.closed = true
+	}
+}
+
+// closedBy reports whether this exact tuple performed the closing mutation.
+// Callers hold e.mu from acquire through release.
+func (e *producerEntry) closedBy(epoch, seq int64) bool {
+	return e.state.known && e.state.closed && e.state.epoch == epoch && e.state.lastSeq == seq
 }
 
 // producerOutcome enumerates the results of producer validation.
@@ -228,6 +245,32 @@ func (r *producerRegistry) acquire(key producerKey) *producerEntry {
 	entry.lastAccess = now
 	r.mu.Unlock()
 
+	entry.mu.Lock()
+	return entry
+}
+
+// acquireExisting returns a committed, non-expired entry with its mutex held.
+// Unlike acquire, it never admits a new producer. This is used after durable
+// stream closure, when only the exact tuple that performed the close can be an
+// idempotent success and every unknown producer must receive the closure
+// conflict regardless of registry capacity.
+func (r *producerRegistry) acquireExisting(key producerKey) *producerEntry {
+	r.mu.Lock()
+	now := r.now()
+	entry, ok := r.entries[key]
+	if ok && entry.pins == 0 && r.expired(entry, now) {
+		delete(r.entries, key)
+		entry, ok = nil, false
+	}
+	if ok {
+		entry.pins++
+		entry.lastAccess = now
+	}
+	r.mu.Unlock()
+
+	if !ok {
+		return nil
+	}
 	entry.mu.Lock()
 	return entry
 }

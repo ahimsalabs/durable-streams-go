@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"iter"
 	"net/http"
 	"strings"
@@ -34,17 +35,19 @@ type Reader struct {
 	contentType string // cached content type for JSON validation
 	catching    bool   // true while in catch-up phase
 
-	// mu guards closed, the active Read cancellation, and the SSE connection
+	// mu guards closed, eof, the active Read cancellation, and the SSE connection
 	// state so Close can abort a blocked Read in every mode.
 	// The remaining fields belong to the single reading goroutine.
 	mu         sync.Mutex
 	closed     bool
+	eof        bool
 	activeRead *readerRead
 	sseStream  transport.EventStream
 	sseCancel  *readerCancel
 
 	// SSE connection state (Section 5.8)
 	sseUpToDate bool // cached upToDate from last control event
+	sseClosed   bool // cached streamClosed from last control event
 }
 
 // readerRead tracks the cancellation for one in-flight Read call. Reader is
@@ -72,6 +75,11 @@ func (r *Reader) beginRead(ctx context.Context) (context.Context, func() bool, e
 		cancel(ErrClosed)
 		return nil, nil, ErrClosed
 	}
+	if r.eof {
+		r.mu.Unlock()
+		cancel(io.EOF)
+		return nil, nil, io.EOF
+	}
 	r.activeRead = call
 	r.mu.Unlock()
 
@@ -92,7 +100,7 @@ func (r *Reader) beginRead(ctx context.Context) (context.Context, func() bool, e
 // concurrently it closes stream instead and returns false.
 func (r *Reader) setStream(stream transport.EventStream) bool {
 	r.mu.Lock()
-	if r.closed {
+	if r.closed || r.eof {
 		r.mu.Unlock()
 		stream.Close()
 		return false
@@ -100,6 +108,34 @@ func (r *Reader) setStream(stream transport.EventStream) bool {
 	r.sseStream = stream
 	r.mu.Unlock()
 	return true
+}
+
+// markEOF records the durable protocol EOF and releases any SSE connection.
+// The Read that discovers EOF still returns its StreamData; later Reads return
+// io.EOF without issuing another network request.
+func (r *Reader) markEOF() {
+	r.mu.Lock()
+	r.eof = true
+	stream := r.sseStream
+	cancel := r.sseCancel
+	r.sseStream = nil
+	r.sseCancel = nil
+	r.mu.Unlock()
+
+	if cancel != nil {
+		cancel.cancel()
+	}
+	if stream != nil {
+		_ = stream.Close()
+	}
+}
+
+// durableEOF distinguishes the protocol's permanent stream closure from an
+// io.EOF returned when an open SSE connection is rotated or disconnected.
+func (r *Reader) durableEOF() bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.eof
 }
 
 // clearStream closes the active SSE connection, if any.
@@ -120,7 +156,10 @@ func (r *Reader) clearStream() {
 }
 
 // Read performs a single read operation based on the current state.
-// Returns the read result or an error.
+//
+// The read that discovers permanent stream closure returns a result with
+// StreamData.Closed set, including any final data. Later calls return io.EOF
+// without another request. Seek clears that EOF state and permits replay.
 //
 // During catch-up phase, uses basic GET requests (Section 5.6).
 // After UpToDate, switches to live mode based on ReadMode:
@@ -183,7 +222,7 @@ func (r *Reader) readCatchUp(ctx context.Context) (*StreamData, error) {
 	// Validate JSON response BEFORE updating state.
 	// If validation fails, we don't advance the offset, allowing the caller
 	// to retry from the same position after the fault is cleared.
-	if isJSONContentType(r.contentType) {
+	if (len(resp.Data) > 0 || !resp.Closed) && isJSONContentType(r.contentType) {
 		if err := validateJSONArray(resp.Data); err != nil {
 			return nil, fmt.Errorf("%w: %v", ErrParseError, err)
 		}
@@ -196,15 +235,19 @@ func (r *Reader) readCatchUp(ctx context.Context) (*StreamData, error) {
 	}
 
 	// Check if we should transition to live mode
-	if resp.UpToDate {
+	if resp.UpToDate || resp.Closed {
 		r.catching = false
+	}
+	if resp.Closed {
+		r.markEOF()
 	}
 
 	return &StreamData{
 		Data:       resp.Data,
 		NextOffset: Offset(resp.NextOffset),
 		Cursor:     resp.Cursor,
-		UpToDate:   resp.UpToDate,
+		UpToDate:   resp.UpToDate || resp.Closed,
+		Closed:     resp.Closed,
 	}, nil
 }
 
@@ -242,12 +285,16 @@ func (r *Reader) readLongPoll(ctx context.Context) (*StreamData, error) {
 	if resp.Cursor != "" {
 		r.cursor = resp.Cursor
 	}
+	if resp.Closed {
+		r.markEOF()
+	}
 
 	return &StreamData{
 		Data:       resp.Data,
 		NextOffset: Offset(resp.NextOffset),
 		Cursor:     r.cursor,
-		UpToDate:   resp.UpToDate,
+		UpToDate:   resp.UpToDate || resp.Closed,
+		Closed:     resp.Closed,
 	}, nil
 }
 
@@ -279,8 +326,14 @@ func (r *Reader) readSSE(ctx context.Context) (*StreamData, error) {
 
 		switch event.Type {
 		case "control":
-			// Control events don't contain data; apply them and read on.
+			// A final control event is the SSE EOF signal. Return it once so
+			// callers can observe closure; later Read calls return io.EOF.
 			r.applyControlEvent(event)
+			if event.Closed {
+				result := r.sseData(nil)
+				r.markEOF()
+				return result, nil
+			}
 			continue
 
 		case "data":
@@ -323,7 +376,11 @@ func (r *Reader) readSSE(ctx context.Context) (*StreamData, error) {
 				return nil, fmt.Errorf("%w: unknown SSE event type %q", ErrParseError, nextEvent.Type)
 			}
 
-			return r.sseData(event), nil
+			result := r.sseData(event)
+			if nextEvent.Closed {
+				r.markEOF()
+			}
+			return result, nil
 
 		default:
 			r.clearStream()
@@ -410,16 +467,22 @@ func (r *Reader) applyControlEvent(event *transport.Event) {
 	if event.Cursor != "" {
 		r.cursor = event.Cursor
 	}
-	r.sseUpToDate = event.UpToDate
+	r.sseUpToDate = event.UpToDate || event.Closed
+	r.sseClosed = event.Closed
 }
 
 // sseData builds the result for a data event at the reader's current position.
 func (r *Reader) sseData(event *transport.Event) *StreamData {
+	var data []byte
+	if event != nil {
+		data = event.Data
+	}
 	return &StreamData{
-		Data:       event.Data,
+		Data:       data,
 		NextOffset: r.offset,
 		Cursor:     r.cursor,
 		UpToDate:   r.sseUpToDate,
+		Closed:     r.sseClosed,
 	}
 }
 
@@ -446,6 +509,11 @@ func (r *Reader) Seek(offset Offset) *Reader {
 	r.offset = offset
 	r.cursor = ""     // Clear cursor when seeking
 	r.catching = true // Reset to catch-up mode
+	r.mu.Lock()
+	r.eof = false
+	r.mu.Unlock()
+	r.sseUpToDate = false
+	r.sseClosed = false
 	return r
 }
 
@@ -512,6 +580,9 @@ func (r *Reader) Close() error {
 //
 // # Error behavior
 //
+// Permanent stream closure ends iteration cleanly after any final messages; it
+// is not yielded as an error.
+//
 // Errors are yielded to the caller, which decides whether to keep iterating.
 // If the caller continues, the iterator distinguishes two cases:
 //
@@ -537,18 +608,27 @@ func (r *Reader) Messages(ctx context.Context) iter.Seq2[Message, error] {
 
 			result, err := r.Read(ctx)
 			if err != nil {
-				if !yield(Message{}, err) {
+				// Only a protocol EOF is normal iterator completion. Open SSE
+				// connections also end with io.EOF when a server rotates them;
+				// reconnect those without surfacing a spurious stream closure.
+				transientSSEEOF := errors.Is(err, io.EOF) && !r.durableEOF()
+				if errors.Is(err, io.EOF) && !transientSSEEOF {
 					return
 				}
-				// If Read returned because the iterator's own context was
-				// cancelled, the cancellation was just yielded above. Stop now
-				// rather than entering backoff and yielding ctx.Err() a second
-				// time.
-				if ctx.Err() != nil {
-					return
-				}
-				if isTerminalReadError(err) {
-					return
+				if !transientSSEEOF {
+					if !yield(Message{}, err) {
+						return
+					}
+					// If Read returned because the iterator's own context was
+					// cancelled, the cancellation was just yielded above. Stop now
+					// rather than entering backoff and yielding ctx.Err() a second
+					// time.
+					if ctx.Err() != nil {
+						return
+					}
+					if isTerminalReadError(err) {
+						return
+					}
 				}
 				// Transient failure: back off before retrying so a persistently
 				// broken server is not hammered.
@@ -572,6 +652,9 @@ func (r *Reader) Messages(ctx context.Context) iter.Seq2[Message, error] {
 				if len(result.Data) > 0 && !yield(Message{data: result.Data}, nil) {
 					return
 				}
+				if result.Closed {
+					return
+				}
 				continue
 			}
 
@@ -590,6 +673,9 @@ func (r *Reader) Messages(ctx context.Context) iter.Seq2[Message, error] {
 						return
 					}
 				}
+			}
+			if result.Closed {
+				return
 			}
 		}
 	}

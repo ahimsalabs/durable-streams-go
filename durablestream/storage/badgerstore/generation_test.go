@@ -215,6 +215,9 @@ func TestReaperResumesPurgeAfterRestart(t *testing.T) {
 	if n := countKeys(t, s2, messagePrefix("stream", gen)); n != 0 {
 		t.Errorf("messages remaining after restart sweep: %d", n)
 	}
+	if n := countKeys(t, s2, batchPrefix("stream", gen)); n != 0 {
+		t.Errorf("batch boundaries remaining after restart sweep: %d", n)
+	}
 	if n := countKeys(t, s2, []byte(prefixTombstone)); n != 0 {
 		t.Errorf("tombstones remaining after restart sweep: %d", n)
 	}
@@ -259,7 +262,8 @@ func TestExpiredStreamReplacementDropsOldGeneration(t *testing.T) {
 			ContentType: "text/plain",
 			ExpiresAt:   time.Now().Add(-time.Hour),
 		},
-		Gen: oldGen,
+		FormatVersion: currentRecordFormatVersion,
+		Gen:           oldGen,
 	}
 	if err := s.db.Update(func(txn *badger.Txn) error {
 		encoded, err := json.Marshal(expired)

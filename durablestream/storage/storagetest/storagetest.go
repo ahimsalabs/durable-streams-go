@@ -73,6 +73,16 @@ type Config struct {
 	// rather than skip when New returns a Storage without that capability. Set
 	// it for implementations that advertise atomic create/append batches.
 	RequireAtomicBatches bool
+
+	// RequireAtomicClose makes the optional AtomicCloseStorage tests fail
+	// rather than skip when New returns a Storage without that capability. Set
+	// it for implementations that support durable protocol stream closure.
+	RequireAtomicClose bool
+
+	// RequireForks makes the optional ForkStorage tests fail rather than skip
+	// when New returns a Storage without that capability. Set it for
+	// implementations that support fork topology and soft deletion.
+	RequireForks bool
 }
 
 // Run executes the conformance suite against the implementation described by
@@ -164,10 +174,26 @@ var suites = []suite{
 	{"atomic append batches do not interleave", testAtomicAppendDoesNotInterleave},
 	{"atomic batches stay generation-safe during delete and recreate", testAtomicBatchRacesLifecycle},
 
+	// Optional atomic stream-closure capability.
+	{"a stream can be created at permanent EOF", testClosedCreate},
+	{"atomic close publishes the final batch and EOF together", testAtomicCloseFinalBatch},
+	{"close releases current and future waiters", testCloseWakesWaiters},
+	{"close serializes with a concurrent append", testCloseSerializesWithAppend},
+
+	// Optional fork and topology capability.
+	{"forks inherit an immutable prefix and keep an independent suffix", testForkPrefixAndIsolation},
+	{"fork creation is idempotent and reference-safe", testForkIdempotency},
+	{"fork sub-offsets honor binary and JSON batch boundaries", testForkSubOffsets},
+	{"fork waits observe inherited data but only target appends", testForkWaitIsolation},
+	{"fork chains survive soft deletion and reclaim ancestors", testForkSoftDeleteCascade},
+	{"fork lifetime inheritance is independent and topology-safe", testForkLifetimeInheritance},
+	{"fork closure and source-incarnation state are target-local", testForkTargetState},
+
 	// Durability (skipped unless Config.Reopen is set).
 	{"appended data survives a reopen", testDurabilityAcrossReopen},
 	{"deleted streams stay deleted across a reopen", testDeleteSurvivesReopen},
 	{"atomic batches and their next offset survive a reopen", testAtomicBatchSurvivesReopen},
+	{"stream closure survives a reopen", testClosureSurvivesReopen},
 }
 
 // waitTimeout bounds how long a subtest waits for an operation that a correct

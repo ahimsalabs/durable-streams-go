@@ -11,6 +11,7 @@ type StreamConfig struct {
 	TTL         time.Duration // Zero means no TTL
 	ExpiresAt   time.Time     // Zero means no expiry; Create derives now+TTL when TTL is positive
 	IsPrivate   bool          // If true, use Cache-Control: private (Section 10.1)
+	Closed      bool          // If true, the stream is created at permanent EOF
 }
 
 // StreamInfo contains metadata about a stream.
@@ -20,6 +21,7 @@ type StreamInfo struct {
 	TTL         time.Duration // Zero means no TTL
 	ExpiresAt   time.Time     // Zero means no expiry
 	IsPrivate   bool          // If true, use Cache-Control: private (Section 10.1)
+	Closed      bool          // True after the stream has reached permanent EOF
 
 	// IncarnationID is an opaque storage-internal token for this exact
 	// incarnation of the stream. A non-empty value is immutable for the
@@ -63,6 +65,11 @@ type ReadResult struct {
 	// opaque/optional semantics as [StreamInfo.IncarnationID]. When non-empty it
 	// matches the value Head reports for that incarnation.
 	IncarnationID string
+
+	// Closed reports whether this stream incarnation has reached permanent EOF.
+	// It describes the same atomic snapshot as Messages and TailOffset. A closed
+	// stream remains readable, but no later message can appear after TailOffset.
+	Closed bool
 }
 
 // Storage defines the interface for stream persistence.
@@ -82,8 +89,10 @@ type ReadResult struct {
 // contain gaps: a failed Append can consume an offset that no message ever
 // occupies, and readers must tolerate that. The empty offset and the string
 // "-1" are the two "start of stream" sentinels accepted on input; they are
-// never returned. An offset from one stream is meaningless in another,
-// including in a stream recreated with the same ID after Delete.
+// never returned. An offset from one independent stream is meaningless in
+// another, including in a stream recreated with the same ID after Delete. The
+// intentional exception is a ForkStorage lineage: a fork preserves its
+// source's offset space through the divergence boundary.
 //
 // Ownership of byte slices: input slices ([]byte passed to Append) are only
 // borrowed for the duration of the call, so implementations MUST copy any data
@@ -91,16 +100,21 @@ type ReadResult struct {
 // implementations MUST NOT return memory that aliases their stored state.
 //
 // Context handling: Read and WaitForData MUST honor cancellation and return
-// ctx.Err() promptly. Create, Append and Delete are durable mutations and MAY
-// complete despite a cancelled context rather than report a committed write as
-// failed; whether they check ctx is implementation-defined, but they MUST NOT
-// block indefinitely after cancellation. Callers therefore cannot conclude from
-// a ctx.Err() return that a mutation did not take effect.
+// ctx.Err() promptly. Create, Append, Delete, and CloseStream are durable
+// mutations and MAY complete despite a cancelled context rather than report a
+// committed write as failed; whether they check ctx is implementation-defined,
+// but they MUST NOT block indefinitely after cancellation. Callers therefore
+// cannot conclude from a ctx.Err() return that a mutation did not take effect.
 //
 // Sentinel errors: implementations return errors that satisfy errors.Is against
 // the sentinels documented per method. They MAY wrap them with context.
 // [ErrGone] is reserved for offsets dropped by retention or compaction; reading
 // past the tail is not an error (see Read).
+// [ErrStreamClosed] is the persistent EOF state of one stream and is distinct
+// from [ErrClosed], which reports that the Storage itself has been shut down.
+// [ErrSoftDeleted] is returned only by implementations that offer ForkStorage;
+// it identifies a deleted, or optionally expired, path whose data is
+// temporarily retained for descendants.
 //
 // Stream IDs: implementations MAY reject stream IDs they cannot represent with
 // [ErrBadRequest] (badgerstore rejects the empty string and IDs containing
@@ -113,20 +127,26 @@ type ReadResult struct {
 // Empty preserves compatibility with Storage implementations that cannot expose
 // an incarnation token.
 //
-// Expiry: a stream whose StreamConfig has elapsed its ExpiresAt behaves as if
-// it does not exist — Append, Read, Head and WaitForData report [ErrNotFound] —
-// and it may be replaced by Create.
+// Expiry: an unreferenced stream whose StreamConfig has elapsed its ExpiresAt
+// behaves as if it does not exist — Append, Read, Head and WaitForData report
+// [ErrNotFound] — and it may be replaced by Create. ForkStorage implementations
+// must preserve an expired node's data while descendants still reference it,
+// but may choose either lifecycle policy for its public path: retire the path
+// immediately (ErrNotFound, and Create may reuse it), or retain the path like a
+// soft deletion (direct operations report ErrSoftDeleted, and Create reports
+// ErrConflict). The latter state ends when the final descendant reference is
+// released. Callers must accept either policy for a referenced expired node.
 //
 // Sliding TTL: a stream created with a positive StreamConfig.TTL expires after
 // being idle for that long. When ExpiresAt is zero, Create initializes the first
 // deadline to its current time plus TTL. Every protocol read or write restarts
-// the countdown (Section 5.1). Storage does not decide what counts as activity: Read, Append
-// and WaitForData never move ExpiresAt on their own, and only an explicit
-// [Storage.Touch] extends the window. That keeps the protocol rule — reads and
-// writes reset the countdown, HEAD does not — in the one place that knows which
-// request it is serving, and lets a caller extend the window for a request that
-// performs no storage operation at all (a live read that only waits, or a
-// close-only append).
+// the countdown (Section 5.1). Storage does not decide what counts as activity:
+// Read, Append and WaitForData never move ExpiresAt on their own, and only an
+// explicit [Storage.Touch] extends the window. That keeps the protocol rule —
+// reads and writes reset the countdown, HEAD does not — in the one place that
+// knows which request it is serving, and lets a caller extend the window for a
+// request that performs no storage operation at all (a live read that only
+// waits, or a close-only append).
 type Storage interface {
 	// Create creates a new stream. Returns (true, nil) if newly created.
 	// Returns (false, nil) if a live stream already exists whose config
@@ -134,12 +154,15 @@ type Storage interface {
 	// Returns (false, error) wrapping ErrConflict if a live stream exists with
 	// a different config.
 	//
-	// An existing stream that has expired is replaced: Create returns
-	// (true, nil), the replacement starts empty, and no data from the previous
-	// incarnation is ever visible through it. Replacement is atomic with
-	// respect to concurrent Create and Delete of the same stream ID: exactly
-	// one concurrent Create observes created=true, and a concurrent Delete
-	// either removes the old incarnation or the new one, never leaves a hybrid.
+	// An existing unreferenced stream that has expired is replaced: Create
+	// returns (true, nil), the replacement starts empty, and no data from the
+	// previous incarnation is ever visible through it. A referenced expired
+	// ForkStorage node may instead reserve its path and make Create report
+	// ErrConflict until its descendants release it, as described under Expiry
+	// above. Replacement, when allowed, is atomic with respect to concurrent
+	// Create and Delete of the same stream ID: exactly one concurrent Create
+	// observes created=true, and a concurrent Delete either removes the old
+	// incarnation or the new one, never leaves a hybrid.
 	//
 	// Errors: ErrConflict, ErrBadRequest (invalid stream ID), ErrClosed.
 	Create(ctx context.Context, streamID string, cfg StreamConfig) (created bool, err error)
@@ -168,9 +191,11 @@ type Storage interface {
 	// A successful Append makes the message visible to Read and wakes every
 	// WaitForData caller waiting at or before the new message.
 	//
-	// Errors: ErrNotFound (no such stream, or expired), ErrBadRequest (empty
-	// data, invalid stream ID), ErrPayloadTooLarge, ErrConflict (seq
-	// regression, or a lost write race the caller may retry), ErrClosed.
+	// Errors: ErrNotFound (no such stream, or an expiry whose path was retired),
+	// ErrBadRequest (empty data, invalid stream ID), ErrPayloadTooLarge,
+	// ErrConflict (seq regression, or a lost write race the caller may retry),
+	// ErrStreamClosed (the stream has reached permanent EOF), ErrSoftDeleted,
+	// ErrClosed (storage shutdown).
 	Append(ctx context.Context, streamID string, data []byte, seq string) (Offset, error)
 
 	// Read returns messages positioned strictly after offset, in ascending
@@ -190,17 +215,17 @@ type Storage interface {
 	// Returned message data belongs to the caller and never aliases stored
 	// state: mutating it cannot change what a later Read returns.
 	//
-	// Errors: ErrNotFound (no such stream, or expired), ErrBadRequest
-	// (malformed offset, negative limit, invalid stream ID), ErrGone,
-	// ErrClosed, ctx.Err().
+	// Errors: ErrNotFound (no such stream, or an expiry whose path was retired),
+	// ErrBadRequest (malformed offset, negative limit, invalid stream ID),
+	// ErrGone, ErrSoftDeleted, ErrClosed, ctx.Err().
 	Read(ctx context.Context, streamID string, offset Offset, limit int) (*ReadResult, error)
 
 	// Head returns stream metadata without reading data (Section 5.5).
 	// StreamInfo.NextOffset is the stream's tail offset, matching the
 	// TailOffset a Read would report.
 	//
-	// Errors: ErrNotFound (no such stream, or expired — use this for existence
-	// checks), ErrBadRequest (invalid stream ID), ErrClosed.
+	// Errors: ErrNotFound (no such stream, or an expiry whose path was retired),
+	// ErrSoftDeleted, ErrBadRequest (invalid stream ID), ErrClosed.
 	Head(ctx context.Context, streamID string) (*StreamInfo, error)
 
 	// Touch restarts a stream's sliding TTL window: the stream's expiry moves
@@ -213,42 +238,49 @@ type Storage interface {
 	// no sliding window to restart, and Touch must never move an absolute
 	// deadline.
 	//
-	// Touch never resurrects a stream: an expired or missing stream reports
-	// ErrNotFound and stays expired.
+	// Touch never resurrects a stream: a missing stream or an expiry whose path
+	// was retired reports ErrNotFound; a referenced expiry retained by a
+	// ForkStorage reports ErrSoftDeleted. Either stays expired.
 	//
-	// Errors: ErrNotFound (no such stream, or expired), ErrBadRequest (invalid
-	// stream ID), ErrClosed.
+	// Errors: ErrNotFound (no such stream, or an expiry whose path was retired),
+	// ErrSoftDeleted, ErrBadRequest (invalid stream ID), ErrClosed.
 	Touch(ctx context.Context, streamID string) error
 
-	// Delete removes a stream (Section 5.4). Returns ErrNotFound if the stream
-	// does not exist. An expired stream is still deleted successfully: expiry
-	// hides a stream from readers, but its record is there to reclaim.
+	// Delete logically removes a stream (Section 5.4). Returns ErrNotFound if the
+	// stream does not exist. An expired, unreferenced record is still deleted
+	// successfully: expiry hides it from readers, but its record is there to
+	// reclaim. A referenced expiry whose ForkStorage retained its path instead
+	// reports ErrSoftDeleted until the final descendant releases it.
 	//
 	// Delete is atomic with respect to a concurrent Create of the same stream
-	// ID: once Delete returns nil the stream is gone, and a stream subsequently
+	// ID: once Delete returns nil the old incarnation is no longer directly
+	// accessible. If its path is eligible for reuse, a stream subsequently
 	// created with that ID starts empty and never observes data, offsets or
 	// deduplication state from the deleted incarnation — including when the
 	// implementation reclaims the deleted bytes lazily in the background.
 	//
-	// Delete wakes every WaitForData caller on the stream, which then report
-	// ErrNotFound.
+	// Delete wakes every WaitForData caller on the stream. They report
+	// ErrSoftDeleted when the record is retained for forks, or ErrNotFound when
+	// it was removed.
 	//
-	// Errors: ErrNotFound, ErrBadRequest (invalid stream ID), ErrClosed.
+	// Errors: ErrNotFound, ErrSoftDeleted, ErrBadRequest (invalid stream ID),
+	// ErrClosed.
 	Delete(ctx context.Context, streamID string) error
 
 	// WaitForData returns messages after offset, blocking until at least one is
-	// available. It returns immediately if data already exists at offset, and
-	// otherwise returns the same result a Read would once data arrives. offset
-	// and limit have the same meaning as in Read.
+	// available or the stream reaches permanent EOF. It returns immediately if
+	// data already exists at offset or if a Read at offset reports Closed, and
+	// otherwise returns the same result a Read would once data or closure
+	// arrives. offset and limit have the same meaning as in Read.
 	//
-	// Wakeups are not lost: a waiter is released by any Append that commits
-	// after the waiter's last unsuccessful read, so a caller that loops on
-	// WaitForData observes every message without polling. Delete and Close also
-	// release waiters.
+	// Wakeups are not lost: a waiter is released by any Append or CloseStream
+	// that commits after the waiter's last unsuccessful read, so a caller that
+	// loops on WaitForData observes every message and permanent EOF without
+	// polling. Delete and Storage.Close also release waiters.
 	//
 	// Errors: ctx.Err() on cancellation or deadline, ErrNotFound (stream absent,
-	// expired, or deleted while waiting), ErrClosed (storage closed while
-	// waiting), ErrBadRequest, ErrGone.
+	// retired after expiry, or deleted while waiting), ErrSoftDeleted, ErrClosed
+	// (storage closed while waiting), ErrBadRequest, ErrGone.
 	WaitForData(ctx context.Context, streamID string, offset Offset, limit int) (*ReadResult, error)
 
 	// Close releases resources. It is idempotent: later calls are no-ops and
@@ -309,4 +341,144 @@ type AtomicBatchStorage interface {
 	//
 	// Errors are the same as Storage.Append.
 	AppendBatch(ctx context.Context, streamID string, messages [][]byte, seq string) (Offset, error)
+}
+
+// AtomicCloseStorage is the optional Storage capability for permanently
+// closing a protocol stream. Protocol closure is durable per-stream state; it
+// is unrelated to [Storage.Close], which shuts down a storage backend.
+//
+// Implementations expose closure through StreamInfo.Closed and
+// ReadResult.Closed. After closure, ordinary Append calls (and AppendBatch,
+// when implemented) must fail with ErrStreamClosed, while reads, metadata
+// operations, Touch, and Delete continue to work normally. Create accepts a
+// StreamConfig whose Closed field is true. An implementation that also offers
+// AtomicBatchStorage accepts the field in CreateWithMessages, allowing an
+// entire closed stream to become visible atomically at creation.
+type AtomicCloseStorage interface {
+	Storage
+
+	// CloseStream atomically appends messages in order and marks the stream
+	// closed. Readers observe either the state before the call or the complete
+	// final batch together with Closed=true; they never observe a prefix of the
+	// batch or final messages on a stream that still appears open. A successful
+	// close wakes every WaitForData caller, including when messages is empty.
+	//
+	// An empty messages slice is a valid close-only mutation. Repeating a
+	// close-only mutation on an already-closed stream is idempotent and returns
+	// its unchanged tail offset. Supplying messages to an already-closed stream
+	// fails with ErrStreamClosed and changes nothing.
+	//
+	// seq applies once to the whole closing mutation, with the same ordering and
+	// atomicity rules as AppendBatch. A rejected close does not advance it. All
+	// message slices are borrowed only for the call and must be copied before
+	// CloseStream returns.
+	//
+	// Errors: ErrNotFound, ErrBadRequest, ErrPayloadTooLarge, ErrConflict,
+	// ErrStreamClosed, ErrSoftDeleted, ErrClosed, and ctx.Err().
+	CloseStream(ctx context.Context, streamID string, messages [][]byte, seq string) (Offset, error)
+}
+
+// ForkRequest describes an atomic fork creation. It deliberately records
+// whether optional protocol fields were present: omission has different
+// inheritance and idempotency semantics from an explicitly supplied zero
+// value.
+//
+// Config.ContentType carries the content type resolved by the caller even when
+// ContentTypeSet is false. CreateFork verifies it against the current source
+// incarnation before committing, then stores the source's canonical value. A
+// caller that obtained SourceIncarnationID from Head should also supply it to
+// fence deletion and recreation races; an empty value preserves compatibility
+// with implementations that do not expose incarnation identity.
+//
+// Config.IsPrivate and Config.Closed always describe the new target and are
+// never inherited. In particular, a closed source produces an open fork unless
+// Config.Closed explicitly requests that the target itself be closed.
+type ForkRequest struct {
+	// SourceStreamID is the storage identifier of the immediate parent stream.
+	SourceStreamID string
+
+	// SourceIncarnationID, when non-empty, must equal the current source
+	// incarnation. A mismatch reports ErrConflict rather than forking data that
+	// the caller did not inspect.
+	SourceIncarnationID string
+
+	// Offset is the divergence anchor. OffsetSet distinguishes an explicit
+	// offset (including a start sentinel) from omission. When OffsetSet is false,
+	// CreateFork resolves the anchor to the source's current tail. Replaying the
+	// same omitted-offset request against an existing target remains idempotent;
+	// it never rebases the target after the source grows.
+	Offset    Offset
+	OffsetSet bool
+
+	// SubOffset refines the anchor within the next source data boundary. Zero is
+	// equivalent to omitting the protocol header. For JSON it counts flattened
+	// messages in the next atomic batch; for other content types it counts bytes
+	// in the next message.
+	SubOffset uint64
+
+	// Config holds target configuration. ContentType, TTL, and ExpiresAt are
+	// interpreted together with their corresponding Set fields below.
+	Config StreamConfig
+
+	// ContentTypeSet reports whether the target content type was explicit. If
+	// true it must match the source. If false the source content type is
+	// inherited, while Config.ContentType still carries the caller's resolved
+	// expectation for race detection.
+	ContentTypeSet bool
+
+	// TTLSet and ExpiresAtSet distinguish explicit target lifetime policy from
+	// inheritance. At most one may be true. When both are false, a source TTL is
+	// copied as a fresh independent sliding window and a source absolute expiry
+	// is copied as the same absolute deadline.
+	TTLSet       bool
+	ExpiresAtSet bool
+}
+
+// ForkStorage is the optional Storage capability for creating streams that
+// share an immutable prefix with another stream. Callers discover it with a
+// type assertion; implementations without fork topology remain valid Storage
+// implementations.
+//
+// A fork uses the source's offset space. It observes source data only through
+// the resolved fork boundary, then its own initial messages and later appends;
+// source appends after creation are never visible through the fork. Forks may
+// themselves be forked, and reads transparently stitch the resulting chain.
+// Producer and Stream-Seq state are target-local and are never inherited.
+//
+// Deleting a stream with direct child forks soft-deletes it. Its data remains
+// available only through descendants, while direct Append, Read, Head, Touch,
+// Delete, WaitForData, AppendBatch, and CloseStream operations report
+// ErrSoftDeleted. Ordinary Create at its path, creating another fork at its
+// path, and using it as a new fork source report ErrConflict. Deleting the last
+// child permits recursive reclamation of soft-deleted ancestors.
+//
+// Expiry also preserves every referenced node's data for descendants. An
+// implementation may either detach the expired node from its public path and
+// allow an independent replacement there, or retain the path in the same
+// externally inaccessible state as a soft deletion. In the retained form,
+// direct operations report ErrSoftDeleted and creation at that path reports
+// ErrConflict until reference release permits reclamation. This choice is an
+// implementation policy; it must not affect reads through existing descendants.
+type ForkStorage interface {
+	Storage
+
+	// CreateFork atomically creates targetStreamID, its source reference, and
+	// all initial messages. On success info is non-nil and describes the exact
+	// target snapshot, including its effective inherited configuration and tail.
+	//
+	// An existing live fork created by an equivalent ForkRequest is an
+	// idempotent success with created=false; messages are validated but neither
+	// compared nor appended again. This existing-target check is resolved before
+	// source visibility, so a retry remains successful if that already-linked
+	// source has since been soft-deleted. Any different target configuration, a
+	// regular stream or soft-deleted stream at the target, a soft-deleted source
+	// for a new target, or a SourceIncarnationID mismatch reports ErrConflict.
+	//
+	// An offset beyond the source tail, a sub-offset beyond the next applicable
+	// message/batch boundary, invalid mutually exclusive lifetime fields, or an
+	// empty message reports ErrBadRequest. A missing source, or one whose expired
+	// path was retired, reports ErrNotFound; an expired source retained like a
+	// soft deletion reports ErrConflict. Input message slices are borrowed only
+	// for the call, and no partial target or reference is visible on error.
+	CreateFork(ctx context.Context, targetStreamID string, req ForkRequest, messages [][]byte) (created bool, info *StreamInfo, err error)
 }

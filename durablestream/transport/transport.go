@@ -33,7 +33,8 @@ type Transport interface {
 	SSE(ctx context.Context, req SSERequest) (EventStream, error)
 
 	// Append adds data to a stream (Section 5.2: Append to Stream).
-	// Data must not be empty. Content-Type must match the stream's type.
+	// Data must not be empty unless Close is true. Content-Type must match the
+	// stream's type when Data is present.
 	Append(ctx context.Context, req AppendRequest) (*AppendResponse, error)
 
 	// Create creates a new stream (Section 5.1: Create Stream).
@@ -117,6 +118,10 @@ type ReadResponse struct {
 	// Per spec: "Clients MAY use this header to determine when they have
 	// caught up and can transition to live tailing mode."
 	UpToDate bool
+
+	// Closed is true when the response is at the final offset of a permanently
+	// closed stream. Unlike UpToDate, Closed means no more data can arrive.
+	Closed bool
 }
 
 // Event represents an SSE event (Section 5.8).
@@ -138,12 +143,16 @@ type Event struct {
 	// UpToDate is extracted from control events.
 	// True when the client has caught up with all available data.
 	UpToDate bool
+
+	// Closed is extracted from control events. Once true, an SSE client must
+	// not reconnect because the stream has reached EOF.
+	Closed bool
 }
 
 // AppendRequest is the request to append data (Section 5.2).
 type AppendRequest struct {
 	Path string // Stream path
-	Data []byte // Data to append (must not be empty per Section 5.2)
+	Data []byte // Data to append; may be empty only when Close is true
 
 	// ContentType must match the stream's content type.
 	// Per spec: "Servers MUST return 400 Bad Request on mismatch."
@@ -169,6 +178,10 @@ type AppendRequest struct {
 	// HasProducerHeaders indicates producer headers should be sent.
 	// Use this to distinguish epoch=0, seq=0 from unset values.
 	HasProducerHeaders bool
+
+	// Close atomically closes the stream after appending Data. When Data is
+	// empty, this is a close-only request and is the sole valid empty append.
+	Close bool
 }
 
 // AppendResponse is the response from an Append operation.
@@ -176,8 +189,10 @@ type AppendResponse struct {
 	// NextOffset is the new tail offset after the append (Section 5.2).
 	NextOffset string
 
-	// Duplicate is true when the append was a duplicate (204 response).
-	// For idempotent producers, duplicate appends are success (Section 5.2.1).
+	// Duplicate is true when a producer append response unambiguously reports a
+	// replay. It remains false for close-only requests because both an initial
+	// close and its replay return 204, so the wire response cannot distinguish
+	// them. Duplicate appends are still successful (Section 5.2.1).
 	Duplicate bool
 
 	// ProducerEpoch is the server's current epoch for this producer (Section 5.2.1).
@@ -190,6 +205,9 @@ type AppendResponse struct {
 
 	// StatusCode is the HTTP status code of the response.
 	StatusCode int
+
+	// Closed confirms that the stream is closed after this request.
+	Closed bool
 }
 
 // CreateRequest is the request to create a stream (Section 5.1).
@@ -211,12 +229,19 @@ type CreateRequest struct {
 
 	// InitialData is optional initial stream content.
 	InitialData []byte
+
+	// Closed creates the stream in its terminal state. InitialData, if any, is
+	// the complete and final content of the stream.
+	Closed bool
 }
 
 // CreateResponse is the response from a Create operation.
 type CreateResponse struct {
 	// NextOffset is the tail offset after any initial content (Section 5.1).
 	NextOffset string
+
+	// Closed confirms that the stream was created in its terminal state.
+	Closed bool
 }
 
 // DeleteRequest is the request to delete a stream (Section 5.4).
@@ -242,6 +267,9 @@ type HeadResponse struct {
 
 	// ExpiresAt is the absolute expiry time, if applicable.
 	ExpiresAt time.Time
+
+	// Closed reports whether the stream is permanently closed.
+	Closed bool
 }
 
 // Middleware wraps a Transport with additional behavior.

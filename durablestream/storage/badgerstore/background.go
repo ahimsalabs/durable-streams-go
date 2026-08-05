@@ -179,7 +179,7 @@ func (s *Storage) scanExpiredStreams(ctx context.Context, seek []byte) ([]expire
 						"streamID", streamID, "error", ErrLegacyFormat)
 					return nil
 				}
-				if rec.IsExpired() {
+				if rec.IsExpired() && !rec.SoftDeleted {
 					expiredStreams = append(expiredStreams, expiredGeneration{
 						streamID: streamID,
 						gen:      rec.Gen,
@@ -206,9 +206,12 @@ func (s *Storage) deleteExpiredGeneration(ctx context.Context, candidate expired
 		return false, err
 	}
 
-	var removed bool
+	var (
+		removed bool
+		changes topologyChanges
+	)
 	err := s.updateWithRetry(func(txn *badger.Txn) error {
-		removed = false
+		removed, changes = false, topologyChanges{}
 		if err := ctx.Err(); err != nil {
 			return err
 		}
@@ -217,18 +220,24 @@ func (s *Storage) deleteExpiredGeneration(ctx context.Context, candidate expired
 		if err != nil {
 			return err
 		}
-		if !found || rec.isLegacy() || rec.Gen != candidate.gen || !rec.IsExpired() {
+		if !found || rec.isLegacy() || rec.Gen != candidate.gen || !rec.IsExpired() || rec.SoftDeleted {
 			return nil
 		}
-
-		if err := txn.Delete(configKey(candidate.streamID)); err != nil {
-			return err
-		}
-		if err := txn.Delete(lastSeqKey(candidate.streamID)); err != nil {
-			return err
-		}
-		if err := txn.Set(tombstoneKey(candidate.streamID, candidate.gen), nil); err != nil {
-			return err
+		if rec.RefCount > 0 {
+			rec.SoftDeleted = true
+			if err := setRecord(txn, candidate.streamID, rec); err != nil {
+				return err
+			}
+			if err := txn.Delete(lastSeqKey(candidate.streamID)); err != nil {
+				return err
+			}
+			changes.softened = append(changes.softened, streamGeneration{streamID: candidate.streamID, gen: rec.Gen})
+		} else {
+			var err error
+			changes, err = removeRecordCascade(txn, candidate.streamID, rec)
+			if err != nil {
+				return err
+			}
 		}
 		removed = true
 		return nil
@@ -237,7 +246,6 @@ func (s *Storage) deleteExpiredGeneration(ctx context.Context, candidate expired
 		return removed, err
 	}
 
-	s.forgetStream(candidate.streamID, candidate.gen)
-	s.signalReaper()
+	s.publishTopologyChanges(changes)
 	return true, nil
 }

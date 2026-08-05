@@ -83,7 +83,9 @@ type Options struct {
 	// Default: 5 minutes. Set to -1 to disable.
 	GCInterval time.Duration
 
-	// CleanupInterval is how often to scan for and delete expired streams.
+	// CleanupInterval is how often to scan for and delete expired streams. An
+	// expired stream retained by child forks is soft-deleted instead; its bytes
+	// remain available only through descendants until their references release.
 	// Default: 1 minute. Set to -1 to disable.
 	CleanupInterval time.Duration
 

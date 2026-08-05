@@ -420,6 +420,7 @@ func TestHeaderConstants(t *testing.T) {
 		HeaderStreamCursor,
 		HeaderStreamNextOffset,
 		HeaderStreamUpToDate,
+		HeaderStreamClosed,
 	}
 
 	for _, h := range headers {

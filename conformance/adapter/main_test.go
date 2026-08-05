@@ -78,3 +78,36 @@ func TestErrorResultSequenceConflict(t *testing.T) {
 			got.Status, got.ErrorCode)
 	}
 }
+
+func TestInitAdvertisesAutoMode(t *testing.T) {
+	result := handleInit(Command{ServerURL: "http://127.0.0.1"})
+	if result.Features == nil || !result.Features.Auto {
+		t.Fatalf("init features = %+v, want auto=true", result.Features)
+	}
+}
+
+func TestErrorResultStreamClosed(t *testing.T) {
+	err := errors.Join(errors.New("append failed"), durablestream.ErrStreamClosed)
+
+	got := errorResult("append", err)
+	if got.Status != 409 || got.ErrorCode != "STREAM_CLOSED" {
+		t.Fatalf("stream closed = status %d, code %q; want 409, STREAM_CLOSED",
+			got.Status, got.ErrorCode)
+	}
+}
+
+func TestProducerForRetainsSequenceState(t *testing.T) {
+	producers = make(map[producerKey]*producerState)
+	cmd := Command{Path: "/stream", ProducerID: "producer", Epoch: 0}
+
+	first := producerFor(cmd)
+	first.nextSeq = 2
+	if got := producerFor(cmd); got != first || got.nextSeq != 2 {
+		t.Fatalf("producerFor() did not retain producer state: %+v", got)
+	}
+
+	restarted := producerFor(Command{Path: cmd.Path, ProducerID: cmd.ProducerID, Epoch: 1})
+	if restarted == first || restarted.epoch != 1 || restarted.nextSeq != 0 {
+		t.Fatalf("new epoch state = %+v, want fresh epoch 1", restarted)
+	}
+}

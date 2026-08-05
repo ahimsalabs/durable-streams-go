@@ -18,14 +18,20 @@
 // acknowledged appends can then be lost if the process is killed. In-memory
 // mode has no durability at all.
 //
-// # Deletion
+// # Forks and deletion
 //
-// Delete removes a stream's configuration atomically and records a tombstone;
-// the stream's message data is purged afterwards by a background reaper. Each
-// stream incarnation is assigned a unique generation that scopes its message
-// keys, so a purge that is slow, interrupted, or resumed after a crash can
-// never observe or destroy data belonging to a stream created later with the
-// same ID. The reaper also sweeps orphaned data at startup.
+// Forks store a generation-fenced pointer to their immediate parent and read
+// the inherited prefix in place. Append-batch boundaries are persisted beside
+// messages so JSON sub-offsets retain their meaning after restart.
+//
+// Delete normally removes a stream's configuration atomically and records a
+// tombstone; message and batch data are purged afterwards by a background
+// reaper. A stream that still has child forks is instead soft-deleted and kept
+// internally readable until its final descendant reference is released. An
+// expired referenced stream is retained the same way, so its path cannot be
+// reused until the descendant chain is removed. Each incarnation has a unique
+// generation, so a slow or crash-resumed purge can never destroy data belonging
+// to a later stream. The reaper also sweeps orphaned data at startup.
 //
 // # Stream-Seq Ordering
 //
@@ -42,11 +48,16 @@
 //
 // # On-disk format
 //
-// Generation scoping changed the message key layout. A directory containing
-// streams written by an earlier version is rejected with [ErrLegacyFormat]
-// before any background reaper starts. The old bytes are left intact so an
-// operator can migrate them explicitly instead of losing durable data merely by
-// opening the directory with a newer binary.
+// Record format version 1 includes generation-scoped messages, durable fork
+// lineage and reference counts, and atomic append-batch boundaries. A directory
+// containing any older stream record is rejected with [ErrLegacyFormat] before
+// background cleanup starts. In particular, generation-scoped records written
+// before batch metadata cannot be upgraded in place: the grouping needed for a
+// JSON fork sub-offset cannot be reconstructed from individual messages.
+//
+// New also rejects malformed generation fences, reference counts, or cyclic
+// lineage. Every rejected open closes Badger and leaves all bytes intact for an
+// explicit migration or repair; this package never guesses at durable history.
 package badgerstore
 
 import (
@@ -73,6 +84,8 @@ import (
 var (
 	_ durablestream.Storage            = (*Storage)(nil)
 	_ durablestream.AtomicBatchStorage = (*Storage)(nil)
+	_ durablestream.AtomicCloseStorage = (*Storage)(nil)
+	_ durablestream.ForkStorage        = (*Storage)(nil)
 )
 
 // streamState holds in-memory notification state for a stream.
@@ -125,9 +138,9 @@ func (st *streamState) markDeleted() {
 var ErrClosed = fmt.Errorf("badgerstore: storage closed: %w", durablestream.ErrClosed)
 
 // ErrLegacyFormat is returned by New when a Badger directory contains stream
-// records written before generation-scoped keys were introduced. New closes
-// the database and leaves every legacy key intact; callers must migrate or
-// explicitly discard that directory before reopening it.
+// records that do not use this package's complete versioned lineage and batch
+// format. New closes the database and leaves every incompatible key intact;
+// callers must migrate or explicitly discard that directory before reopening.
 var ErrLegacyFormat = errors.New("badgerstore: legacy on-disk format")
 
 // errGenerationChanged is an internal sentinel: the stream was deleted and
@@ -154,21 +167,52 @@ const appendAttempts = 3
 // conflict caused by a concurrent mutation of the same stream ID.
 const txnAttempts = 10
 
-// streamRecord is the persisted form of a stream's configuration. The
-// configuration is embedded so the JSON encoding stays compatible with the
-// fields written by earlier versions.
-type streamRecord struct {
-	durablestream.StreamConfig
-	Gen generation `json:"gen"`
+const currentRecordFormatVersion = 1
+
+// parentReference is the immutable edge from a fork to the exact source
+// incarnation it inherited. Offset is the last source position visible to the
+// fork; any materialized sub-offset prefix belongs to the fork's own
+// generation at later offsets.
+type parentReference struct {
+	StreamID           string               `json:"streamId"`
+	Gen                generation           `json:"gen"`
+	Offset             durablestream.Offset `json:"offset"`
+	OffsetSet          bool                 `json:"offsetSet"`
+	SubOffset          uint64               `json:"subOffset,omitempty"`
+	ContentTypeSet     bool                 `json:"contentTypeSet,omitempty"`
+	TTLSet             bool                 `json:"ttlSet,omitempty"`
+	ExpiresAtSet       bool                 `json:"expiresAtSet,omitempty"`
+	RequestedTTL       time.Duration        `json:"requestedTtl,omitempty"`
+	RequestedExpiresAt time.Time            `json:"requestedExpiresAt,omitempty"`
 }
 
-// isLegacy reports whether the record predates generation scoping. New rejects
-// databases containing such records so their old-format message data remains
-// intact for an explicit migration.
-func (r streamRecord) isLegacy() bool { return r.Gen == "" }
+// streamRecord is the persisted stream metadata. Parent and RefCount form a
+// durable, generation-fenced lineage graph: every live or retained fork owns
+// exactly one reference to its immediate parent until the fork is physically
+// removed.
+type streamRecord struct {
+	durablestream.StreamConfig
+	FormatVersion int              `json:"formatVersion"`
+	Gen           generation       `json:"gen"`
+	Parent        *parentReference `json:"parent,omitempty"`
+	RefCount      uint64           `json:"refCount,omitempty"`
+	SoftDeleted   bool             `json:"softDeleted,omitempty"`
+}
 
-// isUsable reports whether the record represents a live, readable stream.
-func (r streamRecord) isUsable() bool { return !r.isLegacy() && !r.IsExpired() }
+// isLegacy reports whether the record predates the complete lineage and batch
+// metadata required by this version. New rejects such databases before any
+// background reaper can mistake their bytes for orphaned data.
+func (r streamRecord) isLegacy() bool {
+	return r.FormatVersion != currentRecordFormatVersion || !validPersistedGeneration(r.Gen)
+}
+
+func newStreamRecord(cfg durablestream.StreamConfig, gen generation) streamRecord {
+	return streamRecord{
+		StreamConfig:  cfg,
+		FormatVersion: currentRecordFormatVersion,
+		Gen:           gen,
+	}
+}
 
 // Storage is a Badger-backed implementation of durablestream.Storage.
 type Storage struct {
@@ -293,7 +337,7 @@ func New(opts Options) (*Storage, error) {
 		}
 		return nil, fmt.Errorf("badgerstore: open: %w", err)
 	}
-	if err := rejectLegacyFormat(db); err != nil {
+	if err := validatePersistedFormat(db); err != nil {
 		if closeErr := db.Close(); closeErr != nil {
 			err = errors.Join(err, fmt.Errorf("badgerstore: close after format check: %w", closeErr))
 		}
@@ -356,36 +400,6 @@ func New(opts Options) (*Storage, error) {
 	s.wg.Go(func() { s.runReaperLoop(reapInterval) })
 
 	return s, nil
-}
-
-// rejectLegacyFormat checks the persisted stream records before Storage starts
-// any background work. Older records have no generation, and therefore refer
-// to message keys whose layout this version cannot safely operate on. Failing
-// the open preserves those bytes for an explicit migration.
-func rejectLegacyFormat(db *badger.DB) error {
-	return db.View(func(txn *badger.Txn) error {
-		opts := badger.DefaultIteratorOptions
-		opts.Prefix = []byte(prefixConfig)
-		opts.PrefetchValues = true
-
-		it := txn.NewIterator(opts)
-		defer it.Close()
-
-		for it.Seek(opts.Prefix); it.ValidForPrefix(opts.Prefix); it.Next() {
-			item := it.Item()
-			streamID := string(item.Key()[len(prefixConfig):])
-			var rec streamRecord
-			if err := item.Value(func(val []byte) error {
-				return json.Unmarshal(val, &rec)
-			}); err != nil {
-				return fmt.Errorf("badgerstore: inspect stream record %q before open: %w", streamID, err)
-			}
-			if rec.isLegacy() {
-				return fmt.Errorf("badgerstore: stream %q predates generation-scoped storage: %w", streamID, ErrLegacyFormat)
-			}
-		}
-		return nil
-	})
 }
 
 // Close closes the Badger database and stops background goroutines.
@@ -579,30 +593,33 @@ func (s *Storage) CreateWithMessages(ctx context.Context, streamID string, cfg d
 	if err != nil {
 		return false, "", err
 	}
-	encoded, err := json.Marshal(streamRecord{StreamConfig: cfg, Gen: gen})
-	if err != nil {
-		return false, "", fmt.Errorf("badgerstore: marshal config: %w", err)
-	}
 	newTail := storage.FormatSimpleOffset(int64(len(messages)))
 	var sequenceValue [8]byte
 	binary.BigEndian.PutUint64(sequenceValue[:], uint64(len(messages)))
 
-	var created bool
-	var nextOffset durablestream.Offset
-	var replaced generation // Non-empty when an unusable stream was displaced
+	var (
+		created    bool
+		nextOffset durablestream.Offset
+		changes    topologyChanges
+		committed  error
+	)
 	commit := func(txn *badger.Txn) error {
-		created, nextOffset, replaced = false, "", ""
+		created, nextOffset, changes, committed = false, "", topologyChanges{}, nil
 		existing, found, err := getRecord(txn, streamID)
 		if err != nil {
 			return err
 		}
 		if found {
 			if existing.isLegacy() {
-				return fmt.Errorf("badgerstore: stream %q predates generation-scoped storage: %w", streamID, ErrLegacyFormat)
+				return fmt.Errorf("badgerstore: stream %q uses an incompatible format: %w", streamID, ErrLegacyFormat)
 			}
-			if existing.isUsable() {
-				// Not expired - check if config matches for idempotency
-				if existing.Matches(cfg) {
+			if existing.SoftDeleted {
+				return fmt.Errorf("badgerstore: stream %q is soft-deleted: %w", streamID, durablestream.ErrConflict)
+			}
+			if !existing.IsExpired() {
+				// A regular PUT cannot silently confirm a fork: lineage is part of
+				// the target's creation configuration.
+				if existing.Parent == nil && existing.Matches(cfg) {
 					created = false
 					nextOffset, err = getTailOffset(txn, streamID, existing.Gen)
 					return err
@@ -610,28 +627,35 @@ func (s *Storage) CreateWithMessages(ctx context.Context, streamID string, cfg d
 				return fmt.Errorf("badgerstore: stream exists with different config: %w", durablestream.ErrConflict)
 			}
 
-			// Expired streams may be replaced (Section 5.1).
-			// Tombstone the displaced generation so the reaper purges its
-			// messages; the new generation writes under a different prefix and
-			// is unaffected by that purge.
-			if err := txn.Set(tombstoneKey(streamID, existing.Gen), nil); err != nil {
-				return fmt.Errorf("badgerstore: set tombstone: %w", err)
+			// An expired source with children cannot be replaced at the same
+			// path. Retain it internally and make the blocked path explicit.
+			if existing.RefCount > 0 {
+				existing.SoftDeleted = true
+				if err := setRecord(txn, streamID, existing); err != nil {
+					return err
+				}
+				changes.softened = append(changes.softened, streamGeneration{streamID: streamID, gen: existing.Gen})
+				committed = fmt.Errorf("badgerstore: expired stream %q is retained by forks: %w", streamID, durablestream.ErrConflict)
+				return nil
 			}
-			if err := txn.Delete(lastSeqKey(streamID)); err != nil {
-				return fmt.Errorf("badgerstore: delete last seq: %w", err)
+			changes, err = removeRecordCascade(txn, streamID, existing)
+			if err != nil {
+				return err
 			}
-			replaced = existing.Gen
 		}
 
 		// Create new stream
-		if err := txn.Set(configKey(streamID), encoded); err != nil {
-			return fmt.Errorf("badgerstore: set config: %w", err)
+		if err := setRecord(txn, streamID, newStreamRecord(cfg, gen)); err != nil {
+			return err
 		}
 		for i, message := range messages {
 			offset := storage.FormatSimpleOffset(int64(i + 1))
 			if err := txn.Set(messageKey(streamID, gen, offset), message); err != nil {
 				return fmt.Errorf("badgerstore: set initial message %d: %w", i, err)
 			}
+		}
+		if err := setBatchBoundary(txn, streamID, gen, offsetsForContiguousRange(1, len(messages))); err != nil {
+			return fmt.Errorf("badgerstore: set initial batch boundary: %w", err)
 		}
 		if len(messages) > 0 {
 			// Badger sequences persist the next number to lease. Initial messages
@@ -655,12 +679,9 @@ func (s *Storage) CreateWithMessages(ctx context.Context, streamID string, cfg d
 	if err := s.updateWithRetry(commit); err != nil {
 		return false, "", mapTransactionSizeError(err)
 	}
-
-	// Past this point the commit is durable; drop in-memory state for the
-	// displaced generation and let the reaper purge its data.
-	if replaced != "" {
-		s.forgetStream(streamID, replaced)
-		s.signalReaper()
+	s.publishTopologyChanges(changes)
+	if committed != nil {
+		return false, "", committed
 	}
 
 	return created, nextOffset, nil
@@ -691,7 +712,33 @@ func (s *Storage) AppendBatch(ctx context.Context, streamID string, messages [][
 	// resolving it and committing the write; the transaction detects that and
 	// we retry against the replacement.
 	for attempt := 0; ; attempt++ {
-		offset, err := s.appendBatchOnce(streamID, messages, seq)
+		offset, err := s.appendBatchOnce(streamID, messages, seq, false)
+		if errors.Is(err, errGenerationChanged) && attempt < appendAttempts-1 {
+			continue
+		}
+		if errors.Is(err, errGenerationChanged) {
+			return "", durablestream.ErrNotFound
+		}
+		return offset, err
+	}
+}
+
+// CloseStream atomically appends an optional final batch and marks the stream
+// closed. An empty final batch makes this operation idempotent; once closed,
+// every append with data is rejected with durablestream.ErrStreamClosed.
+func (s *Storage) CloseStream(ctx context.Context, streamID string, messages [][]byte, seq string) (durablestream.Offset, error) {
+	if err := s.checkClosed(); err != nil {
+		return "", err
+	}
+	if err := validateStreamID(streamID); err != nil {
+		return "", err
+	}
+	if err := validateMessageBatch(messages, true, s.maxMessageSize); err != nil {
+		return "", err
+	}
+
+	for attempt := 0; ; attempt++ {
+		offset, err := s.appendBatchOnce(streamID, messages, seq, true)
 		if errors.Is(err, errGenerationChanged) && attempt < appendAttempts-1 {
 			continue
 		}
@@ -705,7 +752,7 @@ func (s *Storage) AppendBatch(ctx context.Context, streamID string, messages [][
 // appendBatchOnce performs one attempt at appending, against the stream's currently
 // known generation. It returns errGenerationChanged if the stream was replaced
 // before the write committed.
-func (s *Storage) appendBatchOnce(streamID string, messages [][]byte, seq string) (durablestream.Offset, error) {
+func (s *Storage) appendBatchOnce(streamID string, messages [][]byte, seq string, closeStream bool) (durablestream.Offset, error) {
 	gen, err := s.generationFor(streamID)
 	if err != nil {
 		return "", err
@@ -714,35 +761,37 @@ func (s *Storage) appendBatchOnce(streamID string, messages [][]byte, seq string
 	state.appendMu.Lock()
 	defer state.appendMu.Unlock()
 
-	// Get atomic sequence for offset (lock-free, no transaction conflicts)
-	sequence, err := s.getOrCreateSequence(streamID, gen)
-	if err != nil {
-		return "", fmt.Errorf("badgerstore: get sequence: %w", err)
-	}
-	// Next may extend the lease, which writes to the database. Reserve the whole
-	// block while holding appendMu so ordinary Appends cannot take an offset from
-	// the middle of this batch.
 	offsets := make([]durablestream.Offset, len(messages))
-	if err := s.withDB(func() error {
-		for i := range messages {
-			nextNum, err := sequence.Next()
-			if err != nil {
-				return err
-			}
-			if nextNum >= math.MaxInt64 {
-				return fmt.Errorf("badgerstore: offset space exhausted")
-			}
-			offsets[i] = storage.FormatSimpleOffset(int64(nextNum + 1))
+	if len(messages) > 0 {
+		// Reserve the complete block while appendMu excludes ordinary appends.
+		// Reservations may leave gaps on a later transaction failure, which the
+		// Storage offset contract explicitly permits.
+		sequence, err := s.getOrCreateSequence(streamID, gen)
+		if err != nil {
+			return "", fmt.Errorf("badgerstore: get sequence: %w", err)
 		}
-		return nil
-	}); err != nil {
-		if errors.Is(err, durablestream.ErrClosed) {
-			return "", err
+		if err := s.withDB(func() error {
+			for i := range messages {
+				nextNum, err := sequence.Next()
+				if err != nil {
+					return err
+				}
+				if nextNum >= math.MaxInt64 {
+					return fmt.Errorf("badgerstore: offset space exhausted")
+				}
+				offsets[i] = storage.FormatSimpleOffset(int64(nextNum + 1))
+			}
+			return nil
+		}); err != nil {
+			if errors.Is(err, durablestream.ErrClosed) {
+				return "", err
+			}
+			return "", fmt.Errorf("badgerstore: next sequence: %w", err)
 		}
-		return "", fmt.Errorf("badgerstore: next sequence: %w", err)
 	}
 
-	// Write every message (and sequence validation if provided) atomically.
+	var nextOffset durablestream.Offset
+	// Write every message, sequence validation, and the closed bit atomically.
 	err = s.update(func(txn *badger.Txn) error {
 		// Re-validate: the stream may have been deleted, replaced, or expired
 		// since the generation was resolved.
@@ -750,11 +799,22 @@ func (s *Storage) appendBatchOnce(streamID string, messages [][]byte, seq string
 		if err != nil {
 			return err
 		}
-		if !found || !rec.isUsable() {
+		if !found {
 			return durablestream.ErrNotFound
 		}
 		if rec.Gen != gen {
 			return errGenerationChanged
+		}
+		if err := directRecordError(rec); err != nil {
+			return err
+		}
+		if rec.Closed {
+			if closeStream && len(messages) == 0 {
+				var err error
+				nextOffset, err = getTailOffset(txn, streamID, rec.Gen)
+				return err
+			}
+			return durablestream.ErrStreamClosed
 		}
 
 		// Validate dedup sequence number if provided
@@ -776,6 +836,29 @@ func (s *Storage) appendBatchOnce(streamID string, messages [][]byte, seq string
 				return fmt.Errorf("badgerstore: set message %d: %w", i, err)
 			}
 		}
+		if err := setBatchBoundary(txn, streamID, gen, offsets); err != nil {
+			return fmt.Errorf("badgerstore: set append batch boundary: %w", err)
+		}
+
+		if closeStream {
+			rec.Closed = true
+			encoded, err := json.Marshal(rec)
+			if err != nil {
+				return fmt.Errorf("badgerstore: marshal config: %w", err)
+			}
+			if err := txn.Set(configKey(streamID), encoded); err != nil {
+				return fmt.Errorf("badgerstore: set config: %w", err)
+			}
+		}
+		if len(offsets) > 0 {
+			nextOffset = offsets[len(offsets)-1]
+		} else {
+			var err error
+			nextOffset, err = getTailOffset(txn, streamID, rec.Gen)
+			if err != nil {
+				return fmt.Errorf("badgerstore: get tail offset: %w", err)
+			}
+		}
 
 		return nil
 	})
@@ -793,10 +876,11 @@ func (s *Storage) appendBatchOnce(streamID string, messages [][]byte, seq string
 		return "", err
 	}
 
-	// Notify waiters: close current channel to wake all, then replace it
+	// Wake after the entire transaction commits. For append-and-close this makes
+	// the final messages visible before waiters can observe the closed state.
 	state.wake()
 
-	return offsets[len(offsets)-1], nil
+	return nextOffset, nil
 }
 
 // mapTransactionSizeError translates Badger's backend-specific atomic-write
@@ -839,8 +923,11 @@ func (s *Storage) generationFor(streamID string) (generation, error) {
 		if err != nil {
 			return err
 		}
-		if !found || !rec.isUsable() {
+		if !found {
 			return durablestream.ErrNotFound
+		}
+		if err := directRecordError(rec); err != nil {
+			return err
 		}
 		gen = rec.Gen
 		return nil
@@ -861,8 +948,11 @@ func (s *Storage) expiryForGeneration(streamID string, gen generation) (time.Tim
 		if err != nil {
 			return err
 		}
-		if !found || !rec.isUsable() || rec.Gen != gen {
+		if !found || rec.Gen != gen {
 			return durablestream.ErrNotFound
+		}
+		if err := directRecordError(rec); err != nil {
+			return err
 		}
 		expiresAt = rec.ExpiresAt
 		return nil
@@ -944,8 +1034,11 @@ func (s *Storage) getOrCreateSequence(streamID string, gen generation) (*badger.
 		if err != nil {
 			return err
 		}
-		if !found || !rec.isUsable() || rec.Gen != gen {
+		if !found || rec.Gen != gen {
 			return errGenerationChanged
+		}
+		if err := directRecordError(rec); err != nil {
+			return err
 		}
 		return nil
 	}); err != nil {
@@ -1017,102 +1110,18 @@ func (s *Storage) readGeneration(ctx context.Context, streamID string, wantGen g
 		if err != nil {
 			return err
 		}
-		if !found || !rec.isUsable() {
+		if !found {
 			return durablestream.ErrNotFound
+		}
+		if err := directRecordError(rec); err != nil {
+			return err
 		}
 		if wantGen != "" && rec.Gen != wantGen {
 			return durablestream.ErrNotFound
 		}
 
-		// Find the tail offset (highest message offset)
-		tailOffset, err := getTailOffset(txn, streamID, rec.Gen)
-		if err != nil {
-			return fmt.Errorf("badgerstore: get tail offset: %w", err)
-		}
-
-		// Collect messages starting after the requested offset
-		// Gaps are handled naturally: we seek to the start position and iterate
-		// forward, returning whatever messages exist.
-		var messages []durablestream.StoredMessage
-		totalBytes := 0
-
-		prefix := messagePrefix(streamID, rec.Gen)
-		opts := badger.DefaultIteratorOptions
-		opts.Prefix = prefix
-
-		it := txn.NewIterator(opts)
-		defer it.Close()
-
-		// Parse offset to calculate start position
-		_, byteOffset, err := storage.ParseOffset(offset)
-		if err != nil {
-			return err
-		}
-		// MaxInt64 has no representable successor. It is necessarily at or
-		// beyond every offset this implementation can generate, so leave the
-		// iterator unpositioned and return an empty page instead of overflowing
-		// to a negative seek key and replaying the stream from the beginning.
-		if byteOffset != math.MaxInt64 {
-			startOffset := storage.FormatSimpleOffset(byteOffset + 1)
-			it.Seek(messageKey(streamID, rec.Gen, startOffset))
-		}
-
-		for byteOffset != math.MaxInt64 && it.Valid() {
-			// Check for context cancellation
-			if err := ctx.Err(); err != nil {
-				return err
-			}
-
-			item := it.Item()
-			keyStr := string(item.Key())
-			offsetStr := keyStr[len(prefix):]
-			msgOffset := durablestream.Offset(offsetStr)
-
-			var data []byte
-			if err := item.Value(func(val []byte) error {
-				data = make([]byte, len(val))
-				copy(data, val)
-				return nil
-			}); err != nil {
-				return fmt.Errorf("badgerstore: read message: %w", err)
-			}
-
-			if limit > 0 && totalBytes+len(data) > limit && len(messages) > 0 {
-				break
-			}
-
-			messages = append(messages, durablestream.StoredMessage{
-				Data:   data,
-				Offset: msgOffset,
-			})
-			totalBytes += len(data)
-
-			it.Next()
-		}
-
-		// Determine next offset for subsequent reads
-		var nextOffset durablestream.Offset
-		if len(messages) > 0 {
-			nextOffset = messages[len(messages)-1].Offset
-		} else if offset.IsZero() || offset == "-1" {
-			// Empty/zero offset or -1 sentinel with no messages: return formatted zero offset
-			nextOffset = storage.FormatSimpleOffset(0)
-		} else if offset.Compare(tailOffset) >= 0 {
-			// At or past the tail: return requested offset to avoid going backward
-			// This prevents duplicate message delivery on retry
-			nextOffset = offset
-		} else {
-			// Before tail but no messages (gap): return requested offset
-			nextOffset = offset
-		}
-
-		result = &durablestream.ReadResult{
-			Messages:      messages,
-			NextOffset:    nextOffset,
-			TailOffset:    tailOffset,
-			IncarnationID: string(rec.Gen),
-		}
-		return nil
+		result, err = readLogicalStream(ctx, txn, streamID, rec, offset, limit)
+		return err
 	})
 	if err != nil {
 		return nil, err
@@ -1136,8 +1145,11 @@ func (s *Storage) Head(ctx context.Context, streamID string) (*durablestream.Str
 		if err != nil {
 			return err
 		}
-		if !found || !rec.isUsable() {
+		if !found {
 			return durablestream.ErrNotFound
+		}
+		if err := directRecordError(rec); err != nil {
+			return err
 		}
 
 		tailOffset, err := getTailOffset(txn, streamID, rec.Gen)
@@ -1151,6 +1163,7 @@ func (s *Storage) Head(ctx context.Context, streamID string) (*durablestream.Str
 			TTL:           rec.TTL,
 			ExpiresAt:     rec.ExpiresAt,
 			IsPrivate:     rec.IsPrivate,
+			Closed:        rec.Closed,
 			IncarnationID: string(rec.Gen),
 		}
 		return nil
@@ -1189,8 +1202,11 @@ func (s *Storage) Touch(ctx context.Context, streamID string) error {
 		// An already-expired stream stays expired: sliding the window here would
 		// resurrect a stream that Read, Append and Head have been reporting as
 		// absent, and that Create is entitled to replace.
-		if !found || !rec.isUsable() {
+		if !found {
 			return durablestream.ErrNotFound
+		}
+		if err := directRecordError(rec); err != nil {
+			return err
 		}
 
 		cfg, didMove := rec.SlideExpiry(time.Now())
@@ -1226,10 +1242,10 @@ func (s *Storage) Touch(ctx context.Context, streamID string) error {
 
 // Delete removes a stream (Section 5.4).
 //
-// The stream's configuration and metadata are removed in a single transaction
-// that also records a tombstone; the message data is purged asynchronously by
-// the reaper. Once that transaction commits the stream is gone as far as
-// callers are concerned, so Delete reports no error after that point.
+// A stream with children is retained as soft-deleted; otherwise its record is
+// removed, its parent reference is released, and any now-unreferenced retained
+// ancestors are removed in the same transaction. Message bytes are reaped
+// asynchronously from generation-scoped tombstones.
 func (s *Storage) Delete(ctx context.Context, streamID string) error {
 	if err := s.checkClosed(); err != nil {
 		return err
@@ -1241,10 +1257,12 @@ func (s *Storage) Delete(ctx context.Context, streamID string) error {
 	// Delete and a concurrent Create of the same stream ID both write the
 	// config key, so this transaction can lose a conflict; retrying settles it
 	// against whichever record is committed by then.
-	var found bool
-	var gen generation
+	var (
+		found   bool
+		changes topologyChanges
+	)
 	err := s.updateWithRetry(func(txn *badger.Txn) error {
-		found, gen = false, ""
+		found, changes = false, topologyChanges{}
 		rec, ok, err := getRecord(txn, streamID)
 		if err != nil {
 			return err
@@ -1253,20 +1271,25 @@ func (s *Storage) Delete(ctx context.Context, streamID string) error {
 			return nil
 		}
 		found = true
-		gen = rec.Gen
-
-		if err := txn.Delete(configKey(streamID)); err != nil {
-			return fmt.Errorf("badgerstore: delete config: %w", err)
+		if rec.isLegacy() {
+			return ErrLegacyFormat
 		}
-		if err := txn.Delete(lastSeqKey(streamID)); err != nil {
-			return fmt.Errorf("badgerstore: delete last seq: %w", err)
+		if rec.SoftDeleted {
+			return durablestream.ErrSoftDeleted
 		}
-		// Tombstone drives the asynchronous purge of messages and the
-		// sequence key for this generation.
-		if err := txn.Set(tombstoneKey(streamID, gen), nil); err != nil {
-			return fmt.Errorf("badgerstore: set tombstone: %w", err)
+		if rec.RefCount > 0 {
+			rec.SoftDeleted = true
+			if err := setRecord(txn, streamID, rec); err != nil {
+				return err
+			}
+			if err := txn.Delete(lastSeqKey(streamID)); err != nil {
+				return fmt.Errorf("badgerstore: delete last sequence for soft-deleted stream: %w", err)
+			}
+			changes.softened = append(changes.softened, streamGeneration{streamID: streamID, gen: rec.Gen})
+			return nil
 		}
-		return nil
+		changes, err = removeRecordCascade(txn, streamID, rec)
+		return err
 	})
 	if err != nil {
 		return err
@@ -1275,12 +1298,9 @@ func (s *Storage) Delete(ctx context.Context, streamID string) error {
 		return durablestream.ErrNotFound
 	}
 
-	// Wake WaitForData callers AFTER the Badger commit, so Read() returns
-	// ErrNotFound when they re-check. If we closed notifyCh before the
-	// transaction, waiters could wake, find the config still exists,
-	// and block again on a new channel nobody will close.
-	s.forgetStream(streamID, gen)
-	s.signalReaper()
+	// Publish only after the topology transaction commits, so waiters re-read
+	// the authoritative soft-deleted or absent state.
+	s.publishTopologyChanges(changes)
 
 	return nil
 }
@@ -1340,7 +1360,7 @@ func (s *Storage) waitForGeneration(ctx context.Context, streamID string, gen ge
 			}
 			return nil, err
 		}
-		if len(result.Messages) > 0 {
+		if len(result.Messages) > 0 || result.Closed {
 			return result, nil
 		}
 		expiresAt, err := s.expiryForGeneration(streamID, gen)
@@ -1411,34 +1431,15 @@ func (s *Storage) getLastSeq(txn *badger.Txn, streamID string) (string, error) {
 	return seq, err
 }
 
-// getTailOffset returns the highest message offset for a stream generation.
-// Uses reverse iteration to find the last key efficiently.
-// Returns formatted zero offset for empty streams.
+// getTailOffset returns the logical tail of the requested current generation,
+// including an immutable inherited prefix for forked streams.
 func getTailOffset(txn *badger.Txn, streamID string, gen generation) (durablestream.Offset, error) {
-	prefix := messagePrefix(streamID, gen)
-
-	// Use reverse iteration to find the last message efficiently
-	opts := badger.DefaultIteratorOptions
-	opts.Prefix = prefix
-	opts.PrefetchValues = false
-	opts.Reverse = true
-
-	it := txn.NewIterator(opts)
-	defer it.Close()
-
-	// Seek to the end of the prefix range
-	// For reverse iteration, we seek to the prefix + \xff to start at the end
-	seekKey := make([]byte, len(prefix)+1)
-	copy(seekKey, prefix)
-	seekKey[len(prefix)] = 0xff
-	it.Seek(seekKey)
-
-	if it.ValidForPrefix(prefix) {
-		key := it.Item().Key()
-		offsetStr := string(key[len(prefix):])
-		return durablestream.Offset(offsetStr), nil
+	rec, found, err := getRecord(txn, streamID)
+	if err != nil {
+		return "", err
 	}
-
-	// No messages: return zero offset
-	return storage.FormatSimpleOffset(0), nil
+	if !found || rec.Gen != gen {
+		return "", durablestream.ErrNotFound
+	}
+	return streamTailOffset(txn, streamID, rec)
 }

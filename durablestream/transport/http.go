@@ -28,6 +28,7 @@ const (
 	headerStreamCursor     = "Stream-Cursor"
 	headerStreamNextOffset = "Stream-Next-Offset"
 	headerStreamUpToDate   = "Stream-Up-To-Date"
+	headerStreamClosed     = "Stream-Closed"
 
 	// Idempotent producer headers (Section 5.2.1)
 	headerProducerID          = "Producer-Id"
@@ -338,11 +339,13 @@ func (t *HTTPTransport) Read(ctx context.Context, req ReadRequest) (*ReadRespons
 		return nil, err
 	}
 
+	closed := responseStreamClosed(resp)
 	return &ReadResponse{
 		Data:       body,
 		NextOffset: nextOffset,
 		Cursor:     resp.Header.Get(headerStreamCursor),
-		UpToDate:   resp.Header.Get(headerStreamUpToDate) == "true",
+		UpToDate:   responseUpToDate(resp) || closed,
+		Closed:     closed,
 	}, nil
 }
 
@@ -391,10 +394,12 @@ func (t *HTTPTransport) LongPoll(ctx context.Context, req LongPollRequest) (*Rea
 		if err != nil {
 			return nil, err
 		}
+		closed := responseStreamClosed(resp)
 		return &ReadResponse{
 			NextOffset: nextOffset,
 			Cursor:     resp.Header.Get(headerStreamCursor),
 			UpToDate:   true,
+			Closed:     closed,
 		}, nil
 	}
 
@@ -411,11 +416,13 @@ func (t *HTTPTransport) LongPoll(ctx context.Context, req LongPollRequest) (*Rea
 		return nil, err
 	}
 
+	closed := responseStreamClosed(resp)
 	return &ReadResponse{
 		Data:       body,
 		NextOffset: nextOffset,
 		Cursor:     resp.Header.Get(headerStreamCursor),
-		UpToDate:   resp.Header.Get(headerStreamUpToDate) == "true",
+		UpToDate:   responseUpToDate(resp) || closed,
+		Closed:     closed,
 	}, nil
 }
 
@@ -485,8 +492,9 @@ func (t *HTTPTransport) SSE(ctx context.Context, req SSERequest) (EventStream, e
 
 // Append adds data to a stream (Section 5.2: Append to Stream).
 func (t *HTTPTransport) Append(ctx context.Context, req AppendRequest) (*AppendResponse, error) {
-	// Reject empty body (Section 5.2)
-	if len(req.Data) == 0 {
+	// Empty POST bodies are valid only for the canonical close-only operation
+	// (Sections 5.2 and 5.3).
+	if len(req.Data) == 0 && !req.Close {
 		return nil, &Error{
 			Code:       "BAD_REQUEST",
 			Message:    "empty append not allowed",
@@ -511,6 +519,9 @@ func (t *HTTPTransport) Append(ctx context.Context, req AppendRequest) (*AppendR
 		// Writer coordination (Section 5.2)
 		httpReq.Header.Set(headerStreamSeq, req.Seq)
 	}
+	if req.Close {
+		httpReq.Header.Set(headerStreamClosed, "true")
+	}
 
 	// Idempotent producer headers (Section 5.2.1)
 	if req.HasProducerHeaders {
@@ -528,6 +539,21 @@ func (t *HTTPTransport) Append(ctx context.Context, req AppendRequest) (*AppendR
 		return nil, fmt.Errorf("execute request: %w", err)
 	}
 	defer resp.Body.Close()
+
+	// Only an append conflict uses Stream-Closed as its error discriminator.
+	// Other operations may include the header as metadata on a generic 409.
+	if resp.StatusCode == http.StatusConflict && responseStreamClosed(resp) {
+		finalOffset, parseErr := requiredResponseHeader(resp, headerStreamNextOffset)
+		if parseErr != nil {
+			return nil, parseErr
+		}
+		return nil, &Error{
+			Code:        "STREAM_CLOSED",
+			Message:     "stream is closed",
+			StatusCode:  resp.StatusCode,
+			FinalOffset: finalOffset,
+		}
+	}
 
 	if err := checkErrorResponse(resp); err != nil {
 		// Producer-specific 403 and 409 responses carry required reconciliation
@@ -582,16 +608,28 @@ func (t *HTTPTransport) Append(ctx context.Context, req AppendRequest) (*AppendR
 	if err != nil {
 		return nil, err
 	}
+	closed := responseStreamClosed(resp)
+	if req.Close && !closed {
+		return nil, responseParseError(
+			resp,
+			"successful close response missing %s: true",
+			headerStreamClosed,
+		)
+	}
 
-	// 204 means "duplicate, already applied" only for idempotent producers
-	// (Section 5.2.1). Servers also answer 204 to ordinary appends that carry no
-	// producer headers, where it carries no deduplication meaning.
+	// A producer 204 normally means "duplicate, already applied" (Section
+	// 5.2.1). Ordinary appends and first-time close-only mutations can also
+	// return 204, where the status carries no deduplication meaning.
 	result := &AppendResponse{
-		NextOffset:    nextOffset,
-		Duplicate:     req.HasProducerHeaders && resp.StatusCode == http.StatusNoContent,
+		NextOffset: nextOffset,
+		// A close-only mutation returns 204 both when it first commits and when
+		// it is replayed, so its duplicate status is unknowable from HTTP.
+		Duplicate: req.HasProducerHeaders && resp.StatusCode == http.StatusNoContent &&
+			!(req.Close && len(req.Data) == 0),
 		StatusCode:    resp.StatusCode,
 		ProducerEpoch: epoch,
 		ProducerSeq:   seq,
+		Closed:        closed,
 	}
 
 	return result, nil
@@ -638,6 +676,9 @@ func (t *HTTPTransport) Create(ctx context.Context, req CreateRequest) (*CreateR
 	if !req.ExpiresAt.IsZero() {
 		httpReq.Header.Set(headerStreamExpiresAt, req.ExpiresAt.Format(time.RFC3339Nano))
 	}
+	if req.Closed {
+		httpReq.Header.Set(headerStreamClosed, "true")
+	}
 
 	if err := t.applyHeaders(ctx, httpReq); err != nil {
 		return nil, err
@@ -656,9 +697,18 @@ func (t *HTTPTransport) Create(ctx context.Context, req CreateRequest) (*CreateR
 	if err != nil {
 		return nil, err
 	}
+	closed := responseStreamClosed(resp)
+	if req.Closed && !closed {
+		return nil, responseParseError(
+			resp,
+			"successful closed-create response missing %s: true",
+			headerStreamClosed,
+		)
+	}
 
 	return &CreateResponse{
 		NextOffset: nextOffset,
+		Closed:     closed,
 	}, nil
 }
 
@@ -724,6 +774,7 @@ func (t *HTTPTransport) Head(ctx context.Context, req HeadRequest) (*HeadRespons
 	result := &HeadResponse{
 		ContentType: contentType,
 		NextOffset:  nextOffset,
+		Closed:      responseStreamClosed(resp),
 	}
 
 	if ttlStr, ok, err := optionalResponseHeader(resp, headerStreamTTL); err != nil {
@@ -849,6 +900,10 @@ type Error struct {
 	Code       string
 	Message    string
 	StatusCode int
+
+	// FinalOffset is set for STREAM_CLOSED append conflicts. It is the
+	// permanent tail reported by Stream-Next-Offset.
+	FinalOffset string
 
 	// ProducerEpoch is set for 403 (stale epoch) errors (Section 5.2.1).
 	// Contains the server's current epoch for the producer.
@@ -1065,6 +1120,7 @@ func (s *httpEventStream) buildEvent(eventType string, dataLines []string) (*Eve
 			StreamNextOffset string `json:"streamNextOffset"`
 			StreamCursor     string `json:"streamCursor,omitempty"`
 			UpToDate         bool   `json:"upToDate,omitempty"`
+			StreamClosed     bool   `json:"streamClosed,omitempty"`
 		}
 		if err := json.Unmarshal(data, &control); err != nil {
 			return nil, &Error{
@@ -1083,10 +1139,21 @@ func (s *httpEventStream) buildEvent(eventType string, dataLines []string) (*Eve
 
 		event.NextOffset = control.StreamNextOffset
 		event.Cursor = control.StreamCursor
-		event.UpToDate = control.UpToDate
+		event.UpToDate = control.UpToDate || control.StreamClosed
+		event.Closed = control.StreamClosed
 	}
 
 	return event, nil
+}
+
+// responseStreamClosed recognizes the protocol's sole closure value. Other
+// values, including "false", are intentionally treated as header absence.
+func responseStreamClosed(resp *http.Response) bool {
+	return strings.EqualFold(resp.Header.Get(headerStreamClosed), "true")
+}
+
+func responseUpToDate(resp *http.Response) bool {
+	return strings.EqualFold(resp.Header.Get(headerStreamUpToDate), "true")
 }
 
 // buildSSEData combines multiple data lines into a single value.

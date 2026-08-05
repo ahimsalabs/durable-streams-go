@@ -44,6 +44,7 @@ type Command struct {
 	ContentType string `json:"contentType,omitempty"`
 	TTLSeconds  int    `json:"ttlSeconds,omitempty"`
 	ExpiresAt   string `json:"expiresAt,omitempty"`
+	Closed      bool   `json:"closed,omitempty"`
 	// Append fields
 	Data   string `json:"data,omitempty"`
 	Binary bool   `json:"binary,omitempty"`
@@ -93,6 +94,8 @@ type Result struct {
 	CommandType   string      `json:"commandType,omitempty"`
 	ErrorCode     string      `json:"errorCode,omitempty"`
 	Message       string      `json:"message,omitempty"`
+	FinalOffset   string      `json:"finalOffset,omitempty"`
+	StreamClosed  *bool       `json:"streamClosed,omitempty"`
 	// IdempotentProducer fields
 	Duplicate bool `json:"duplicate,omitempty"`
 	// Dynamic header/param values (for get-dynamic-values)
@@ -118,6 +121,7 @@ type Features struct {
 	Batching       bool `json:"batching"`
 	SSE            bool `json:"sse"`
 	LongPoll       bool `json:"longPoll"`
+	Auto           bool `json:"auto"`
 	Streaming      bool `json:"streaming"`
 	DynamicHeaders bool `json:"dynamicHeaders"`
 }
@@ -134,7 +138,23 @@ var (
 	client    *durablestream.Client
 	// Cache content types per stream path for append operations
 	streamContentTypes = make(map[string]string)
+	producers          = make(map[producerKey]*producerState)
 )
+
+type producerKey struct {
+	path string
+	id   string
+}
+
+// producerState models the adapter's long-lived IdempotentProducer commands.
+// Batch commands intentionally create a fresh producer each time, matching the
+// conformance protocol's deduplication tests.
+type producerState struct {
+	epoch       int
+	nextSeq     int
+	closed      bool
+	finalOffset string
+}
 
 // dynamicValue holds state for a dynamic header or param.
 type dynamicValue struct {
@@ -262,6 +282,12 @@ func handleCommand(cmd Command) Result {
 		return handleIdempotentAppend(cmd)
 	case "idempotent-append-batch":
 		return handleIdempotentAppendBatch(cmd)
+	case "idempotent-close":
+		return handleIdempotentClose(cmd)
+	case "idempotent-detach":
+		return handleIdempotentDetach(cmd)
+	case "close":
+		return handleClose(cmd)
 	case "read":
 		return handleRead(cmd)
 	case "head":
@@ -288,6 +314,7 @@ func handleCommand(cmd Command) Result {
 func handleInit(cmd Command) Result {
 	serverURL = cmd.ServerURL
 	streamContentTypes = make(map[string]string)
+	producers = make(map[producerKey]*producerState)
 	dynamicHeaders = make(map[string]*dynamicValue)
 	dynamicParams = make(map[string]*dynamicValue)
 	lastSentHeaders = make(map[string]string)
@@ -308,6 +335,7 @@ func handleInit(cmd Command) Result {
 			Batching:       true, // Idempotent producer support via transport layer
 			SSE:            true,
 			LongPoll:       true,
+			Auto:           true,
 			Streaming:      true,
 			DynamicHeaders: true,
 		},
@@ -331,6 +359,10 @@ func handleCreate(cmd Command) Result {
 
 	opts := &durablestream.CreateOptions{
 		ContentType: contentType,
+		Closed:      cmd.Closed,
+	}
+	if cmd.Data != "" {
+		opts.InitialData = []byte(cmd.Data)
 	}
 
 	if cmd.TTLSeconds > 0 {
@@ -346,6 +378,9 @@ func handleCreate(cmd Command) Result {
 	if err != nil {
 		return errorResult("create", err)
 	}
+	if !alreadyExists {
+		clearProducersForPath(cmd.Path)
+	}
 
 	// Cache content type for append operations
 	streamContentTypes[cmd.Path] = contentType
@@ -357,10 +392,11 @@ func handleCreate(cmd Command) Result {
 	}
 
 	return Result{
-		Type:    "create",
-		Success: true,
-		Status:  status,
-		Offset:  info.NextOffset.String(),
+		Type:         "create",
+		Success:      true,
+		Status:       status,
+		Offset:       info.NextOffset.String(),
+		StreamClosed: boolPointer(info.Closed),
 	}
 }
 
@@ -454,7 +490,7 @@ func appendErrorResult(err error, hasSequence bool) Result {
 
 // idempotentAppendTransport creates a transport that bypasses the durablestream.Client
 // to directly support idempotent producer headers.
-func idempotentAppendTransport(ctx context.Context, path string, data []byte, contentType string, producerID string, epoch, seq int, autoClaim bool) (*transport.AppendResponse, error) {
+func idempotentAppendTransport(ctx context.Context, path string, data []byte, contentType string, producerID string, epoch, seq int, autoClaim, closeStream bool) (*transport.AppendResponse, error) {
 	// Get transport directly - we need to bypass Client.Writer since it doesn't support producer headers
 	httpTransport := transport.NewHTTPTransport(serverURL, nil)
 	retryTransport := transport.WithRetry(transport.DefaultRetryOptions())(httpTransport)
@@ -467,6 +503,7 @@ func idempotentAppendTransport(ctx context.Context, path string, data []byte, co
 		ProducerEpoch:      epoch,
 		ProducerSeq:        seq,
 		HasProducerHeaders: true,
+		Close:              closeStream,
 	}
 
 	resp, err := retryTransport.Append(ctx, req)
@@ -520,10 +557,13 @@ func handleIdempotentAppend(cmd Command) Result {
 		data = []byte("[" + string(data) + "]")
 	}
 
-	resp, err := idempotentAppendTransport(ctx, cmd.Path, data, contentType, cmd.ProducerID, cmd.Epoch, 0, cmd.AutoClaim)
+	state := producerFor(cmd)
+	resp, err := idempotentAppendTransport(ctx, cmd.Path, data, contentType, cmd.ProducerID, state.epoch, state.nextSeq, cmd.AutoClaim, false)
 	if err != nil {
 		return errorResult("idempotent-append", err)
 	}
+	state.epoch = resp.ProducerEpoch
+	state.nextSeq = resp.ProducerSeq + 1
 
 	status := resp.StatusCode
 	if status == 0 {
@@ -574,7 +614,7 @@ func handleIdempotentAppendBatch(cmd Command) Result {
 		allData = buf.Bytes()
 	}
 
-	resp, err := idempotentAppendTransport(ctx, cmd.Path, allData, contentType, cmd.ProducerID, cmd.Epoch, 0, cmd.AutoClaim)
+	resp, err := idempotentAppendTransport(ctx, cmd.Path, allData, contentType, cmd.ProducerID, cmd.Epoch, 0, cmd.AutoClaim, false)
 	if err != nil {
 		return errorResult("idempotent-append-batch", err)
 	}
@@ -590,6 +630,91 @@ func handleIdempotentAppendBatch(cmd Command) Result {
 		Status:    status,
 		Offset:    resp.NextOffset,
 		Duplicate: resp.Duplicate,
+	}
+}
+
+func producerFor(cmd Command) *producerState {
+	key := producerKey{path: cmd.Path, id: cmd.ProducerID}
+	state := producers[key]
+	if state == nil || (state.epoch != cmd.Epoch && !(cmd.AutoClaim && state.epoch >= cmd.Epoch)) {
+		state = &producerState{epoch: cmd.Epoch}
+		producers[key] = state
+	}
+	return state
+}
+
+func handleIdempotentClose(cmd Command) Result {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	state := producerFor(cmd)
+	if state.closed {
+		return Result{
+			Type:        "idempotent-close",
+			Success:     true,
+			Status:      200,
+			FinalOffset: state.finalOffset,
+		}
+	}
+
+	contentType := streamContentTypes[cmd.Path]
+	if contentType == "" {
+		contentType = "application/octet-stream"
+	}
+	data := []byte(cmd.Data)
+	if len(data) > 0 && normalizeContentType(contentType) == "application/json" {
+		data = []byte("[" + string(data) + "]")
+	}
+
+	resp, err := idempotentAppendTransport(
+		ctx, cmd.Path, data, contentType, cmd.ProducerID,
+		state.epoch, state.nextSeq, cmd.AutoClaim, true,
+	)
+	if err != nil {
+		return errorResult("idempotent-close", err)
+	}
+	state.epoch = resp.ProducerEpoch
+	state.nextSeq = resp.ProducerSeq + 1
+	state.closed = true
+	state.finalOffset = resp.NextOffset
+
+	return Result{
+		Type:        "idempotent-close",
+		Success:     true,
+		Status:      200,
+		FinalOffset: resp.NextOffset,
+	}
+}
+
+func handleIdempotentDetach(cmd Command) Result {
+	delete(producers, producerKey{path: cmd.Path, id: cmd.ProducerID})
+	return Result{Type: "idempotent-detach", Success: true, Status: 200}
+}
+
+func clearProducersForPath(path string) {
+	for key := range producers {
+		if key.path == path {
+			delete(producers, key)
+		}
+	}
+}
+
+func handleClose(cmd Command) Result {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	writer, err := client.Writer(ctx, cmd.Path)
+	if err != nil {
+		return errorResult("close", err)
+	}
+	if err := writer.CloseContext(ctx, []byte(cmd.Data)); err != nil {
+		return errorResult("close", err)
+	}
+	return Result{
+		Type:        "close",
+		Success:     true,
+		Status:      200,
+		FinalOffset: writer.Offset().String(),
 	}
 }
 
@@ -653,6 +778,7 @@ func handleRead(cmd Command) Result {
 
 	var finalOffset string
 	upToDate := false
+	streamClosed := false
 	status := 200
 
 	for len(chunks) < maxChunks {
@@ -683,6 +809,11 @@ func handleRead(cmd Command) Result {
 
 		finalOffset = result.NextOffset.String()
 		upToDate = result.UpToDate
+		streamClosed = result.Closed
+
+		if result.Closed {
+			break
+		}
 
 		// For waitForUpToDate, stop when we've reached up-to-date
 		if cmd.WaitForUpToDate && result.UpToDate {
@@ -706,14 +837,15 @@ func handleRead(cmd Command) Result {
 
 	hdrsSent, paramsSent := getSentDynamic()
 	return Result{
-		Type:        "read",
-		Success:     true,
-		Status:      status,
-		Chunks:      chunks,
-		Offset:      finalOffset,
-		UpToDate:    upToDate,
-		HeadersSent: hdrsSent,
-		ParamsSent:  paramsSent,
+		Type:         "read",
+		Success:      true,
+		Status:       status,
+		Chunks:       chunks,
+		Offset:       finalOffset,
+		UpToDate:     upToDate,
+		StreamClosed: boolPointer(streamClosed),
+		HeadersSent:  hdrsSent,
+		ParamsSent:   paramsSent,
 	}
 }
 
@@ -727,11 +859,12 @@ func handleHead(cmd Command) Result {
 	}
 
 	return Result{
-		Type:        "head",
-		Success:     true,
-		Status:      200,
-		Offset:      info.NextOffset.String(),
-		ContentType: info.ContentType,
+		Type:         "head",
+		Success:      true,
+		Status:       200,
+		Offset:       info.NextOffset.String(),
+		ContentType:  info.ContentType,
+		StreamClosed: boolPointer(info.Closed),
 	}
 }
 
@@ -746,6 +879,7 @@ func handleDelete(cmd Command) Result {
 
 	// Remove from cache
 	delete(streamContentTypes, cmd.Path)
+	clearProducersForPath(cmd.Path)
 
 	return Result{
 		Type:    "delete",
@@ -921,6 +1055,16 @@ func errorResult(cmdType string, err error) Result {
 			Message:     err.Error(),
 		}
 	}
+	if errors.Is(err, durablestream.ErrStreamClosed) {
+		return Result{
+			Type:        "error",
+			Success:     false,
+			CommandType: cmdType,
+			Status:      409,
+			ErrorCode:   "STREAM_CLOSED",
+			Message:     err.Error(),
+		}
+	}
 	if errors.Is(err, durablestream.ErrGone) {
 		return Result{
 			Type:        "error",
@@ -980,6 +1124,8 @@ func mapTransportErrorCode(err *transport.Error) string {
 		return "SEQUENCE_CONFLICT"
 	case "CONFLICT", "conflict":
 		return "CONFLICT"
+	case "STREAM_CLOSED", "stream_closed":
+		return "STREAM_CLOSED"
 	case "GONE", "gone":
 		return "INVALID_OFFSET"
 	case "BAD_REQUEST", "bad_request":
@@ -989,6 +1135,10 @@ func mapTransportErrorCode(err *transport.Error) string {
 	default:
 		return "UNEXPECTED_STATUS"
 	}
+}
+
+func boolPointer(value bool) *bool {
+	return &value
 }
 
 // normalizeContentType extracts the media type before semicolon and lowercases.
