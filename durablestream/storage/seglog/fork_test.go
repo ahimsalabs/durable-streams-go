@@ -92,9 +92,10 @@ func TestFork_SubOffsetPrefixesRemainChildLocalAcrossMaterializationAndReopen(t 
 		t.Run(tt.name, func(t *testing.T) {
 			dir := t.TempDir()
 			opts := Options{Dir: dir, Partitions: 4, MaxMessageSize: 64 << 10, WALSegmentBytes: 1 << 20, MaterializeInterval: time.Millisecond}
-			if streamHash("source-cross-partition")%uint64(opts.Partitions) == streamHash("target-other-partition")%uint64(opts.Partitions) {
-				t.Fatal("test source and target unexpectedly route to the same partition")
-			}
+			// The point of this test is a fork whose source lives in another
+			// partition; derive a target ID that provably routes elsewhere so
+			// the test does not depend on any particular hash function.
+			target := crossPartitionID(t, "source-cross-partition", opts.Partitions)
 			s, err := New(opts)
 			if err != nil {
 				t.Fatal(err)
@@ -109,7 +110,7 @@ func TestFork_SubOffsetPrefixesRemainChildLocalAcrossMaterializationAndReopen(t 
 			if err != nil {
 				t.Fatal(err)
 			}
-			created, _, err := s.CreateFork(t.Context(), "target-other-partition", durablestream.ForkRequest{
+			created, _, err := s.CreateFork(t.Context(), target, durablestream.ForkRequest{
 				SourceStreamID: "source-cross-partition", SourceIncarnationID: head.IncarnationID,
 				Offset: storage.FormatSimpleOffset(1), OffsetSet: true, SubOffset: tt.sub,
 				Config: durablestream.StreamConfig{ContentType: tt.contentType}, ContentTypeSet: true,
@@ -117,7 +118,7 @@ func TestFork_SubOffsetPrefixesRemainChildLocalAcrossMaterializationAndReopen(t 
 			if err != nil || !created {
 				t.Fatalf("CreateFork() = %v, %v, want created", created, err)
 			}
-			waitFor(t, "fork materialization", func() bool { return materializedThrough(s, "target-other-partition") >= int64(len(tt.want)) })
+			waitFor(t, "fork materialization", func() bool { return materializedThrough(s, target) >= int64(len(tt.want)) })
 			if err := s.Close(); err != nil {
 				t.Fatal(err)
 			}
@@ -126,7 +127,7 @@ func TestFork_SubOffsetPrefixesRemainChildLocalAcrossMaterializationAndReopen(t 
 				t.Fatal(err)
 			}
 			t.Cleanup(func() { _ = s.Close() })
-			res, err := s.Read(t.Context(), "target-other-partition", durablestream.ZeroOffset, 0)
+			res, err := s.Read(t.Context(), target, durablestream.ZeroOffset, 0)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -137,7 +138,7 @@ func TestFork_SubOffsetPrefixesRemainChildLocalAcrossMaterializationAndReopen(t 
 			if !reflect.DeepEqual(got, tt.want) {
 				t.Errorf("messages = %q, want %q", got, tt.want)
 			}
-			st, _ := s.streams.Load("target-other-partition")
+			st, _ := s.streams.Load(target)
 			if gotBatch, err := s.messageBatch(st, 2, 0); err != nil || gotBatch != 2 {
 				t.Errorf("prefix batchFirst = %d, %v; want 2", gotBatch, err)
 			}

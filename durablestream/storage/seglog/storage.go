@@ -131,16 +131,22 @@ func New(opts Options) (_ *Storage, retErr error) {
 	return s, nil
 }
 
-const formatVersionLine = "seglog-format-v1"
+const (
+	formatVersionLine = "seglog-format-v1"
 
-// checkFormat validates or initializes the root FORMAT file. The persisted
-// partition count is authoritative (invariant I4): opening with a different
-// Options.Partitions fails rather than silently rehashing streams.
+	// formatHashLine names the stream-routing hash. Both the partition count
+	// and the hash algorithm are persisted routing state (invariant I4): a
+	// different hash would silently send a stream's new frames to a partition
+	// other than the one holding its history, so open refuses a mismatch.
+	formatHashLine = "hash=xxh64"
+)
+
+// checkFormat validates or initializes the root FORMAT file.
 func checkFormat(dir string, partitions int) error {
 	path := filepath.Join(dir, "FORMAT")
 	raw, err := os.ReadFile(path)
 	if os.IsNotExist(err) {
-		content := fmt.Sprintf("%s\npartitions=%d\n", formatVersionLine, partitions)
+		content := fmt.Sprintf("%s\npartitions=%d\n%s\n", formatVersionLine, partitions, formatHashLine)
 		if err := atomicWrite(path, []byte(content), 0o644); err != nil {
 			return fmt.Errorf("seglog: initialize FORMAT: %w", err)
 		}
@@ -151,7 +157,7 @@ func checkFormat(dir string, partitions int) error {
 	}
 
 	lines := strings.Split(strings.TrimSpace(string(raw)), "\n")
-	if len(lines) < 2 || lines[0] != formatVersionLine {
+	if len(lines) < 3 || lines[0] != formatVersionLine {
 		return fmt.Errorf("seglog: unsupported format %q in %s", strings.TrimSpace(string(raw)), path)
 	}
 	value, ok := strings.CutPrefix(lines[1], "partitions=")
@@ -164,6 +170,9 @@ func checkFormat(dir string, partitions int) error {
 	}
 	if persisted != partitions {
 		return fmt.Errorf("seglog: directory was created with %d partitions, cannot open with %d", persisted, partitions)
+	}
+	if lines[2] != formatHashLine {
+		return fmt.Errorf("seglog: directory uses routing hash %q, this build requires %q", lines[2], formatHashLine)
 	}
 	return nil
 }

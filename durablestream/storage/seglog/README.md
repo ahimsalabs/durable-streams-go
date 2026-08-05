@@ -37,7 +37,8 @@ With the default `SyncWritesEnabled` behavior:
    guess or rewrite that history.
 3. Catalog mutations and waiter notifications happen only after the WAL commit
    is durable.
-4. Stream routing is stable: FNV-1a hashing is fixed and reopening with a
+4. Stream routing is stable: seed-zero XXH64 hashing is fixed (the FORMAT
+   file records both the partition count and the hash identity) and reopening with a
    different partition count is rejected.
 5. One partition worker owns logical mutations; readers consume consistent
    snapshots and never perform file I/O while holding the state lock.

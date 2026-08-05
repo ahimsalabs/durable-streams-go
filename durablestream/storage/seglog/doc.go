@@ -4,7 +4,7 @@
 //
 // # Architecture
 //
-// Stream IDs hash (FNV-1a, stable across restarts) to one of N logical
+// Stream IDs hash (XXH64, stable across restarts) to one of N logical
 // partitions. A single worker goroutine owns each partition: it is the only
 // writer of the partition's WAL and the only mutator of the in-memory state of
 // the partition's streams, which gives per-stream ordering, deduplication, and

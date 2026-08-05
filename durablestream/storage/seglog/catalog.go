@@ -4,11 +4,12 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"fmt"
-	"hash/fnv"
 	"os"
 	"slices"
 	"sync"
 	"sync/atomic"
+
+	"github.com/cespare/xxhash/v2"
 
 	"github.com/ahimsalabs/durable-streams-go/durablestream"
 )
@@ -24,13 +25,15 @@ func newIncarnation() (incarnation, error) {
 
 func (i incarnation) String() string { return hex.EncodeToString(i[:]) }
 
-// streamHash is the stable hash used for partition routing and stream
-// directory sharding. It must never change (invariant I4): a stream's frames
-// live in one partition's WAL for the lifetime of the directory.
+// streamHash is the stable hash used for partition routing (low bits, modulo
+// the partition count) and stream directory sharding (top byte). It is
+// seed-zero XXH64 over the raw stream-ID bytes and must never change
+// (invariant I4): a stream's frames live in one partition's WAL for the
+// lifetime of the directory. The FORMAT file records the algorithm identity
+// ("hash=xxh64") and TestStreamHashGoldenValues pins the outputs, so an
+// accidental change fails loudly instead of silently misrouting streams.
 func streamHash(streamID string) uint64 {
-	h := fnv.New64a()
-	_, _ = h.Write([]byte(streamID)) // never fails
-	return h.Sum64()
+	return xxhash.Sum64String(streamID)
 }
 
 // walLoc locates one committed message inside a partition's WAL.

@@ -45,6 +45,7 @@ func main() {
 }
 
 func run() error {
+	host := flag.String("host", "127.0.0.1", "host to listen on")
 	port := flag.Int("port", 4437, "port to listen on")
 	storageKind := flag.String("storage", "memory", "storage backend: memory, badger, or seglog")
 	dataDir := flag.String("data-dir", "", "data directory for disk-backed storage (default: a temp dir removed on exit)")
@@ -63,7 +64,7 @@ func run() error {
 	mux := http.NewServeMux()
 	mux.Handle("/v1/stream/", http.StripPrefix("/v1/stream/", handler))
 
-	addr := fmt.Sprintf("127.0.0.1:%d", *port)
+	addr := fmt.Sprintf("%s:%d", *host, *port)
 	server := &http.Server{
 		Addr:              addr,
 		Handler:           mux,
