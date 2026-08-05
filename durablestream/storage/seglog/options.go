@@ -1,0 +1,152 @@
+package seglog
+
+import (
+	"errors"
+	"fmt"
+	"log/slog"
+	"time"
+)
+
+// Defaults for Options fields left at their zero values.
+const (
+	DefaultPartitions      = 32
+	DefaultMaxMessageSize  = 10 << 20 // 10 MiB
+	DefaultWALSegmentBytes = 256 << 20
+	DefaultGroupLinger     = 500 * time.Microsecond
+	DefaultGroupMaxBytes   = 4 << 20
+	DefaultQueueDepth      = 256
+	DefaultShutdownTimeout = 30 * time.Second
+)
+
+// SyncWrites selects whether acknowledged writes are fdatasync'd.
+//
+// It is a tri-state instead of a bool so the zero value can mean "the safe
+// default" (sync enabled) while still allowing an explicit opt-out for
+// throughput experiments where acknowledged writes may be lost on a crash.
+type SyncWrites int
+
+const (
+	// SyncWritesDefault enables fdatasync (identical to SyncWritesEnabled).
+	SyncWritesDefault SyncWrites = iota
+	// SyncWritesEnabled fdatasyncs each commit group before acknowledging it.
+	SyncWritesEnabled
+	// SyncWritesDisabled skips fdatasync. Acknowledged writes can be lost on
+	// a crash; recovery correctness (valid-prefix replay) is unaffected.
+	SyncWritesDisabled
+)
+
+func (s SyncWrites) enabled() (bool, error) {
+	switch s {
+	case SyncWritesDefault, SyncWritesEnabled:
+		return true, nil
+	case SyncWritesDisabled:
+		return false, nil
+	default:
+		return false, fmt.Errorf("seglog: invalid SyncWrites value %d", s)
+	}
+}
+
+// Options configures a seglog Storage. The zero value of every field selects
+// a documented default; fields that control background cadence accept -1 to
+// disable the loop entirely (used by tests and conformance runs).
+type Options struct {
+	// Dir is the storage root. When empty, an ephemeral temporary directory
+	// is created and removed on Close.
+	Dir string
+
+	// SLogger receives operational logs. Nil discards them.
+	SLogger *slog.Logger
+
+	// Partitions is the number of WAL partitions. It is fixed at first open:
+	// the value is persisted in the FORMAT file and later opens must match.
+	Partitions int
+
+	// MaxMessageSize bounds one message's payload bytes; larger appends fail
+	// with ErrPayloadTooLarge.
+	MaxMessageSize int
+
+	// WALSegmentBytes is the preallocated size of one WAL segment file. It
+	// also bounds a single logical mutation: a frame must fit one segment.
+	WALSegmentBytes int64
+
+	// GroupLinger is how long a partition worker waits for more requests
+	// after the first one before committing a group.
+	GroupLinger time.Duration
+
+	// GroupMaxBytes bounds the encoded bytes of one commit group. A single
+	// logical mutation may exceed it (it forms a group of one).
+	GroupMaxBytes int64
+
+	// QueueDepth is each partition's request queue capacity. Submissions
+	// beyond it block, which is the backpressure contract: callers are held
+	// at the queue rather than growing unbounded memory.
+	QueueDepth int
+
+	// SyncWrites controls fdatasync on commit groups.
+	SyncWrites SyncWrites
+
+	// ShutdownTimeout bounds how long Close waits for workers to drain.
+	ShutdownTimeout time.Duration
+}
+
+func (o Options) withDefaults() Options {
+	if o.SLogger == nil {
+		o.SLogger = slog.New(slog.DiscardHandler)
+	}
+	if o.Partitions == 0 {
+		o.Partitions = DefaultPartitions
+	}
+	if o.MaxMessageSize == 0 {
+		o.MaxMessageSize = DefaultMaxMessageSize
+	}
+	if o.WALSegmentBytes == 0 {
+		o.WALSegmentBytes = DefaultWALSegmentBytes
+	}
+	if o.GroupLinger == 0 {
+		o.GroupLinger = DefaultGroupLinger
+	}
+	if o.GroupMaxBytes == 0 {
+		o.GroupMaxBytes = DefaultGroupMaxBytes
+	}
+	if o.QueueDepth == 0 {
+		o.QueueDepth = DefaultQueueDepth
+	}
+	if o.ShutdownTimeout == 0 {
+		o.ShutdownTimeout = DefaultShutdownTimeout
+	}
+	return o
+}
+
+func (o Options) validate() error {
+	var errs []error
+	if o.Partitions < 1 {
+		errs = append(errs, fmt.Errorf("option Partitions must be positive, got %d", o.Partitions))
+	}
+	if o.MaxMessageSize < 1 {
+		errs = append(errs, fmt.Errorf("option MaxMessageSize must be positive, got %d", o.MaxMessageSize))
+	}
+	if o.WALSegmentBytes < walSegmentHeaderSize+minFrameSize {
+		errs = append(errs, fmt.Errorf("option WALSegmentBytes %d is below the minimum %d",
+			o.WALSegmentBytes, walSegmentHeaderSize+minFrameSize))
+	}
+	if int64(o.MaxMessageSize) > o.WALSegmentBytes-walSegmentHeaderSize {
+		errs = append(errs, fmt.Errorf("option MaxMessageSize %d cannot fit one WAL segment of %d bytes",
+			o.MaxMessageSize, o.WALSegmentBytes))
+	}
+	if o.GroupLinger < 0 {
+		errs = append(errs, fmt.Errorf("option GroupLinger cannot be negative, got %v", o.GroupLinger))
+	}
+	if o.GroupMaxBytes < 1 {
+		errs = append(errs, fmt.Errorf("option GroupMaxBytes must be positive, got %d", o.GroupMaxBytes))
+	}
+	if o.QueueDepth < 1 {
+		errs = append(errs, fmt.Errorf("option QueueDepth must be positive, got %d", o.QueueDepth))
+	}
+	if _, err := o.SyncWrites.enabled(); err != nil {
+		errs = append(errs, err)
+	}
+	if len(errs) > 0 {
+		return fmt.Errorf("seglog: invalid options: %w", errors.Join(errs...))
+	}
+	return nil
+}
