@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Runs the server conformance suite against a locally built testserver.
 #
-# Usage: ./run-server-conformance.sh <memory|badger> <port> [vitest args...]
+# Usage: ./run-server-conformance.sh <memory|badger|seglog> <port> [vitest args...]
 #
 # The server runs as a child of this script and is terminated by the trap on
 # every exit path (success, test failure, or Ctrl-C), so no process is left
@@ -13,12 +13,12 @@
 
 set -euo pipefail
 
-STORAGE="${1:?usage: run-server-conformance.sh <memory|badger> <port> [vitest args...]}"
-PORT="${2:?usage: run-server-conformance.sh <memory|badger> <port> [vitest args...]}"
+STORAGE="${1:?usage: run-server-conformance.sh <memory|badger|seglog> <port> [vitest args...]}"
+PORT="${2:?usage: run-server-conformance.sh <memory|badger|seglog> <port> [vitest args...]}"
 shift 2
 
-if [[ "$STORAGE" != "memory" && "$STORAGE" != "badger" ]]; then
-    printf '[ERROR] Unknown storage %s; want memory or badger\n' "$STORAGE" >&2
+if [[ "$STORAGE" != "memory" && "$STORAGE" != "badger" && "$STORAGE" != "seglog" ]]; then
+    printf '[ERROR] Unknown storage %s; want memory, badger, or seglog\n' "$STORAGE" >&2
     exit 2
 fi
 if [[ ! "$PORT" =~ ^[0-9]+$ ]] || ((10#$PORT < 1 || 10#$PORT > 65535)); then

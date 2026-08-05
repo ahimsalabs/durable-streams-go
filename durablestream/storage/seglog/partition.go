@@ -16,6 +16,7 @@ import (
 type request struct {
 	op           opKind
 	streamID     string
+	returnInfo   bool                       // opTouch: return the pre-renewal Head result
 	cfg          durablestream.StreamConfig // opCreate
 	messages     [][]byte
 	seq          string
@@ -36,6 +37,7 @@ type request struct {
 type result struct {
 	created bool
 	offset  durablestream.Offset
+	info    *durablestream.StreamInfo
 	err     error
 	// ambiguous is set when a WAL write/sync failed after bytes may have
 	// reached durable media. Callers must conservatively retain topology pins.
@@ -796,9 +798,19 @@ func (p *partition) stageTouch(op *stagedOp, req *request, ps *pendingStream, ex
 		op.res = result{err: softDeletedErr(req.streamID)}
 		return frameSpec{}
 	}
+	if req.returnInfo {
+		op.res.info = &durablestream.StreamInfo{
+			ContentType:   ps.cfg.ContentType,
+			NextOffset:    storage.FormatSimpleOffset(ps.nextIndex - 1),
+			TTL:           ps.cfg.TTL,
+			ExpiresAt:     ps.cfg.ExpiresAt,
+			IsPrivate:     ps.cfg.IsPrivate,
+			Closed:        ps.closed,
+			IncarnationID: ps.state.inc.String(),
+		}
+	}
 	slid, moved := ps.cfg.SlideExpiry(now)
 	if !moved {
-		op.res = result{}
 		return frameSpec{}
 	}
 	meta, err := json.Marshal(touchMeta{ExpiresAt: slid.ExpiresAt})

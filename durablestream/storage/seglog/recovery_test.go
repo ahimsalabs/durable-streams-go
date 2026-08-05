@@ -361,3 +361,93 @@ func TestTouchDurableAcrossReopen(t *testing.T) {
 		t.Fatalf("Touch not durable: %v != %v", reopened.ExpiresAt, after.ExpiresAt)
 	}
 }
+
+func TestTouchHead_ReturnsPreRenewalInfoAndDurablyRenews(t *testing.T) {
+	dir := t.TempDir()
+	opts := singlePartitionOptions(dir)
+	opts.MaterializeInterval = -1
+	opts.RetentionInterval = -1
+	s := openTest(t, opts)
+
+	if _, err := s.Create(t.Context(), "sliding", durablestream.StreamConfig{
+		ContentType: "text/plain",
+		TTL:         time.Hour,
+		IsPrivate:   true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	before, err := s.Head(t.Context(), "sliding")
+	if err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(10 * time.Millisecond)
+	got, err := s.TouchHead(t.Context(), "sliding")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !got.ExpiresAt.Equal(before.ExpiresAt) || got.ContentType != before.ContentType ||
+		got.NextOffset != before.NextOffset || got.TTL != before.TTL || got.IsPrivate != before.IsPrivate ||
+		got.Closed != before.Closed || got.IncarnationID != before.IncarnationID {
+		t.Fatalf("TouchHead info = %+v, want pre-renewal %+v", got, before)
+	}
+	after, err := s.Head(t.Context(), "sliding")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !after.ExpiresAt.After(got.ExpiresAt) {
+		t.Fatalf("TouchHead did not advance expiry: %v -> %v", got.ExpiresAt, after.ExpiresAt)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	r := openTest(t, opts)
+	reopened, err := r.Head(t.Context(), "sliding")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reopened.ExpiresAt.Equal(after.ExpiresAt) {
+		t.Fatalf("TouchHead renewal not durable: %v != %v", reopened.ExpiresAt, after.ExpiresAt)
+	}
+}
+
+func TestTouchHead_NoTTLMatchesHeadWithoutWritingFrame(t *testing.T) {
+	dir := t.TempDir()
+	opts := singlePartitionOptions(dir)
+	opts.MaterializeInterval = -1
+	opts.RetentionInterval = -1
+	s := openTest(t, opts)
+	if _, err := s.Create(t.Context(), "static", durablestream.StreamConfig{ContentType: "application/octet-stream"}); err != nil {
+		t.Fatal(err)
+	}
+	paths := walSegments(t, dir)
+	beforeFrames := len(scanFrames(t, paths[0]))
+	want, err := s.Head(t.Context(), "static")
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := s.TouchHead(t.Context(), "static")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if *got != *want {
+		t.Fatalf("TouchHead info = %+v, want Head %+v", got, want)
+	}
+	afterFrames := len(scanFrames(t, paths[0]))
+	if afterFrames != beforeFrames {
+		t.Fatalf("TTL-less TouchHead wrote a WAL frame: before %d, after %d", beforeFrames, afterFrames)
+	}
+}
+
+func TestTouchHead_ErrorsMatchHead(t *testing.T) {
+	s := openTest(t, singlePartitionOptions(t.TempDir()))
+	if _, err := s.TouchHead(t.Context(), "missing"); !errors.Is(err, durablestream.ErrNotFound) {
+		t.Errorf("missing stream error = %v, want ErrNotFound", err)
+	}
+	if _, err := s.Create(t.Context(), "expired", durablestream.StreamConfig{ExpiresAt: time.Now().Add(-time.Hour)}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.TouchHead(t.Context(), "expired"); !errors.Is(err, durablestream.ErrNotFound) {
+		t.Errorf("expired stream error = %v, want ErrNotFound", err)
+	}
+}

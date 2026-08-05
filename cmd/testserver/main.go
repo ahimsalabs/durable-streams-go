@@ -5,6 +5,7 @@
 //	go run ./cmd/testserver
 //	go run ./cmd/testserver -port 8080
 //	go run ./cmd/testserver -storage badger
+//	go run ./cmd/testserver -storage seglog
 //	go run ./cmd/testserver -storage badger -data-dir /var/lib/ds
 //
 // Default port is 4437 per PROTOCOL.md Section 13.1.
@@ -25,6 +26,7 @@ import (
 	"github.com/ahimsalabs/durable-streams-go/durablestream"
 	"github.com/ahimsalabs/durable-streams-go/durablestream/storage/badgerstore"
 	"github.com/ahimsalabs/durable-streams-go/durablestream/storage/memorystorage"
+	"github.com/ahimsalabs/durable-streams-go/durablestream/storage/seglog"
 )
 
 // Server timeouts. WriteTimeout is deliberately unset: SSE and long-poll
@@ -44,8 +46,8 @@ func main() {
 
 func run() error {
 	port := flag.Int("port", 4437, "port to listen on")
-	storageKind := flag.String("storage", "memory", "storage backend: memory or badger")
-	dataDir := flag.String("data-dir", "", "data directory for badger storage (default: a temp dir removed on exit)")
+	storageKind := flag.String("storage", "memory", "storage backend: memory, badger, or seglog")
+	dataDir := flag.String("data-dir", "", "data directory for disk-backed storage (default: a temp dir removed on exit)")
 	flag.Parse()
 
 	storage, cleanup, err := newStorage(*storageKind, *dataDir)
@@ -146,7 +148,39 @@ func newStorage(kind, dataDir string) (durablestream.Storage, func(), error) {
 			}
 		}, nil
 
+	case "seglog":
+		dir := dataDir
+		removeDir := false
+		if dir == "" {
+			var err error
+			dir, err = os.MkdirTemp("", "ds-testserver-*")
+			if err != nil {
+				return nil, nil, fmt.Errorf("create seglog data dir: %v", err)
+			}
+			removeDir = true
+		}
+		s, err := seglog.New(seglog.Options{Dir: dir})
+		if err != nil {
+			if removeDir {
+				if rmErr := os.RemoveAll(dir); rmErr != nil {
+					log.Printf("Error removing data dir %s: %v", dir, rmErr)
+				}
+			}
+			return nil, nil, fmt.Errorf("open seglog storage: %v", err)
+		}
+		log.Printf("Using seglog storage at %s", dir)
+		return s, func() {
+			if err := s.Close(); err != nil {
+				log.Printf("Error closing storage: %v", err)
+			}
+			if removeDir {
+				if err := os.RemoveAll(dir); err != nil {
+					log.Printf("Error removing data dir %s: %v", dir, err)
+				}
+			}
+		}, nil
+
 	default:
-		return nil, nil, fmt.Errorf("unknown -storage %q: want memory or badger", kind)
+		return nil, nil, fmt.Errorf("unknown -storage %q: want memory, badger, or seglog", kind)
 	}
 }

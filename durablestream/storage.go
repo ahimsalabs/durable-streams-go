@@ -210,7 +210,8 @@ type Storage interface {
 	// Messages slice with NextOffset equal to the requested offset, so a poller
 	// can call Read again with the same offset. ErrGone is returned only when
 	// the offset predates the earliest retained position because of retention
-	// or compaction, which no current implementation performs.
+	// or compaction (seglog and bboltstore enforce retention floors; backends
+	// without retention never return it).
 	//
 	// Returned message data belongs to the caller and never aliases stored
 	// state: mutating it cannot change what a later Read returns.

@@ -50,6 +50,7 @@ var (
 	_ durablestream.AtomicBatchStorage = (*Storage)(nil)
 	_ durablestream.AtomicCloseStorage = (*Storage)(nil)
 	_ durablestream.ForkStorage        = (*Storage)(nil)
+	_ durablestream.TouchHeadStorage   = (*Storage)(nil)
 )
 
 // New opens (or initializes) a seglog storage rooted at opts.Dir, recovering
@@ -363,6 +364,33 @@ func (s *Storage) Touch(ctx context.Context, streamID string) error {
 		done:     make(chan result, 1),
 	})
 	return res.err
+}
+
+// TouchHead implements durablestream.TouchHeadStorage. The partition worker
+// captures the Head result from its staging overlay before staging the touch,
+// making the read and renewal one per-stream operation.
+func (s *Storage) TouchHead(ctx context.Context, streamID string) (*durablestream.StreamInfo, error) {
+	if err := s.checkClosed(); err != nil {
+		return nil, err
+	}
+	if err := validateStreamID(streamID); err != nil {
+		return nil, err
+	}
+	s.topologyMu.RLock()
+	defer s.topologyMu.RUnlock()
+	if st, ok := s.streams.Load(streamID); ok {
+		snap := st.snapshot()
+		if snap.softDeleted || (snap.cfg.IsExpired() && st.refCount.Load() != 0) {
+			return nil, softDeletedErr(streamID)
+		}
+	}
+	res := s.partitionFor(streamID).submit(&request{
+		op:         opTouch,
+		streamID:   streamID,
+		returnInfo: true,
+		done:       make(chan result, 1),
+	})
+	return res.info, res.err
 }
 
 // SetRetention changes the history limits for an existing stream. The policy

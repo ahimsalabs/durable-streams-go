@@ -100,6 +100,12 @@ tasks:
       - task: conformance:go:run
         vars: {STORAGE: badger, PORT: 8789}
 
+  conformance:go:seglog:
+    desc: Run server conformance tests against Go server (seglog)
+    cmds:
+      - task: conformance:go:run
+        vars: {STORAGE: seglog, PORT: 8790}
+
   conformance:go:run:
     internal: true
     cmds:

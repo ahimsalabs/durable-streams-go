@@ -5,6 +5,22 @@ backends. The existing Badger backend remains the default until an alternative
 passes the complete storage conformance suite and the high-cardinality
 benchmarks.
 
+## Adopted design: seglog
+
+`durablestream/storage/seglog` implements the design below at full scope and
+passes the complete storage conformance suite (all four capabilities,
+including forks). Its shape follows Redpanda's storage layer adapted to many
+independent streams: stream IDs hash to fixed partitions (count persisted in
+the FORMAT file); each partition worker group-commits every mutation as one
+transaction frame in a partition WAL (one fdatasync per group, requests never
+atomically coupled); a per-partition materializer copies committed records
+into per-stream sealed segments with manifests, checkpoints, and reclaims
+fully-reflected WAL segments. Retention keeps a WAL-durable monotonic floor
+(ErrGone below it), deletes only sealed unpinned segments, and orders floor →
+manifest → unlink. Forks are one frame in the target's partition: the child's
+durable parent reference is the pin record, and refcounts/pins are derived at
+recovery. See `durablestream/storage/seglog/doc.go` for invariants I1–I6.
+
 ## File-backed target
 
 The closest match to the Rust server is not another key/value database. It is

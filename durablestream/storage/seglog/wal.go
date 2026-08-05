@@ -28,6 +28,12 @@ type walWriter struct {
 	active    *os.File // nil until the first append; also present in segments
 	activeSeq uint64
 	writePos  int64
+
+	// failMu and failWrite are a test seam for exercising partition fail-stop.
+	// Production code never installs an error; taking it consumes exactly one
+	// append attempt and is safe even if a test races writers.
+	failMu    sync.Mutex
+	failWrite error
 }
 
 func newWALWriter(dir string, partition uint32, segmentBytes int64, syncWrites bool) *walWriter {
@@ -56,11 +62,30 @@ func (w *walWriter) adopt(seq uint64, f *os.File, writePos int64) {
 // capacity reports the payload capacity of one segment.
 func (w *walWriter) capacity() int64 { return w.segmentBytes - walSegmentHeaderSize }
 
+// failNextWrite causes the next appendGroup call to fail before touching the
+// active segment. It exists solely for deterministic fail-stop tests.
+func (w *walWriter) failNextWrite(err error) {
+	w.failMu.Lock()
+	w.failWrite = err
+	w.failMu.Unlock()
+}
+
+func (w *walWriter) takeWriteFailure() error {
+	w.failMu.Lock()
+	defer w.failMu.Unlock()
+	err := w.failWrite
+	w.failWrite = nil
+	return err
+}
+
 // appendGroup writes one encoded commit group contiguously and, when sync is
 // enabled, fdatasyncs it. It returns the segment sequence and file offset at
 // which buf begins. Rolling to a new segment happens first when the group
 // does not fit the active one; a group never spans segments.
 func (w *walWriter) appendGroup(buf []byte) (seq uint64, base int64, err error) {
+	if err := w.takeWriteFailure(); err != nil {
+		return 0, 0, fmt.Errorf("seglog: injected WAL write failure: %w", err)
+	}
 	if int64(len(buf)) > w.capacity() {
 		// Callers bound frames to one segment; a group that outgrew it is a
 		// programmer error upstream, reported rather than split.
