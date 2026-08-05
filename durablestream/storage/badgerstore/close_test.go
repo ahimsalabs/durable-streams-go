@@ -30,6 +30,12 @@ func TestErrClosedWrapsDurablestreamErrClosed(t *testing.T) {
 	if _, err := s.Head(context.Background(), "stream"); !errors.Is(err, durablestream.ErrClosed) {
 		t.Errorf("Head after close = %v, want durablestream.ErrClosed", err)
 	}
+	if _, err := s.AppendBatch(context.Background(), "stream", [][]byte{[]byte("value")}, ""); !errors.Is(err, durablestream.ErrClosed) {
+		t.Errorf("AppendBatch after close = %v, want durablestream.ErrClosed", err)
+	}
+	if _, err := s.CloseStream(context.Background(), "stream", nil, ""); !errors.Is(err, durablestream.ErrClosed) {
+		t.Errorf("CloseStream after close = %v, want durablestream.ErrClosed", err)
+	}
 }
 
 // TestCloseReleasesWaitForDataWaiters ensures Close unblocks long-polling

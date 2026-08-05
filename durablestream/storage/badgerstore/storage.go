@@ -14,9 +14,11 @@
 //
 // In disk mode, writes are fsynced before an operation is acknowledged (see
 // [Options.SyncWrites]), so a successful Append survives process death and
-// machine crash. Disabling SyncWrites trades that guarantee for throughput:
-// acknowledged appends can then be lost if the process is killed. In-memory
-// mode has no durability at all.
+// machine crash. Concurrent independent appends share bounded synchronous
+// Badger transactions, amortizing one WAL sync without making any mutation
+// visible before that shared commit succeeds. Disabling SyncWrites trades the
+// durability guarantee for throughput: acknowledged appends can then be lost
+// if the process is killed. In-memory mode has no durability at all.
 //
 // # Forks and deletion
 //
@@ -69,7 +71,6 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
-	"math"
 	"os"
 	"strings"
 	"sync"
@@ -221,15 +222,16 @@ func newStreamRecord(cfg durablestream.StreamConfig, gen generation) streamRecor
 type Storage struct {
 	db *badger.DB
 
+	// appendCommits combines independent append mutations into bounded Badger
+	// transactions. It is enabled only for durable SyncWrites mode, where one
+	// transaction lets every request in the group share a single WAL sync.
+	// Unsynced and in-memory stores commit directly to avoid needless queuing.
+	appendCommits *appendCommitter
+
 	// In-memory notification tracking (ephemeral, not persisted). Entries are
 	// keyed by stream ID plus generation, so deleting an old generation can
 	// never remove or wake the state of a replacement generation.
 	streams hashtriemap.HashTrieMap[string, *streamState]
-
-	// Per-generation sequences for atomic offset generation (lock-free).
-	// Keyed by the stream's sequence key, so a recreated stream never shares a
-	// sequence with the generation it replaced.
-	seqs hashtriemap.HashTrieMap[string, *badger.Sequence]
 
 	// Configuration
 	maxMessageSize  int
@@ -260,9 +262,6 @@ type Storage struct {
 	// used, so the atomic flag alone is not enough: it is a check that an
 	// in-flight operation can pass moments before Close runs.
 	dbMu sync.RWMutex
-
-	// Sequence creation mutex - prevents race condition in getOrCreateSequence
-	seqCreateMu sync.Mutex
 
 	// Temp directory to clean up on Close. It is set when no persistent Dir was
 	// provided and the caller did not request strictly in-memory storage.
@@ -376,6 +375,10 @@ func New(opts Options) (*Storage, error) {
 		initialReapDone: make(chan struct{}),
 		tempDir:         tempDir,
 	}
+	if syncWrites && !useInMemory {
+		s.appendCommits = newAppendCommitter(s, defaultAppendCommitConfig())
+		go s.appendCommits.run()
+	}
 
 	// Start background GC if enabled
 	gcInterval := opts.GCInterval
@@ -416,6 +419,13 @@ func (s *Storage) Close() error {
 	s.closeOnce.Do(func() {
 		// Mark as closed to reject new operations
 		s.closed.Store(true)
+		if s.appendCommits != nil {
+			// Closing admission before the database prevents a sender from
+			// enqueueing onto a coordinator that has already exited. Accepted
+			// requests either finish an in-progress transaction or receive
+			// ErrClosed while the coordinator drains.
+			s.appendCommits.close()
+		}
 
 		// Cancel shutdown context to signal all background goroutines and interrupt blocking operations
 		s.shutdownCancel()
@@ -438,6 +448,9 @@ func (s *Storage) Close() error {
 		done := make(chan struct{})
 		go func() {
 			s.wg.Wait()
+			if s.appendCommits != nil {
+				<-s.appendCommits.done
+			}
 			close(done)
 		}()
 
@@ -464,8 +477,8 @@ func (s *Storage) Close() error {
 	return closeErr
 }
 
-// shutdownDB releases sequences, closes the database, and removes the temp
-// directory. It runs exactly once, after all background goroutines have exited.
+// shutdownDB closes the database and removes the temp directory. It runs
+// exactly once, after all background goroutines and the append committer exit.
 //
 // The write lock makes the close exclusive with every in-flight operation:
 // callers that already passed the closed check finish first, and later ones
@@ -473,15 +486,6 @@ func (s *Storage) Close() error {
 func (s *Storage) shutdownDB() error {
 	s.dbMu.Lock()
 	defer s.dbMu.Unlock()
-
-	s.seqs.Range(func(key string, seq *badger.Sequence) bool {
-		if err := seq.Release(); err != nil {
-			s.logger.Warn("badgerstore: failed to release sequence",
-				"key", key, "error", err)
-		}
-		s.seqs.Delete(key)
-		return true
-	})
 
 	err := s.db.Close()
 
@@ -661,9 +665,8 @@ func (s *Storage) CreateWithMessages(ctx context.Context, streamID string, cfg d
 			return fmt.Errorf("badgerstore: set initial batch boundary: %w", err)
 		}
 		if len(messages) > 0 {
-			// Badger sequences persist the next number to lease. Initial messages
-			// occupy offsets 1..N, corresponding to sequence values 0..N-1, so
-			// storing N makes the first later Next return N (offset N+1).
+			// The high-water stores the last allocated position. Initial messages
+			// occupy offsets 1..N, so storing N makes the next append start at N+1.
 			if err := txn.Set(seqKey(streamID, gen), sequenceValue[:]); err != nil {
 				return fmt.Errorf("badgerstore: initialize sequence: %w", err)
 			}
@@ -764,107 +767,19 @@ func (s *Storage) appendBatchOnce(streamID string, messages [][]byte, seq string
 	state.appendMu.Lock()
 	defer state.appendMu.Unlock()
 
-	offsets := make([]durablestream.Offset, len(messages))
-	if len(messages) > 0 {
-		// Reserve the complete block while appendMu excludes ordinary appends.
-		// Reservations may leave gaps on a later transaction failure, which the
-		// Storage offset contract explicitly permits.
-		sequence, err := s.getOrCreateSequence(streamID, gen)
-		if err != nil {
-			return "", fmt.Errorf("badgerstore: get sequence: %w", err)
-		}
-		if err := s.withDB(func() error {
-			for i := range messages {
-				nextNum, err := sequence.Next()
-				if err != nil {
-					return err
-				}
-				if nextNum >= math.MaxInt64 {
-					return fmt.Errorf("badgerstore: offset space exhausted")
-				}
-				offsets[i] = storage.FormatSimpleOffset(int64(nextNum + 1))
-			}
-			return nil
-		}); err != nil {
-			if errors.Is(err, durablestream.ErrClosed) {
-				return "", err
-			}
-			return "", fmt.Errorf("badgerstore: next sequence: %w", err)
+	request := newAppendCommitRequest(streamID, gen, messages, seq, closeStream)
+	var result appendCommitResult
+	if s.appendCommits != nil {
+		result = s.appendCommits.submit(request)
+	} else {
+		results, commitErr := s.commitAppendRequests([]*appendCommitRequest{request})
+		if commitErr != nil {
+			result.err = commitErr
+		} else {
+			result = results[0]
 		}
 	}
-
-	var nextOffset durablestream.Offset
-	// Write every message, sequence validation, and the closed bit atomically.
-	err = s.update(func(txn *badger.Txn) error {
-		// Re-validate: the stream may have been deleted, replaced, or expired
-		// since the generation was resolved.
-		rec, found, err := getRecord(txn, streamID)
-		if err != nil {
-			return err
-		}
-		if !found {
-			return durablestream.ErrNotFound
-		}
-		if rec.Gen != gen {
-			return errGenerationChanged
-		}
-		if err := directRecordError(rec); err != nil {
-			return err
-		}
-		if rec.Closed {
-			if closeStream && len(messages) == 0 {
-				var err error
-				nextOffset, err = getTailOffset(txn, streamID, rec.Gen)
-				return err
-			}
-			return durablestream.ErrStreamClosed
-		}
-
-		// Validate dedup sequence number if provided
-		if seq != "" {
-			lastSeq, err := s.getLastSeq(txn, streamID)
-			if err != nil && err != badger.ErrKeyNotFound {
-				return fmt.Errorf("badgerstore: get last seq: %w", err)
-			}
-			if lastSeq != "" && seq <= lastSeq {
-				return fmt.Errorf("badgerstore: sequence regression: %w", durablestream.ErrConflict)
-			}
-			if err := txn.Set(lastSeqKey(streamID), []byte(seq)); err != nil {
-				return fmt.Errorf("badgerstore: set last seq: %w", err)
-			}
-		}
-
-		for i, message := range messages {
-			if err := txn.Set(messageKey(streamID, gen, offsets[i]), message); err != nil {
-				return fmt.Errorf("badgerstore: set message %d: %w", i, err)
-			}
-		}
-		if err := setBatchBoundary(txn, streamID, gen, offsets); err != nil {
-			return fmt.Errorf("badgerstore: set append batch boundary: %w", err)
-		}
-
-		if closeStream {
-			rec.Closed = true
-			encoded, err := json.Marshal(rec)
-			if err != nil {
-				return fmt.Errorf("badgerstore: marshal config: %w", err)
-			}
-			if err := txn.Set(configKey(streamID), encoded); err != nil {
-				return fmt.Errorf("badgerstore: set config: %w", err)
-			}
-		}
-		if len(offsets) > 0 {
-			nextOffset = offsets[len(offsets)-1]
-		} else {
-			var err error
-			nextOffset, err = getTailOffset(txn, streamID, rec.Gen)
-			if err != nil {
-				return fmt.Errorf("badgerstore: get tail offset: %w", err)
-			}
-		}
-
-		return nil
-	})
+	err = result.err
 	if err != nil {
 		err = mapTransactionSizeError(err)
 		if errors.Is(err, errGenerationChanged) {
@@ -883,7 +798,7 @@ func (s *Storage) appendBatchOnce(streamID string, messages [][]byte, seq string
 	// the final messages visible before waiters can observe the closed state.
 	state.wake()
 
-	return nextOffset, nil
+	return result.offset, nil
 }
 
 // mapTransactionSizeError translates Badger's backend-specific atomic-write
@@ -986,80 +901,10 @@ func (s *Storage) dropNotificationState(streamID string, gen generation, state *
 
 // forgetStream drops all in-memory state for a dead generation of a stream and
 // wakes any waiters so they observe the deletion.
-//
-// The generation's Badger sequence is dropped without Release: the generation
-// is gone and the reaper deletes its sequence key, so releasing would only
-// resurrect that key.
 func (s *Storage) forgetStream(streamID string, gen generation) {
-	// Serialize cache deletion with sequence creation. If creation is already in
-	// progress, this waits and removes the pointer it installs; if deletion won
-	// first, getOrCreateSequence's persisted-generation check refuses to install
-	// a sequence for the dead generation.
-	s.seqCreateMu.Lock()
-	s.seqs.Delete(string(seqKey(streamID, gen)))
-	s.seqCreateMu.Unlock()
-
 	if state, ok := s.streams.Load(streamStateKey(streamID, gen)); ok {
 		s.dropNotificationState(streamID, gen, state)
 	}
-}
-
-// getOrCreateSequence returns the Badger sequence for one generation of a
-// stream, creating it if needed. Uses lock-free hashtriemap for O(1) lookups,
-// with mutex protection for creation to prevent race conditions that could
-// cause duplicate offsets.
-func (s *Storage) getOrCreateSequence(streamID string, gen generation) (*badger.Sequence, error) {
-	key := seqKey(streamID, gen)
-	cacheKey := string(key)
-
-	// Fast path: sequence already exists (lock-free)
-	if seq, ok := s.seqs.Load(cacheKey); ok {
-		return seq, nil
-	}
-
-	// Slow path: acquire mutex for creation to prevent race condition
-	// where multiple goroutines create sequences and some sequence numbers
-	// are lost when the "losing" sequences are released.
-	s.seqCreateMu.Lock()
-	defer s.seqCreateMu.Unlock()
-
-	// Double-check after acquiring lock - another goroutine may have created it
-	if seq, ok := s.seqs.Load(cacheKey); ok {
-		return seq, nil
-	}
-
-	// The stream may have been deleted while this append waited for sequence
-	// creation. Validate under seqCreateMu so forgetStream either observes and
-	// removes the sequence we install below, or completes first and makes this
-	// check fail. This prevents dead generations from accumulating in the cache.
-	if err := s.view(func(txn *badger.Txn) error {
-		rec, found, err := getRecord(txn, streamID)
-		if err != nil {
-			return err
-		}
-		if !found || rec.Gen != gen {
-			return errGenerationChanged
-		}
-		if err := directRecordError(rec); err != nil {
-			return err
-		}
-		return nil
-	}); err != nil {
-		return nil, err
-	}
-
-	// Create new sequence - now safe from races
-	var seq *badger.Sequence
-	if err := s.withDB(func() error {
-		var err error
-		seq, err = s.db.GetSequence(key, 100)
-		return err
-	}); err != nil {
-		return nil, err
-	}
-
-	s.seqs.Store(cacheKey, seq)
-	return seq, nil
 }
 
 // AppendFrom streams data from an io.Reader to a stream.

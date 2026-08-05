@@ -22,6 +22,8 @@ const (
 )
 
 // SyncWrites selects whether Badger fsyncs a write before acknowledging it.
+// Durable appends use bounded group commit, so concurrent independent calls
+// can share one synchronous Badger transaction and WAL flush.
 type SyncWrites int
 
 const (

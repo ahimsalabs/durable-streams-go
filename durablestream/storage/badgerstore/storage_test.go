@@ -3,6 +3,7 @@ package badgerstore
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"errors"
 	"io"
 	"log/slog"
@@ -1397,38 +1398,48 @@ func TestDeleteContextCancellation(t *testing.T) {
 	}
 }
 
-func TestConcurrentSequenceCreation(t *testing.T) {
-	// Test that concurrent getOrCreateSequence calls don't cause duplicate sequences
+func TestConcurrentOffsetHighWater(t *testing.T) {
 	s := newTestStorage(t)
 	_, _ = s.Create(context.Background(), "test", durablestream.StreamConfig{ContentType: "text/plain"})
 
-	// Launch many goroutines trying to get sequence simultaneously
 	const numGoroutines = 50
-	results := make(chan *badger.Sequence, numGoroutines)
-	gen := currentGeneration(t, s, "test")
+	offsets := make(chan durablestream.Offset, numGoroutines)
+	errs := make(chan error, numGoroutines)
 	for i := 0; i < numGoroutines; i++ {
 		go func() {
-			seq, err := s.getOrCreateSequence("test", gen)
-			if err != nil {
-				t.Errorf("getOrCreateSequence error: %v", err)
-				results <- nil
-				return
-			}
-			results <- seq
+			offset, err := s.Append(t.Context(), "test", []byte("value"), "")
+			offsets <- offset
+			errs <- err
 		}()
 	}
 
-	// All goroutines should get the same sequence
-	var firstSeq *badger.Sequence
+	seen := make(map[durablestream.Offset]struct{}, numGoroutines)
 	for i := 0; i < numGoroutines; i++ {
-		seq := <-results
-		if seq == nil {
-			continue
+		if err := <-errs; err != nil {
+			t.Fatalf("Append: %v", err)
 		}
-		if firstSeq == nil {
-			firstSeq = seq
-		} else if seq != firstSeq {
-			t.Error("got different sequence instances - race condition in getOrCreateSequence")
+		offset := <-offsets
+		if _, duplicate := seen[offset]; duplicate {
+			t.Fatalf("duplicate offset %q", offset)
 		}
+		seen[offset] = struct{}{}
+	}
+
+	gen := currentGeneration(t, s, "test")
+	var highWater uint64
+	if err := s.db.View(func(txn *badger.Txn) error {
+		item, err := txn.Get(seqKey("test", gen))
+		if err != nil {
+			return err
+		}
+		return item.Value(func(value []byte) error {
+			highWater = binary.BigEndian.Uint64(value)
+			return nil
+		})
+	}); err != nil {
+		t.Fatalf("read offset high-water: %v", err)
+	}
+	if highWater != numGoroutines {
+		t.Fatalf("offset high-water = %d, want %d", highWater, numGoroutines)
 	}
 }

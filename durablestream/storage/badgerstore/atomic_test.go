@@ -9,10 +9,10 @@ import (
 	"github.com/dgraph-io/badger/v4"
 )
 
-// TestCreateWithMessagesInitializesSequence guards the boundary between the
-// atomic creation transaction and Badger's leased sequence allocator. If the
-// sequence key starts at zero, the first later Append overwrites offset 1.
-func TestCreateWithMessagesInitializesSequence(t *testing.T) {
+// TestCreateWithMessagesInitializesHighWater guards the boundary between the
+// atomic creation transaction and later appends. If the high-water starts at
+// zero, the first later Append overwrites offset 1.
+func TestCreateWithMessagesInitializesHighWater(t *testing.T) {
 	s := newTestStorage(t)
 	created, initialTail, err := s.CreateWithMessages(t.Context(), "stream", durablestream.StreamConfig{ContentType: "text/plain"}, [][]byte{
 		[]byte("one"), []byte("two"), []byte("three"),
@@ -33,10 +33,10 @@ func TestCreateWithMessagesInitializesSequence(t *testing.T) {
 			return nil
 		})
 	}); err != nil {
-		t.Fatalf("read initialized sequence: %v", err)
+		t.Fatalf("read initialized high-water: %v", err)
 	}
 	if persisted != 3 {
-		t.Fatalf("persisted next sequence = %d, want 3", persisted)
+		t.Fatalf("persisted offset high-water = %d, want 3", persisted)
 	}
 
 	next, err := s.Append(t.Context(), "stream", []byte("four"), "")

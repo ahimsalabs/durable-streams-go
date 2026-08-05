@@ -19,7 +19,7 @@ const (
 	prefixLastSeq   = "q:" // q:{streamID} -> last sequence number (for dedup)
 	prefixMessage   = "m:" // m:{streamID}:{generation}:{offset} -> message data
 	prefixBatch     = "b:" // b:{streamID}:{generation}:{startOffset} -> end offset
-	prefixSeq       = "s:" // s:{streamID}:{generation} -> Badger sequence for offset generation
+	prefixSeq       = "s:" // s:{streamID}:{generation} -> big-endian uint64 offset high-water
 	prefixTombstone = "t:" // t:{streamID}:{generation} -> generation awaiting purge (empty value)
 )
 
