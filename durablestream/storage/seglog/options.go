@@ -11,14 +11,10 @@ import (
 
 // Defaults for Options fields left at their zero values.
 const (
-	DefaultPartitions      = 32
-	DefaultMaxMessageSize  = 10 << 20 // 10 MiB
-	DefaultWALSegmentBytes = 256 << 20
-	DefaultWALExtentBytes  = 16 << 20
-	// DefaultGroupLinger remains for source compatibility. The write-at-arrival
-	// pipeline does not read it; commit waves now self-clock.
-	DefaultGroupLinger       = time.Duration(0)
-	DefaultGroupMaxBytes     = 4 << 20
+	DefaultPartitions        = 32
+	DefaultMaxMessageSize    = 10 << 20 // 10 MiB
+	DefaultWALSegmentBytes   = 256 << 20
+	DefaultWALExtentBytes    = 16 << 20
 	DefaultQueueDepth        = 256
 	DefaultShutdownTimeout   = 30 * time.Second
 	DefaultMaterializeBytes  = 4 << 20
@@ -110,14 +106,6 @@ type Options struct {
 	// WALExtentBytes is the unit of physical WAL preallocation.
 	WALExtentBytes int64
 
-	// GroupLinger is retained for source compatibility and is now a no-op.
-	// Write-at-arrival commit waves self-clock without a staging linger.
-	GroupLinger time.Duration
-
-	// GroupMaxBytes is retained for source compatibility and is now a no-op.
-	// WALSegmentBytes bounds each independently written frame.
-	GroupMaxBytes int64
-
 	// QueueDepth is each partition's request queue capacity. Submissions
 	// beyond it block, which is the backpressure contract: callers are held
 	// at the queue rather than growing unbounded memory.
@@ -188,9 +176,6 @@ func (o Options) withDefaults() Options {
 	if o.WALExtentBytes == 0 {
 		o.WALExtentBytes = min(DefaultWALExtentBytes, o.WALSegmentBytes)
 	}
-	if o.GroupMaxBytes == 0 {
-		o.GroupMaxBytes = DefaultGroupMaxBytes
-	}
 	if o.QueueDepth == 0 {
 		o.QueueDepth = DefaultQueueDepth
 	}
@@ -247,12 +232,6 @@ func (o Options) validate() error {
 	if int64(o.MaxMessageSize) > o.WALSegmentBytes-walSegmentHeaderSize {
 		errs = append(errs, fmt.Errorf("option MaxMessageSize %d cannot fit one WAL segment of %d bytes",
 			o.MaxMessageSize, o.WALSegmentBytes))
-	}
-	if o.GroupLinger < 0 {
-		errs = append(errs, fmt.Errorf("option GroupLinger cannot be negative, got %v", o.GroupLinger))
-	}
-	if o.GroupMaxBytes < 1 {
-		errs = append(errs, fmt.Errorf("option GroupMaxBytes must be positive, got %d", o.GroupMaxBytes))
 	}
 	if o.QueueDepth < 1 {
 		errs = append(errs, fmt.Errorf("option QueueDepth must be positive, got %d", o.QueueDepth))

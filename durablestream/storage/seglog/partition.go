@@ -2,6 +2,7 @@ package seglog
 
 import (
 	"container/heap"
+	"context"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -16,6 +17,9 @@ import (
 // slices are borrowed: submit blocks until completion, so the worker may
 // encode them without copying.
 type request struct {
+	// group contains the append mutations in one explicit producer durability
+	// group. A group request does not use the mutation fields below directly.
+	group        []*request
 	op           opKind
 	streamID     string
 	returnInfo   bool                       // opTouch: return the pre-renewal Head result
@@ -289,8 +293,17 @@ func (p *partition) swapDirty() (map[*streamState]struct{}, []*streamState) {
 // submit hands a request to the worker and blocks until it completes. It is
 // deliberately not context-cancellable after admission: the worker borrows
 // the request's message slices, so returning early would let the caller
-// mutate them mid-encode. Group linger and fdatasync latency bound the wait.
+// mutate them mid-encode. WAL write and fdatasync latency bound the wait.
 func (p *partition) submit(req *request) result {
+	return p.submitContext(context.Background(), req)
+}
+
+// submitContext applies cancellation only while waiting for queue admission.
+// After admission it waits for completion because the request borrows payloads.
+func (p *partition) submitContext(ctx context.Context, req *request) result {
+	if err := ctx.Err(); err != nil {
+		return result{err: err}
+	}
 	p.admissionMu.Lock()
 	if !p.accepting {
 		p.admissionMu.Unlock()
@@ -302,6 +315,9 @@ func (p *partition) submit(req *request) result {
 	select {
 	case p.queue <- req:
 		p.senders.Done()
+	case <-ctx.Done():
+		p.senders.Done()
+		return result{err: ctx.Err()}
 	case <-p.stop:
 		p.senders.Done()
 		return result{err: ErrClosed}
@@ -331,6 +347,12 @@ func (p *partition) closeAdmission() {
 type stagedRecord struct {
 	id uint64
 	op *stagedOp
+	// ops has one outcome for each explicit producer-group mutation. Ordinary
+	// requests continue to use op.
+	ops []*stagedOp
+	// groupDone completes the wrapper queue item after all per-operation
+	// results have been delivered.
+	groupDone chan result
 
 	segment *os.File
 	segSeq  uint64
@@ -342,6 +364,31 @@ type stagedRecord struct {
 
 	writeAttempted bool
 	writeErr       error
+}
+
+func (r *stagedRecord) stagedOps() []*stagedOp {
+	if r.ops != nil {
+		return r.ops
+	}
+	return []*stagedOp{r.op}
+}
+
+func (r *stagedRecord) hasFrame() bool {
+	for _, op := range r.stagedOps() {
+		if op.hasFrame() {
+			return true
+		}
+	}
+	return false
+}
+
+func (r *stagedRecord) firstFrameTS() int64 {
+	for _, op := range r.stagedOps() {
+		if op.hasFrame() {
+			return op.ts
+		}
+	}
+	return 0
 }
 
 type retiredRecord struct {
@@ -408,9 +455,17 @@ func (p *partition) run() {
 		}
 		stager.waitForPendingSpace()
 		_, dependsOnInflight := stager.inflight[req.streamID]
+		if len(req.group) > 0 {
+			for _, grouped := range req.group {
+				if _, ok := stager.inflight[grouped.streamID]; ok {
+					dependsOnInflight = true
+					break
+				}
+			}
+		}
 		record := p.stageRecord(stager.nextRecordID, req, stager.inflight, stager.last, stager.writeStopped)
 		stager.nextRecordID++
-		if !record.op.hasFrame() && !record.op.barrier && record.writeErr == nil && !dependsOnInflight {
+		if !record.hasFrame() && record.op != nil && !record.op.barrier && record.writeErr == nil && !dependsOnInflight {
 			// Independent validation failures and no-ops complete inline. A
 			// no-op validated against speculative overlay state must remain a
 			// FIFO marker so a preceding durability failure reaches it.
@@ -653,36 +708,55 @@ type pendingStream struct {
 // then writes its frame without syncing. Publication remains publisher-only.
 func (p *partition) stageRecord(recordID uint64, req *request, inflight map[string]*pendingStream, last map[string]uint64, writeStopped bool) *stagedRecord {
 	record := &stagedRecord{id: recordID, endSeq: p.wal.activeSeq, endOff: p.wal.writePos, endNextTxn: p.nextTxnID}
+	if len(req.group) > 0 {
+		record.groupDone = req.done
+	}
 	if writeStopped || p.brokenErr() != nil {
 		record.writeErr = p.brokenErr()
-		record.op = &stagedOp{req: req}
+		if len(req.group) > 0 {
+			record.ops = make([]*stagedOp, len(req.group))
+			for i, mutation := range req.group {
+				record.ops[i] = &stagedOp{req: mutation}
+			}
+		} else {
+			record.op = &stagedOp{req: req}
+		}
 		return record
 	}
 	buf := p.encodeBuf[:0]
 	pending := make(map[string]*pendingStream)
 	now := time.Now()
-	ts := max(now.UnixNano(), p.lastTS) // clamp against wall-clock regression
-	p.lastTS = ts
-
-	op, frame := p.stage(req, pending, inflight, now, ts)
-	if op.hasFrame() {
-		frame.txnID = p.nextTxnID
-		p.nextTxnID++
-		buf, op.payloadOffs = appendFrame(buf, frame)
-		op.payloadLens = make([]int32, len(frame.payloads))
-		for i, pl := range frame.payloads {
-			op.payloadLens[i] = int32(len(pl))
-		}
-		op.ts = ts
-		inflight[req.streamID] = pending[req.streamID]
-		last[req.streamID] = recordID
-	} else if op.barrier {
-		op.res.walSeq = p.wal.activeSeq
-		op.res.walOff = p.wal.writePos
-		op.res.nextTxn = p.nextTxnID
+	requests := []*request{req}
+	if len(req.group) > 0 {
+		requests = req.group
+		record.ops = make([]*stagedOp, 0, len(requests))
 	}
-
-	record.op = op
+	for _, mutation := range requests {
+		ts := max(now.UnixNano(), p.lastTS) // clamp against wall-clock regression
+		p.lastTS = ts
+		op, frame := p.stage(mutation, pending, inflight, now, ts)
+		if op.hasFrame() {
+			frame.txnID = p.nextTxnID
+			p.nextTxnID++
+			buf, op.payloadOffs = appendFrame(buf, frame)
+			op.payloadLens = make([]int32, len(frame.payloads))
+			for i, pl := range frame.payloads {
+				op.payloadLens[i] = int32(len(pl))
+			}
+			op.ts = ts
+			inflight[mutation.streamID] = pending[mutation.streamID]
+			last[mutation.streamID] = recordID
+		} else if op.barrier {
+			op.res.walSeq = p.wal.activeSeq
+			op.res.walOff = p.wal.writePos
+			op.res.nextTxn = p.nextTxnID
+		}
+		if record.ops != nil {
+			record.ops = append(record.ops, op)
+		} else {
+			record.op = op
+		}
+	}
 	if len(buf) > 0 {
 		record.writeAttempted = true
 		record.segSeq, record.base, record.segment, record.writeErr = p.wal.writeGroup(buf)
@@ -777,8 +851,12 @@ func (p *partition) publishSets(publish <-chan publishSet, retired chan<- retire
 		}
 		for _, record := range set.batches {
 			published := p.commitRecord(record, setErr)
-			if published && record.op.hasFrame() {
-				waveOps++
+			if published && record.hasFrame() {
+				for _, op := range record.stagedOps() {
+					if op.hasFrame() {
+						waveOps++
+					}
+				}
 				p.stats.walBytesWritten.Add(record.endOff - record.base)
 			}
 			if !published && priorErr == nil {
@@ -838,12 +916,27 @@ func (p *partition) commitRecord(record *stagedRecord, syncErr error) bool {
 	if err != nil {
 		p.stats.discardPendingWALBytes(frameBytes)
 		broken := p.latchBroken(err)
-		record.op.req.done <- result{err: broken, ambiguous: record.writeAttempted && record.op.hasFrame()}
+		for _, op := range record.stagedOps() {
+			res := result{err: broken}
+			if record.ops != nil && record.writeAttempted && !op.hasFrame() {
+				// Preserve definitive state-dependent validation outcomes for
+				// frame-less siblings in an attempted explicit group write.
+				res = op.res
+			} else if op.hasFrame() {
+				res = result{err: broken, ambiguous: record.writeAttempted}
+			}
+			op.req.done <- res
+		}
+		if record.groupDone != nil {
+			record.groupDone <- result{}
+		}
 		return false
 	}
-	p.publish(record.op, record.segSeq, record.base)
+	for _, op := range record.stagedOps() {
+		p.publish(op, record.segSeq, record.base)
+	}
 	if frameBytes > 0 {
-		p.stats.publishWALFrame(frameBytes, record.op.ts)
+		p.stats.publishWALFrame(frameBytes, record.firstFrameTS())
 		// publish can ring the dirty doorbell before the frontier counters are
 		// advanced. Ring it again after both become visible so a fast consumer
 		// cannot lose the transition that crosses a pressure threshold.
@@ -851,14 +944,19 @@ func (p *partition) commitRecord(record *stagedRecord, syncErr error) bool {
 	}
 	// A barrier is a queue marker. Swap the exact dirty/removal frontier only
 	// after every preceding FIFO record has published.
-	if record.op.barrier && record.op.req.captureDirty {
+	if record.op != nil && record.op.barrier && record.op.req.captureDirty {
 		record.op.res.frontier = p.stats.captureMaterializationFrontier()
 		record.op.res.dirty, record.op.res.removals = p.swapDirty()
 	}
 	p.publishedSeq = record.endSeq
 	p.publishedOff = record.endOff
 	p.publishedNextTx = record.endNextTxn
-	record.op.req.done <- record.op.res
+	for _, op := range record.stagedOps() {
+		op.req.done <- op.res
+	}
+	if record.groupDone != nil {
+		record.groupDone <- result{}
+	}
 	return true
 }
 
@@ -1163,12 +1261,16 @@ func (p *partition) stageCreate(op *stagedOp, req *request, ps *pendingStream, e
 }
 
 func (p *partition) stageAppend(op *stagedOp, req *request, ps *pendingStream, expired bool, ts int64) frameSpec {
-	if !ps.exists || expired {
+	if !ps.exists {
 		op.res = result{err: fmt.Errorf("seglog: stream %q not found: %w", req.streamID, durablestream.ErrNotFound)}
 		return frameSpec{}
 	}
-	if ps.softDeleted {
+	if ps.softDeleted || (expired && ps.state.refCount.Load() != 0) {
 		op.res = result{err: softDeletedErr(req.streamID)}
+		return frameSpec{}
+	}
+	if expired {
+		op.res = result{err: fmt.Errorf("seglog: stream %q not found: %w", req.streamID, durablestream.ErrNotFound)}
 		return frameSpec{}
 	}
 	if ps.closed {

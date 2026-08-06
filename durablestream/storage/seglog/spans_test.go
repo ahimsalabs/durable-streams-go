@@ -123,7 +123,6 @@ func newSpanTestStorage(t *testing.T) *Storage {
 	opts := benchmarkOptions(t.TempDir())
 	opts.Partitions = 1
 	opts.SyncWrites = SyncWritesDisabled
-	opts.GroupMaxBytes = 1
 	s, err := New(opts)
 	if err != nil {
 		t.Fatal(err)

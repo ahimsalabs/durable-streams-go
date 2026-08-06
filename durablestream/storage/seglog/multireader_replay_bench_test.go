@@ -57,7 +57,7 @@ func BenchmarkMultiReaderReplay(b *testing.B) {
 func newReplayFixture(b *testing.B, streamBytes int) *Storage {
 	b.Helper()
 	opts := benchmarkOptions(b.TempDir())
-	opts.Partitions, opts.SyncWrites, opts.GroupMaxBytes = 1, SyncWritesDisabled, 1<<20
+	opts.Partitions, opts.SyncWrites = 1, SyncWritesDisabled
 	opts.DefaultSegmentPolicy = SegmentPolicy{TargetBytes: int64(replayStreamBytes + (1 << 20))}
 	s := benchmarkOpen(b, opts)
 	benchmarkCreate(b, s, "replay")

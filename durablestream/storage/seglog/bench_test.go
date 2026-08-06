@@ -18,8 +18,6 @@ func benchmarkOptions(dir string) Options {
 		Partitions:           8,
 		MaxMessageSize:       1 << 20,
 		WALSegmentBytes:      64 << 20,
-		GroupLinger:          time.Microsecond,
-		GroupMaxBytes:        1 << 20,
 		QueueDepth:           4096,
 		SyncWrites:           SyncWritesEnabled,
 		MaterializeInterval:  -1,
@@ -65,7 +63,6 @@ func reportLatencyPercentiles(b *testing.B, samples []time.Duration) {
 
 func BenchmarkAppendDurable(b *testing.B) {
 	opts := benchmarkOptions(b.TempDir())
-	opts.GroupMaxBytes = 1 // Sequential benchmark: do not wait for an impossible peer.
 	s := benchmarkOpen(b, opts)
 	benchmarkCreate(b, s, "stream")
 	payload := make([]byte, 256)
@@ -124,7 +121,6 @@ func BenchmarkAppendDurableParallel(b *testing.B) {
 func BenchmarkAppendNoSync(b *testing.B) {
 	opts := benchmarkOptions(b.TempDir())
 	opts.SyncWrites = SyncWritesDisabled
-	opts.GroupMaxBytes = 1 // Measure the write ceiling, not group-linger latency.
 	s := benchmarkOpen(b, opts)
 	benchmarkCreate(b, s, "stream")
 	payload := make([]byte, 256)
@@ -145,7 +141,6 @@ func BenchmarkManyStreams(b *testing.B) {
 			}
 			opts := benchmarkOptions(b.TempDir())
 			opts.SyncWrites = SyncWritesDisabled // This benchmark measures stream cardinality, not fsync.
-			opts.GroupMaxBytes = 1
 			s := benchmarkOpen(b, opts)
 			ids := make([]string, count)
 			for i := range ids {
@@ -169,7 +164,6 @@ func BenchmarkManyStreams(b *testing.B) {
 
 func BenchmarkReadHot(b *testing.B) {
 	opts := benchmarkOptions(b.TempDir())
-	opts.GroupMaxBytes = 1
 	s := benchmarkOpen(b, opts)
 	benchmarkCreate(b, s, "stream")
 	payload := make([]byte, 1024)
@@ -200,7 +194,6 @@ func BenchmarkReadColdSegments(b *testing.B) {
 	opts := benchmarkOptions(dir)
 	opts.Partitions = 1
 	opts.MaterializeInterval = -1
-	opts.GroupMaxBytes = 1
 	s, err := New(opts)
 	if err != nil {
 		b.Fatal(err)
@@ -241,7 +234,6 @@ func BenchmarkRetentionDuringWrites(b *testing.B) {
 	opts.RetentionInterval = time.Millisecond
 	opts.DefaultSegmentPolicy.TargetBytes = 16 << 10
 	opts.DefaultRetention = Retention{MaxBytes: 64 << 10}
-	opts.GroupMaxBytes = 1
 	s := benchmarkOpen(b, opts)
 	benchmarkCreate(b, s, "stream")
 	payload := make([]byte, 1024)
@@ -270,7 +262,6 @@ func BenchmarkRecovery(b *testing.B) {
 			opts := benchmarkOptions(dir)
 			opts.Partitions = 1
 			opts.MaterializeInterval = -1
-			opts.GroupMaxBytes = 1
 			s, err := New(opts)
 			if err != nil {
 				b.Fatal(err)

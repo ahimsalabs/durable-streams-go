@@ -27,7 +27,6 @@ func BenchmarkAppendPartitionSweep(b *testing.B) {
 			b.Run(fmt.Sprintf("partitions=%d/materializer=%s", parts, matName), func(b *testing.B) {
 				opts := benchmarkOptions(b.TempDir())
 				opts.Partitions = parts
-				opts.GroupLinger = 0
 				opts.MaterializeInterval = mat
 				s, err := New(opts)
 				if err != nil {

@@ -24,7 +24,7 @@ func BenchmarkSpanHTTP(b *testing.B) {
 
 func benchmarkSpanHTTPCell(b *testing.B, spans, tls bool) {
 	opts := benchmarkOptions(b.TempDir())
-	opts.Partitions, opts.SyncWrites, opts.GroupMaxBytes = 1, SyncWritesDisabled, 1
+	opts.Partitions, opts.SyncWrites = 1, SyncWritesDisabled
 	s := benchmarkOpen(b, opts)
 	benchmarkCreate(b, s, "stream")
 	payload := make([]byte, 2<<10)
