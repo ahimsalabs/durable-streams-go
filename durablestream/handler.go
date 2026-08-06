@@ -24,6 +24,7 @@ const (
 	defaultChunkSize       = 1 * 1024 * 1024  // 1MB
 	defaultLongPollTimeout = 30 * time.Second
 	defaultSSECloseAfter   = 60 * time.Second
+	readOnlyAllowMethods   = "GET, HEAD, OPTIONS"
 
 	// Security headers per protocol Section 12.7
 	headerXContentTypeOptions       = "X-Content-Type-Options"
@@ -135,6 +136,15 @@ type HandlerConfig struct {
 	// false when an outer authentication/CORS layer owns browser access.
 	// Default: false.
 	EnableCORS bool
+
+	// ReadOnly rejects every request that would mutate storage with 405 Method
+	// Not Allowed. Reads, HEAD, and OPTIONS remain available. Default: false.
+	ReadOnly bool
+
+	// StreamFilter reports whether a stream ID may be accessed. It runs after
+	// PathExtractor and before storage. A rejected stream is reported as not
+	// found. Nil allows all streams.
+	StreamFilter func(streamID string) bool
 }
 
 // Handler implements http.Handler for serving durable streams.
@@ -160,6 +170,8 @@ type Handler struct {
 	maxAppendSize   int64
 	chunkSize       int
 	enableCORS      bool
+	readOnly        bool
+	streamFilter    func(string) bool
 
 	// mutations binds create, append, delete, and producer-state changes to one
 	// stream incarnation. It is process-local, like the producer registry; use a
@@ -218,6 +230,8 @@ func NewHandler(storage Storage, cfg *HandlerConfig) *Handler {
 			producerStateTTL = cfg.ProducerStateTTL
 		}
 		h.enableCORS = cfg.EnableCORS
+		h.readOnly = cfg.ReadOnly
+		h.streamFilter = cfg.StreamFilter
 	}
 	h.producers = newProducerRegistry(maxProducers, producerStateTTL)
 
@@ -233,6 +247,11 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// are CORS-safelisted. Advertise them on every response, errors included, so
 	// a cross-origin fetch behaves the same as a same-origin one.
 	h.setCORSHeaders(w)
+
+	if h.streamFilter != nil && !h.streamFilter(streamID) {
+		writeStorageError(w, ErrNotFound)
+		return
+	}
 
 	// The __ds prefix is reserved for Durable Streams control APIs (spec Section 6),
 	// which this handler does not implement. Reject it before any stream operation so
@@ -252,6 +271,11 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if h.readOnly && isMutationMethod(r.Method) {
+		writeMethodNotAllowed(w)
+		return
+	}
+
 	switch r.Method {
 	case http.MethodPut:
 		h.handleCreate(w, r, streamID)
@@ -266,6 +290,10 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	default:
 		writeError(w, newError(codeBadRequest, "method not allowed"))
 	}
+}
+
+func isMutationMethod(method string) bool {
+	return method == http.MethodPost || method == http.MethodPut || method == http.MethodDelete
 }
 
 // touch restarts a stream's sliding TTL window because this request counts as
@@ -506,12 +534,6 @@ func (h *Handler) handleCreate(w http.ResponseWriter, r *http.Request, streamID 
 // to decode an initial body whose Content-Type was omitted; in that case the
 // inspected source incarnation is fenced when the target does not yet exist.
 func (h *Handler) handleForkCreate(w http.ResponseWriter, r *http.Request, streamID string) {
-	forkStorage, ok := h.storage.(ForkStorage)
-	if !ok {
-		writeError(w, newError(codeNotImplemented, "storage does not support stream forking"))
-		return
-	}
-
 	sourcePath, sourceSet, err := singleRequestHeader(r.Header, protocol.HeaderStreamForkedFrom)
 	if err != nil {
 		writeError(w, newError(codeBadRequest, err.Error()))
@@ -539,6 +561,16 @@ func (h *Handler) handleForkCreate(w http.ResponseWriter, r *http.Request, strea
 	}
 	if sourceID == "" || hasReservedSegment(sourceID) {
 		writeError(w, newError(codeBadRequest, "Stream-Forked-From does not identify a valid stream"))
+		return
+	}
+	if h.streamFilter != nil && !h.streamFilter(sourceID) {
+		writeStorageError(w, ErrNotFound)
+		return
+	}
+
+	forkStorage, ok := h.storage.(ForkStorage)
+	if !ok {
+		writeError(w, newError(codeNotImplemented, "storage does not support stream forking"))
 		return
 	}
 
@@ -2122,10 +2154,22 @@ func (h *Handler) setCORSHeaders(w http.ResponseWriter) {
 	}
 	headers := w.Header()
 	headers.Set(headerAccessControlAllowOrigin, "*")
-	headers.Set(headerAccessControlAllowMethods, corsAllowMethods)
+	if h.readOnly {
+		headers.Set(headerAccessControlAllowMethods, readOnlyAllowMethods)
+	} else {
+		headers.Set(headerAccessControlAllowMethods, corsAllowMethods)
+	}
 	headers.Set(headerAccessControlAllowHeaders, corsAllowHeaders)
 	headers.Set(headerAccessControlExposeHeaders, corsExposeHeaders)
 	headers.Set(headerAccessControlMaxAge, corsMaxAgeSeconds)
+}
+
+func writeMethodNotAllowed(w http.ResponseWriter) {
+	setSecurityHeaders(w)
+	w.Header().Set("Allow", readOnlyAllowMethods)
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusMethodNotAllowed)
+	_ = json.NewEncoder(w).Encode(newError("method_not_allowed", "method not allowed"))
 }
 
 // writeError writes a JSON error response.

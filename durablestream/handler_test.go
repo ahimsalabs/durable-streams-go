@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strconv"
 	"strings"
 	"sync"
@@ -951,6 +952,175 @@ func TestHandler_PathExtractor(t *testing.T) {
 
 	if rec2.Code != http.StatusOK {
 		t.Errorf("head status = %d, want %d", rec2.Code, http.StatusOK)
+	}
+}
+
+func TestHandler_ReadOnlyRejectsMutations(t *testing.T) {
+	storage := memorystorage.New()
+	if _, err := storage.Create(t.Context(), "/stream", durablestream.StreamConfig{ContentType: "text/plain"}); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	handler := durablestream.NewHandler(storage, &durablestream.HandlerConfig{ReadOnly: true})
+
+	tests := []struct {
+		name    string
+		method  string
+		target  string
+		headers map[string]string
+	}{
+		{name: "append is rejected", method: http.MethodPost, target: "/stream"},
+		{name: "create is rejected", method: http.MethodPut, target: "/new-stream"},
+		{name: "delete is rejected", method: http.MethodDelete, target: "/stream"},
+		{
+			name:   "fork creation is rejected",
+			method: http.MethodPut,
+			target: "/fork",
+			headers: map[string]string{
+				protocol.HeaderStreamForkedFrom: "/stream",
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			req := httptest.NewRequest(tt.method, tt.target, strings.NewReader("data"))
+			for name, value := range tt.headers {
+				req.Header.Set(name, value)
+			}
+			rec := httptest.NewRecorder()
+			handler.ServeHTTP(rec, req)
+
+			if rec.Code != http.StatusMethodNotAllowed {
+				t.Errorf("status = %d, want %d: %s", rec.Code, http.StatusMethodNotAllowed, rec.Body.String())
+			}
+			if got := rec.Header().Get("Allow"); got != "GET, HEAD, OPTIONS" {
+				t.Errorf("Allow = %q, want %q", got, "GET, HEAD, OPTIONS")
+			}
+		})
+	}
+
+	if _, err := storage.Head(t.Context(), "/stream"); err != nil {
+		t.Errorf("existing stream changed: %v", err)
+	}
+	if _, err := storage.Head(t.Context(), "/new-stream"); err != durablestream.ErrNotFound {
+		t.Errorf("new stream Head error = %v, want %v", err, durablestream.ErrNotFound)
+	}
+	if _, err := storage.Head(t.Context(), "/fork"); err != durablestream.ErrNotFound {
+		t.Errorf("fork target Head error = %v, want %v", err, durablestream.ErrNotFound)
+	}
+}
+
+func TestHandler_ReadOnlyAllowsReadsAndLiveModes(t *testing.T) {
+	storage := memorystorage.New()
+	if _, err := storage.Create(t.Context(), "/stream", durablestream.StreamConfig{ContentType: "text/plain"}); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if _, err := storage.Append(t.Context(), "/stream", []byte("data"), ""); err != nil {
+		t.Fatalf("Append: %v", err)
+	}
+	handler := durablestream.NewHandler(storage, &durablestream.HandlerConfig{
+		ReadOnly:        true,
+		EnableCORS:      true,
+		LongPollTimeout: time.Millisecond,
+		SSECloseAfter:   time.Millisecond,
+	})
+
+	read := httptest.NewRecorder()
+	handler.ServeHTTP(read, httptest.NewRequest(http.MethodGet, "/stream?offset=-1", nil))
+	if read.Code != http.StatusOK || read.Body.String() != "data" {
+		t.Errorf("GET response = (%d, %q), want (%d, %q)", read.Code, read.Body.String(), http.StatusOK, "data")
+	}
+
+	head := httptest.NewRecorder()
+	handler.ServeHTTP(head, httptest.NewRequest(http.MethodHead, "/stream", nil))
+	if head.Code != http.StatusOK {
+		t.Errorf("HEAD status = %d, want %d", head.Code, http.StatusOK)
+	}
+
+	longPoll := httptest.NewRecorder()
+	handler.ServeHTTP(longPoll, httptest.NewRequest(http.MethodGet, "/stream?offset=now&live=long-poll", nil))
+	if longPoll.Code != http.StatusNoContent {
+		t.Errorf("long-poll status = %d, want %d: %s", longPoll.Code, http.StatusNoContent, longPoll.Body.String())
+	}
+
+	sse := serveSSE(t, handler, "/stream?offset=-1&live=sse")
+	if sse.Code != http.StatusOK || !strings.Contains(sse.Body.String(), "data:data\n") {
+		t.Errorf("SSE response = (%d, %q), want status %d with data", sse.Code, sse.Body.String(), http.StatusOK)
+	}
+
+	options := httptest.NewRecorder()
+	handler.ServeHTTP(options, httptest.NewRequest(http.MethodOptions, "/stream", nil))
+	if options.Code != http.StatusNoContent {
+		t.Errorf("OPTIONS status = %d, want %d", options.Code, http.StatusNoContent)
+	}
+	if got := options.Header().Get("Access-Control-Allow-Methods"); got != "GET, HEAD, OPTIONS" {
+		t.Errorf("Access-Control-Allow-Methods = %q, want %q", got, "GET, HEAD, OPTIONS")
+	}
+}
+
+func TestHandler_StreamFilterHidesStreamsForEveryMethod(t *testing.T) {
+	storage := memorystorage.New()
+	if _, err := storage.Create(t.Context(), "/filtered", durablestream.StreamConfig{ContentType: "text/plain"}); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	handler := durablestream.NewHandler(storage, &durablestream.HandlerConfig{
+		EnableCORS: true,
+		StreamFilter: func(streamID string) bool {
+			return streamID != "/filtered"
+		},
+	})
+
+	for _, method := range []string{http.MethodGet, http.MethodPost} {
+		t.Run(method, func(t *testing.T) {
+			filtered := httptest.NewRecorder()
+			handler.ServeHTTP(filtered, httptest.NewRequest(method, "/filtered", strings.NewReader("data")))
+			missing := httptest.NewRecorder()
+			handler.ServeHTTP(missing, httptest.NewRequest(method, "/missing", strings.NewReader("data")))
+
+			if filtered.Code != http.StatusNotFound {
+				t.Errorf("filtered status = %d, want %d", filtered.Code, http.StatusNotFound)
+			}
+			if filtered.Code != missing.Code || filtered.Body.String() != missing.Body.String() ||
+				!reflect.DeepEqual(filtered.Header(), missing.Header()) {
+				t.Errorf("filtered response = (%d, %q, %v), missing response = (%d, %q, %v)",
+					filtered.Code, filtered.Body.String(), filtered.Header(),
+					missing.Code, missing.Body.String(), missing.Header())
+			}
+		})
+	}
+}
+
+func TestHandler_StreamFilterRejectsFilteredForkSource(t *testing.T) {
+	storage := memorystorage.New()
+	if _, err := storage.Create(t.Context(), "/source", durablestream.StreamConfig{ContentType: "text/plain"}); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	handler := durablestream.NewHandler(storage, &durablestream.HandlerConfig{
+		StreamFilter: func(streamID string) bool {
+			return streamID != "/source"
+		},
+	})
+	req := httptest.NewRequest(http.MethodPut, "/fork", nil)
+	req.Header.Set(protocol.HeaderStreamForkedFrom, "/source")
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusNotFound {
+		t.Errorf("status = %d, want %d: %s", rec.Code, http.StatusNotFound, rec.Body.String())
+	}
+	if _, err := storage.Head(t.Context(), "/fork"); err != durablestream.ErrNotFound {
+		t.Errorf("fork target Head error = %v, want %v", err, durablestream.ErrNotFound)
+	}
+}
+
+func TestHandler_NilStreamFilterAllowsAllStreams(t *testing.T) {
+	handler := durablestream.NewHandler(memorystorage.New(), &durablestream.HandlerConfig{StreamFilter: nil})
+	req := httptest.NewRequest(http.MethodPut, "/stream", nil)
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusCreated {
+		t.Errorf("status = %d, want %d: %s", rec.Code, http.StatusCreated, rec.Body.String())
 	}
 }
 
