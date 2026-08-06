@@ -17,9 +17,13 @@ type pipelineAppendResult struct {
 	err    error
 }
 
+type pipelineCreateResult struct {
+	created bool
+	err     error
+}
+
 func pipelineOptions(dir string) Options {
 	opts := singlePartitionOptions(dir)
-	opts.GroupMaxBytes = 1 // one mutation per group
 	opts.MaterializeInterval = -1
 	opts.RetentionInterval = -1
 	return opts
@@ -34,6 +38,15 @@ func appendAsync(s *Storage, streamID, payload, seq string) <-chan pipelineAppen
 	return done
 }
 
+func createAsync(s *Storage, streamID string, cfg durablestream.StreamConfig) <-chan pipelineCreateResult {
+	done := make(chan pipelineCreateResult, 1)
+	go func() {
+		created, err := s.Create(context.Background(), streamID, cfg)
+		done <- pipelineCreateResult{created: created, err: err}
+	}()
+	return done
+}
+
 func awaitAppend(t *testing.T, done <-chan pipelineAppendResult) pipelineAppendResult {
 	t.Helper()
 	select {
@@ -42,6 +55,17 @@ func awaitAppend(t *testing.T, done <-chan pipelineAppendResult) pipelineAppendR
 	case <-time.After(5 * time.Second):
 		t.Fatal("timed out waiting for pipelined append")
 		return pipelineAppendResult{}
+	}
+}
+
+func awaitCreate(t *testing.T, done <-chan pipelineCreateResult) pipelineCreateResult {
+	t.Helper()
+	select {
+	case got := <-done:
+		return got
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for pipelined create")
+		return pipelineCreateResult{}
 	}
 }
 
@@ -62,7 +86,22 @@ func closeTestGate(gate chan struct{}) {
 	}
 }
 
-func TestPartitionPipeline_StagesSequenceChainBeforePriorPublish(t *testing.T) {
+func awaitPendingRecords(t *testing.T, p *partition, want int) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		p.walPendingMu.Lock()
+		got := len(p.walPending)
+		p.walPendingMu.Unlock()
+		if got >= want {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatalf("pending records did not reach %d", want)
+}
+
+func TestPartitionPipeline_WriteDuringSyncWaitsForNextCoveringSync(t *testing.T) {
 	s := openTest(t, pipelineOptions(t.TempDir()))
 	if _, err := s.Create(t.Context(), "s", durablestream.StreamConfig{}); err != nil {
 		t.Fatal(err)
@@ -224,6 +263,32 @@ func TestPartitionPipeline_BarrierWaitsForPriorPublication(t *testing.T) {
 	if checkpoint.Replay.SegmentSeq != p.publishedSeq || checkpoint.Replay.Offset != p.publishedOff {
 		t.Fatalf("checkpoint replay = (%d,%d), published = (%d,%d)",
 			checkpoint.Replay.SegmentSeq, checkpoint.Replay.Offset, p.publishedSeq, p.publishedOff)
+	}
+}
+
+func TestPartitionPipeline_InflightNoOpWaitsForPriorPublication(t *testing.T) {
+	s := openTest(t, pipelineOptions(t.TempDir()))
+	p := s.parts[0]
+
+	syncStarted, releaseSync := make(chan struct{}), make(chan struct{})
+	t.Cleanup(func() { closeTestGate(releaseSync) })
+	p.wal.blockNextSync(syncStarted, releaseSync)
+	first := createAsync(s, "same-create", durablestream.StreamConfig{})
+	awaitSignal(t, syncStarted, "first create sync")
+	duplicate := createAsync(s, "same-create", durablestream.StreamConfig{})
+	awaitPendingRecords(t, p, 1)
+
+	select {
+	case got := <-duplicate:
+		t.Fatalf("dependent no-op completed before prior publication: %+v", got)
+	default:
+	}
+	closeTestGate(releaseSync)
+	if got := awaitCreate(t, first); got.err != nil || !got.created {
+		t.Fatalf("first create = (%v, %v), want (true, nil)", got.created, got.err)
+	}
+	if got := awaitCreate(t, duplicate); got.err != nil || got.created {
+		t.Fatalf("duplicate create = (%v, %v), want (false, nil)", got.created, got.err)
 	}
 }
 

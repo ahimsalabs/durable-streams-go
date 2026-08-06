@@ -12,11 +12,8 @@ const (
 	DefaultPartitions      = 32
 	DefaultMaxMessageSize  = 10 << 20 // 10 MiB
 	DefaultWALSegmentBytes = 256 << 20
-	// DefaultGroupLinger is zero: an idle commit group closes as soon as the
-	// queue has no more waiting requests. Under load, the previous global commit
-	// wave clocks the forming group instead, so an artificial idle linger
-	// only taxes sequential-caller latency (measured at ~140x on stream creation
-	// with the previous 500µs default).
+	// DefaultGroupLinger remains for source compatibility. The write-at-arrival
+	// pipeline does not read it; commit waves now self-clock.
 	DefaultGroupLinger         = time.Duration(0)
 	DefaultGroupMaxBytes       = 4 << 20
 	DefaultQueueDepth          = 256
@@ -90,16 +87,12 @@ type Options struct {
 	// a frame must fit one segment.
 	WALSegmentBytes int64
 
-	// GroupLinger is the idle-pipeline batching floor. While a previous group
-	// is waiting for its global commit wave, that wave is the batching clock
-	// and GroupLinger is ignored: the forming group stays open until that flush
-	// retires or the byte bound is reached. When the pipeline is idle, a positive
-	// value holds the first group open for that duration. Zero (the default)
-	// commits an idle group as soon as the queue is drained.
+	// GroupLinger is retained for source compatibility and is now a no-op.
+	// Write-at-arrival commit waves self-clock without a staging linger.
 	GroupLinger time.Duration
 
-	// GroupMaxBytes bounds the encoded bytes of one commit group. A single
-	// logical mutation may exceed it (it forms a group of one).
+	// GroupMaxBytes is retained for source compatibility and is now a no-op.
+	// WALSegmentBytes bounds each independently written frame.
 	GroupMaxBytes int64
 
 	// QueueDepth is each partition's request queue capacity. Submissions

@@ -6,13 +6,12 @@
 //
 // Stream IDs hash (XXH64, stable across restarts) to one of N logical
 // partitions. Each partition has a bounded three-stage worker: one stager owns
-// validation, offset and transaction allocation, encoding, and WAL writes; one
-// committer establishes durability through the storage-wide gate; and one FIFO
-// publisher updates catalog state and acknowledges requests. Publication
-// overlaps the committer's next hunger and wave admission. Arrivals during an
-// active wave form the next wave. The completed global wave, rather than each
-// partition's individual return time, is the adaptive batching clock.
-// Independent requests share one write and fdatasync, but each frame remains
+// validation, offset and transaction allocation, encoding, and immediate WAL
+// writes; one committer snapshots the contiguous-written pending watermark and
+// establishes durability through the storage-wide gate; and one FIFO publisher
+// updates catalog state and acknowledges requests. Writes continue during
+// fdatasync, but those later records remain pending for the next wave.
+// Independent requests can share one fdatasync, but each frame remains
 // independently replayable — requests are never atomically coupled.
 //
 // The WAL is the sole durable commit point. Every mutation — create, append,
@@ -24,12 +23,14 @@
 //
 // # Invariants
 //
-//	I1: A request is acknowledged only after its frame's group joins a global
-//	    commit wave and its own segment's fdatasync returns successfully. A
-//	    sibling's completion cannot make it durable. Recovery keeps the longest
-//	    valid frame prefix; anything discarded was never acknowledged.
-//	I2: Frame txnIDs are strictly monotonic per partition. A txnID gap during
-//	    replay is corruption and open fails, leaving all bytes intact.
+//	I1: A request is acknowledged only after it is in the pending watermark
+//	    snapshot taken before a commit wave's fdatasync and its segment's
+//	    fdatasync returns successfully. Bytes written during fdatasync are not
+//	    covered by that call. Recovery keeps the longest valid frame prefix;
+//	    anything discarded was never acknowledged.
+//	I2: Frame txnIDs are strictly monotonic per partition. The WAL format has no
+//	    group boundaries, so recovery still scans independent frames and needs no
+//	    pipeline-specific handling. A txnID gap is corruption and open fails.
 //	I3: In-memory state and reader wakeups are published only after the frame
 //	    is durable.
 //	I4: A stream's partition assignment never changes: the hash is stable and
@@ -37,10 +38,11 @@
 //	    conflicting Options.Partitions.
 //	I5: Per partition, the stager owns validation, encoding, transaction and
 //	    offset allocation, and WAL writes; the committer owns durability; and a
-//	    single publisher alone publishes logical stream state and retirements in
-//	    FIFO order. Their bounded handoffs preserve order and backpressure. The
-//	    stager carries uncommitted logical end-state in its private overlay and
-//	    takes stream RLock when seeding from published state. Other readers also
+//	    single publisher alone publishes logical stream state and completions in
+//	    FIFO order. The pending list is bounded and their handoffs preserve order
+//	    and backpressure. The stager carries uncommitted logical end-state in its
+//	    private overlay and takes stream RLock when seeding from published state.
+//	    Other readers also
 //	    take consistent snapshots under RLock and never do file I/O while holding
 //	    it.
 //	I6: All mutations of one stream flow through its single partition worker,

@@ -3,7 +3,8 @@ package seglog
 import "sync/atomic"
 
 // PartitionStats is a snapshot of one partition's commit and materialization
-// activity.
+// activity. GroupsCommitted and GroupSizeHist now count partition snapshots
+// per flush wave; histogram buckets contain operations per snapshot.
 type PartitionStats struct {
 	GroupsCommitted      int64
 	OpsCommitted         int64

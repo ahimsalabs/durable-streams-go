@@ -216,7 +216,7 @@ func softDeletedErr(streamID string) error {
 // validateBatch checks every message against per-message and aggregate
 // limits. The aggregate bound is the WAL segment capacity: one logical
 // mutation is one frame and a frame never spans segments. metaBound must be
-// the same overestimate group admission uses (estimateFrameBytes), so any
+// the same conservative metadata bounds as frame admission, so any
 // admitted request is guaranteed to encode within one segment.
 func (s *Storage) validateBatch(streamID string, messages [][]byte, allowEmptyBatch bool, metaBound int) error {
 	if err := s.validatePayloads(messages, allowEmptyBatch); err != nil {
