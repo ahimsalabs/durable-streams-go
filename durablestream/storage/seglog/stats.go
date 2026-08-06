@@ -11,6 +11,7 @@ type PartitionStats struct {
 	CommitFdatasyncNanos int64
 	GroupSizeHist        [10]int64
 	CommitterIdleNanos   int64
+	PublishNanos         int64
 	MaterializerSyncs    int64
 	SyncfsCalls          int64
 	CheckpointRounds     int64
@@ -29,6 +30,7 @@ type partitionStats struct {
 	commitFdatasyncNanos atomic.Int64
 	groupSizeHist        [10]atomic.Int64
 	committerIdleNanos   atomic.Int64
+	publishNanos         atomic.Int64
 	materializerSyncs    atomic.Int64
 	syncfsCalls          atomic.Int64
 	checkpointRounds     atomic.Int64
@@ -54,6 +56,7 @@ func (s *partitionStats) snapshot() PartitionStats {
 		WALBytesWritten:      s.walBytesWritten.Load(),
 		CommitFdatasyncNanos: s.commitFdatasyncNanos.Load(),
 		CommitterIdleNanos:   s.committerIdleNanos.Load(),
+		PublishNanos:         s.publishNanos.Load(),
 		MaterializerSyncs:    s.materializerSyncs.Load(),
 		SyncfsCalls:          s.syncfsCalls.Load(),
 		CheckpointRounds:     s.checkpointRounds.Load(),
@@ -72,6 +75,7 @@ func (s *PartitionStats) add(other PartitionStats) {
 	s.WALBytesWritten += other.WALBytesWritten
 	s.CommitFdatasyncNanos += other.CommitFdatasyncNanos
 	s.CommitterIdleNanos += other.CommitterIdleNanos
+	s.PublishNanos += other.PublishNanos
 	s.MaterializerSyncs += other.MaterializerSyncs
 	s.SyncfsCalls += other.SyncfsCalls
 	s.CheckpointRounds += other.CheckpointRounds

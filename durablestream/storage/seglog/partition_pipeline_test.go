@@ -111,6 +111,66 @@ func TestPartitionPipeline_StagesSequenceChainBeforePriorPublish(t *testing.T) {
 	}
 }
 
+func TestPartitionPublisher_AcksFIFOAndSyncFailureDoesNotWedge(t *testing.T) {
+	opts := pipelineOptions(t.TempDir())
+	opts.Partitions = 2
+	s := openTest(t, opts)
+	ids := make([]string, 2)
+	for i := 0; ids[0] == "" || ids[1] == ""; i++ {
+		id := fmt.Sprintf("publisher-%d", i)
+		ids[s.partitionFor(id).id] = id
+	}
+	for _, id := range ids {
+		if _, err := s.Create(t.Context(), id, durablestream.StreamConfig{}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	p := s.partitionFor(ids[0])
+	firstSyncStarted, releaseFirstSync := make(chan struct{}), make(chan struct{})
+	t.Cleanup(func() { closeTestGate(releaseFirstSync) })
+	p.wal.blockNextSync(firstSyncStarted, releaseFirstSync)
+	first := appendAsync(s, ids[0], "first", "")
+	awaitSignal(t, firstSyncStarted, "first publisher wave")
+
+	secondSyncStarted, releaseSecondSync := make(chan struct{}), make(chan struct{})
+	t.Cleanup(func() { closeTestGate(releaseSecondSync) })
+	p.wal.blockNextSync(secondSyncStarted, releaseSecondSync)
+	second := appendAsync(s, ids[0], "second", "")
+	closeTestGate(releaseFirstSync)
+	awaitSignal(t, secondSyncStarted, "second publisher wave")
+	if got := awaitAppend(t, first); got.err != nil || got.offset != storagepkg.FormatSimpleOffset(1) {
+		t.Fatalf("first append = (%q, %v), want (1, nil)", got.offset, got.err)
+	}
+	select {
+	case got := <-second:
+		t.Fatalf("second append acknowledged before its wave completed: %v", got.err)
+	default:
+	}
+	closeTestGate(releaseSecondSync)
+	if got := awaitAppend(t, second); got.err != nil || got.offset != storagepkg.FormatSimpleOffset(2) {
+		t.Fatalf("second append = (%q, %v), want (2, nil)", got.offset, got.err)
+	}
+	if got := readAll(t, s, ids[0]); !reflect.DeepEqual(got, []string{"first", "second"}) {
+		t.Fatalf("published order = %q, want [first second]", got)
+	}
+
+	injected := errors.New("publisher sync failure")
+	p.wal.failNextSync(injected)
+	if got := awaitAppend(t, appendAsync(s, ids[0], "fails", "")); !errors.Is(got.err, injected) {
+		t.Fatalf("sync-failed append error = %v, want injected error", got.err)
+	}
+	if got := awaitAppend(t, appendAsync(s, ids[0], "fails-later", "")); !errors.Is(got.err, injected) {
+		t.Fatalf("post-failure append error = %v, want injected error", got.err)
+	}
+	if _, err := s.Append(t.Context(), ids[1], []byte("survives"), ""); err != nil {
+		t.Fatalf("subsequent partition wave: %v", err)
+	}
+	if got := readAll(t, s, ids[1]); !reflect.DeepEqual(got, []string{"survives"}) {
+		t.Fatalf("subsequent partition publish = %q, want [survives]", got)
+	}
+}
+
 func TestPartitionPipeline_BarrierWaitsForPriorPublication(t *testing.T) {
 	dir := t.TempDir()
 	s := openTest(t, pipelineOptions(dir))

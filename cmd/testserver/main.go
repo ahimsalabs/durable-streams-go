@@ -177,6 +177,7 @@ func logSeglogStats(current, previous seglog.Stats, elapsed time.Duration) {
 	delta.WALBytesWritten -= previous.WALBytesWritten
 	delta.CommitFdatasyncNanos -= previous.CommitFdatasyncNanos
 	delta.CommitterIdleNanos -= previous.CommitterIdleNanos
+	delta.PublishNanos -= previous.PublishNanos
 	delta.MaterializerSyncs -= previous.MaterializerSyncs
 	delta.SyncfsCalls -= previous.SyncfsCalls
 	delta.CheckpointRounds -= previous.CheckpointRounds
@@ -198,9 +199,9 @@ func logSeglogStats(current, previous seglog.Stats, elapsed time.Duration) {
 		// delta can briefly exceed one interval.
 		idlePercent = min(idlePercent, 100)
 	}
-	log.Printf("seglog-stats: ops=%.0f/s groups=%.0f/s waves=%.0f/s ops/group=%.1f ops/wave=%.1f wal_bytes=%.0f/s fsync_mean=%.1fms idle=%.0f%% hist=%v mat_syncs=%.0f/s syncfs=%.0f/s checkpoints=%.0f/s",
+	log.Printf("seglog-stats: ops=%.0f/s groups=%.0f/s waves=%.0f/s ops/group=%.1f ops/wave=%.1f wal_bytes=%.0f/s fsync_mean=%.1fms idle=%.0f%% publish=%.1fms/s hist=%v mat_syncs=%.0f/s syncfs=%.0f/s checkpoints=%.0f/s",
 		float64(delta.OpsCommitted)/seconds, float64(delta.GroupsCommitted)/seconds, float64(commitWaves)/seconds, opsPerGroup, opsPerWave,
-		float64(delta.WALBytesWritten)/seconds, fsyncMeanMillis, idlePercent, delta.GroupSizeHist,
+		float64(delta.WALBytesWritten)/seconds, fsyncMeanMillis, idlePercent, float64(delta.PublishNanos)/float64(time.Millisecond)/seconds, delta.GroupSizeHist,
 		float64(delta.MaterializerSyncs)/seconds, float64(delta.SyncfsCalls)/seconds, float64(delta.CheckpointRounds)/seconds)
 }
 

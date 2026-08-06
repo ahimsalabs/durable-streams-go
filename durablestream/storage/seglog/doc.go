@@ -5,15 +5,15 @@
 // # Architecture
 //
 // Stream IDs hash (XXH64, stable across restarts) to one of N logical
-// partitions. Each partition has a bounded two-stage worker: one stager owns
-// validation, offset and transaction allocation, encoding, and WAL writes;
-// one committer publishes staged groups in FIFO order. Committers enter one
-// storage-wide gate before fdatasyncing their own WAL segments concurrently;
-// arrivals during an active wave form the next wave. The completed global
-// wave, rather than each partition's individual return time, is the adaptive
-// batching clock. Independent requests share one write and fdatasync, but each
-// frame remains independently replayable — requests are never atomically
-// coupled.
+// partitions. Each partition has a bounded three-stage worker: one stager owns
+// validation, offset and transaction allocation, encoding, and WAL writes; one
+// committer establishes durability through the storage-wide gate; and one FIFO
+// publisher updates catalog state and acknowledges requests. Publication
+// overlaps the committer's next hunger and wave admission. Arrivals during an
+// active wave form the next wave. The completed global wave, rather than each
+// partition's individual return time, is the adaptive batching clock.
+// Independent requests share one write and fdatasync, but each frame remains
+// independently replayable — requests are never atomically coupled.
 //
 // The WAL is the sole durable commit point. Every mutation — create, append,
 // close, delete, touch, fork, retention, trim — is one transaction frame in
@@ -36,11 +36,13 @@
 //	    the partition count is persisted in the FORMAT file. Open refuses a
 //	    conflicting Options.Partitions.
 //	I5: Per partition, the stager owns validation, encoding, transaction and
-//	    offset allocation, and WAL writes; the committer alone publishes logical
-//	    stream state. Their bounded FIFO handoff preserves order. The stager
-//	    carries uncommitted logical end-state in its private overlay and takes
-//	    stream RLock when seeding from published state. Other readers also take
-//	    consistent snapshots under RLock and never do file I/O while holding it.
+//	    offset allocation, and WAL writes; the committer owns durability; and a
+//	    single publisher alone publishes logical stream state and retirements in
+//	    FIFO order. Their bounded handoffs preserve order and backpressure. The
+//	    stager carries uncommitted logical end-state in its private overlay and
+//	    takes stream RLock when seeding from published state. Other readers also
+//	    take consistent snapshots under RLock and never do file I/O while holding
+//	    it.
 //	I6: All mutations of one stream flow through its single partition worker,
 //	    so per-stream operations are totally ordered without cross-partition
 //	    coordination.

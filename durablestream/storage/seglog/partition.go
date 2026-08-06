@@ -84,9 +84,9 @@ type partition struct {
 	lastTS    int64
 	encodeBuf []byte
 
-	// broken is latched by the committer after the first FIFO WAL failure and
-	// read by the stager to stop further encoding. published* is committer-owned
-	// while run is active and read after run exits by finalMaterialize.
+	// broken is latched after the first FIFO WAL failure and read by the stager
+	// to stop further encoding. published* is publisher-owned while run is
+	// active and read after run exits by finalMaterialize.
 	brokenMu        sync.Mutex
 	broken          error
 	publishedSeq    uint64
@@ -250,9 +250,9 @@ type partitionStager struct {
 	writeStopped bool
 }
 
-// run owns both pipeline stages. It starts exactly one committer, drains the
-// admission queue, closes the FIFO handoff, consumes every retirement, and
-// joins the committer before returning.
+// run owns all three pipeline stages. It starts exactly one committer and one
+// FIFO publisher, drains the admission queue, consumes every retirement, and
+// joins both goroutines before returning.
 func (p *partition) run() {
 	p.publishedSeq = p.wal.activeSeq
 	p.publishedOff = p.wal.writePos
@@ -260,12 +260,23 @@ func (p *partition) run() {
 	handoff := make(chan *stagedGroup, 1)
 	retired := make(chan retiredGroup, 1)
 	ready := make(chan struct{}) // unbuffered: hunger is a rendezvous
+	// Capacity two is the bounded overlap contract: the committer may run one
+	// wave ahead of acknowledgements, then its blocking send applies
+	// backpressure instead of accumulating durable-but-unpublished work.
+	publish := make(chan publishSet, 2)
 	committerDone := make(chan struct{})
-	// run owns and joins this goroutine. It terminates after handoff closes and
-	// every staged group has been published or failed.
+	publisherDone := make(chan struct{})
+	// run owns and joins both goroutines. The committer terminates after
+	// handoff closes, then closes publish; the publisher terminates after
+	// every synced wave has been published or failed.
 	go func() {
-		p.commitGroups(handoff, retired, ready)
+		p.commitGroups(handoff, publish, ready)
+		close(publish)
 		close(committerDone)
+	}()
+	go func() {
+		p.publishSets(publish, retired)
+		close(publisherDone)
 	}()
 	stager := partitionStager{
 		p: p, handoff: handoff, retired: retired, ready: ready,
@@ -300,6 +311,7 @@ func (p *partition) run() {
 		stager.retire(<-retired)
 	}
 	<-committerDone
+	<-publisherDone
 }
 
 // Guaranteed upper bounds on encoded JSON meta documents. createMetaBound
@@ -608,9 +620,18 @@ func (p *partition) stageGroup(groupID uint64, group []*request, inflight map[st
 	return batch
 }
 
-// commitGroups serially establishes durability, publishes in FIFO order, and
-// completes requests. One committer per partition is invariant I1/I3's owner.
-func (p *partition) commitGroups(handoff <-chan *stagedGroup, retired chan<- retiredGroup, ready chan<- struct{}) {
+// publishSet is one flush wave's worth of groups with the wave's shared sync
+// outcome, handed from the committer to the publisher.
+type publishSet struct {
+	batches []*stagedGroup
+	syncErr error
+}
+
+// commitGroups serially establishes durability in WAL order and hands each
+// synced wave to the publisher. The committer owns I1's durability boundary;
+// the publisher owns I3's state transition. Splitting them lets the committer
+// re-board while the previous wave's acks are still being written.
+func (p *partition) commitGroups(handoff <-chan *stagedGroup, publish chan<- publishSet, ready chan<- struct{}) {
 	for {
 		idleStart := time.Now()
 		var batch *stagedGroup
@@ -631,10 +652,39 @@ func (p *partition) commitGroups(handoff <-chan *stagedGroup, retired chan<- ret
 		}
 		batches := append(make([]*stagedGroup, 0, 4), batch)
 		syncErr := p.syncWave(&batches, handoff)
-		for _, b := range batches {
-			published := p.commitGroup(b, syncErr)
+		if syncErr != nil {
+			// Latch before handoff so the next commit iteration observes the
+			// failed durability boundary even if publication has not run yet.
+			_ = p.latchBroken(syncErr)
+		}
+		publish <- publishSet{batches: batches, syncErr: syncErr}
+	}
+}
+
+// publishSets is the partition's single publisher. It fails or publishes each
+// wave's groups in FIFO order and retires them to the stager, all strictly
+// after that wave's fdatasync outcome (invariant I1 rides the syncErr, not
+// goroutine identity).
+func (p *partition) publishSets(publish <-chan publishSet, retired chan<- retiredGroup) {
+	var priorErr error
+	for set := range publish {
+		start := time.Now()
+		setErr := set.syncErr
+		if setErr == nil {
+			setErr = priorErr
+		}
+		for _, b := range set.batches {
+			published := p.commitGroup(b, setErr)
+			if !published && priorErr == nil {
+				// Carry failures forward in publisher order. Do not reread the
+				// global broken state for successful earlier sets: a later
+				// committer failure may already have latched it.
+				priorErr = p.brokenErr()
+				setErr = priorErr
+			}
 			retired <- retiredGroup{id: b.id, published: published}
 		}
+		p.stats.publishNanos.Add(time.Since(start).Nanoseconds())
 	}
 }
 
@@ -649,6 +699,11 @@ func (p *partition) syncWave(batches *[]*stagedGroup, handoff <-chan *stagedGrou
 		// Nothing durable to establish (sync disabled, barrier-only group, or
 		// a failed write): publish immediately, off the wave cadence.
 		return nil
+	}
+	if err := p.brokenErr(); err != nil {
+		// A prior wave failure is latched before handoff; do not spend flush
+		// waves on a partition that refuses writes.
+		return err
 	}
 	admission, err := p.st.commitGate.admit()
 	if err != nil {
@@ -688,9 +743,6 @@ drain:
 
 func (p *partition) commitGroup(batch *stagedGroup, syncErr error) bool {
 	err := batch.writeErr
-	if err == nil {
-		err = p.brokenErr()
-	}
 	if err == nil {
 		err = syncErr
 	}

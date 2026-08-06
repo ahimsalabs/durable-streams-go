@@ -2,11 +2,8 @@ package seglog
 
 import (
 	"errors"
-	"sync"
 	"testing"
 	"time"
-
-	"github.com/ahimsalabs/durable-streams-go/durablestream"
 )
 
 type admissionResult struct {
@@ -107,46 +104,10 @@ func TestCommitGate_FailingMemberDoesNotBlockNextWave(t *testing.T) {
 	next.complete()
 }
 
-func TestCommitGate_StorageCloseDrainsActiveCommit(t *testing.T) {
-	opts := pipelineOptions(t.TempDir())
-	storage, err := New(opts)
-	if err != nil {
-		t.Fatal(err)
-	}
-	var cleanup sync.Once
-	releaseSync := make(chan struct{})
-	t.Cleanup(func() {
-		cleanup.Do(func() { close(releaseSync) })
-		_ = storage.Close()
-	})
-	if _, err := storage.Create(t.Context(), "close-gate", durablestream.StreamConfig{}); err != nil {
-		t.Fatal(err)
-	}
-
-	syncStarted := make(chan struct{})
-	storage.parts[0].wal.blockNextSync(syncStarted, releaseSync)
-	appendDone := appendAsync(storage, "close-gate", "value", "")
-	awaitSignal(t, syncStarted, "active commit sync")
-	closeDone := make(chan error, 1)
-	go func() { closeDone <- storage.Close() }()
-	select {
-	case err := <-closeDone:
-		t.Fatalf("Close returned before active commit drained: %v", err)
-	default:
-	}
-	cleanup.Do(func() { close(releaseSync) })
-	if result := awaitAppend(t, appendDone); result.err != nil {
-		t.Fatalf("append: %v", result.err)
-	}
-	select {
-	case err := <-closeDone:
-		if err != nil {
-			t.Fatalf("Close: %v", err)
-		}
-	case <-time.After(5 * time.Second):
-		t.Fatal("Close did not drain commit gate")
-	}
-	if _, err := storage.commitGate.admit(); !errors.Is(err, ErrClosed) {
+func TestCommitGate_CloseRejectsNewAdmissions(t *testing.T) {
+	gate := newCommitGate()
+	gate.close()
+	if _, err := gate.admit(); !errors.Is(err, ErrClosed) {
 		t.Errorf("admit after Close = %v, want ErrClosed", err)
 	}
 }

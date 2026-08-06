@@ -6,6 +6,12 @@ import (
 	"time"
 )
 
+type checkpointBarrierResult struct {
+	supported bool
+	performed bool
+	err       error
+}
+
 func TestCheckpointBarrier_RequestsDuringSyncShareNextEpoch(t *testing.T) {
 	var barrier checkpointBarrier
 	var calls atomic.Int64
@@ -23,14 +29,14 @@ func TestCheckpointBarrier_RequestsDuringSyncShareNextEpoch(t *testing.T) {
 	awaitSignal(t, firstStarted, "first checkpoint barrier")
 
 	const followers = 4
-	results := make(chan bool, followers)
+	results := make(chan checkpointBarrierResult, followers)
 	for range followers {
 		go func() {
-			supported, _, err := barrier.run(func() (bool, error) {
+			supported, performed, err := barrier.run(func() (bool, error) {
 				calls.Add(1)
 				return true, nil
 			})
-			results <- supported && err == nil
+			results <- checkpointBarrierResult{supported: supported, performed: performed, err: err}
 		}()
 	}
 	deadline := time.Now().Add(5 * time.Second)
@@ -52,11 +58,15 @@ func TestCheckpointBarrier_RequestsDuringSyncShareNextEpoch(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("first checkpoint barrier did not finish")
 	}
+	var performed int
 	for range followers {
 		select {
-		case ok := <-results:
-			if !ok {
-				t.Error("coalesced checkpoint barrier returned an error")
+		case result := <-results:
+			if result.err != nil || !result.supported {
+				t.Errorf("coalesced checkpoint barrier = (%v, %v), want (true, nil)", result.supported, result.err)
+			}
+			if result.performed {
+				performed++
 			}
 		case <-time.After(5 * time.Second):
 			t.Fatal("coalesced checkpoint barrier did not finish")
@@ -64,5 +74,8 @@ func TestCheckpointBarrier_RequestsDuringSyncShareNextEpoch(t *testing.T) {
 	}
 	if got := calls.Load(); got != 2 {
 		t.Errorf("filesystem barrier calls = %d, want 2 epochs", got)
+	}
+	if performed != 1 {
+		t.Errorf("followers performing coalesced barrier = %d, want 1", performed)
 	}
 }
