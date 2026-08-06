@@ -12,6 +12,7 @@ const (
 	DefaultPartitions      = 32
 	DefaultMaxMessageSize  = 10 << 20 // 10 MiB
 	DefaultWALSegmentBytes = 256 << 20
+	DefaultWALExtentBytes  = 16 << 20
 	// DefaultGroupLinger remains for source compatibility. The write-at-arrival
 	// pipeline does not read it; commit waves now self-clock.
 	DefaultGroupLinger       = time.Duration(0)
@@ -92,6 +93,9 @@ type Options struct {
 	// a frame must fit one segment.
 	WALSegmentBytes int64
 
+	// WALExtentBytes is the unit of physical WAL preallocation.
+	WALExtentBytes int64
+
 	// GroupLinger is retained for source compatibility and is now a no-op.
 	// Write-at-arrival commit waves self-clock without a staging linger.
 	GroupLinger time.Duration
@@ -167,6 +171,9 @@ func (o Options) withDefaults() Options {
 	if o.WALSegmentBytes == 0 {
 		o.WALSegmentBytes = DefaultWALSegmentBytes
 	}
+	if o.WALExtentBytes == 0 {
+		o.WALExtentBytes = min(DefaultWALExtentBytes, o.WALSegmentBytes)
+	}
 	if o.GroupMaxBytes == 0 {
 		o.GroupMaxBytes = DefaultGroupMaxBytes
 	}
@@ -222,6 +229,9 @@ func (o Options) validate() error {
 	if o.WALSegmentBytes < walSegmentHeaderSize+minFrameSize {
 		errs = append(errs, fmt.Errorf("option WALSegmentBytes %d is below the minimum %d",
 			o.WALSegmentBytes, walSegmentHeaderSize+minFrameSize))
+	}
+	if o.WALExtentBytes < walSegmentHeaderSize || o.WALExtentBytes > o.WALSegmentBytes {
+		errs = append(errs, fmt.Errorf("option WALExtentBytes must be in [%d, WALSegmentBytes], got %d", walSegmentHeaderSize, o.WALExtentBytes))
 	}
 	if int64(o.MaxMessageSize) > o.WALSegmentBytes-walSegmentHeaderSize {
 		errs = append(errs, fmt.Errorf("option MaxMessageSize %d cannot fit one WAL segment of %d bytes",

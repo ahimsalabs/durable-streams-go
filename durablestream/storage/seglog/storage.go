@@ -305,7 +305,7 @@ func New(opts Options) (_ *Storage, retErr error) {
 	s.parts = make([]*partition, opts.Partitions)
 	for i := range s.parts {
 		walDir := filepath.Join(dir, "wal", fmt.Sprintf("p%04d", i))
-		w := newWALWriter(walDir, uint32(i), opts.WALSegmentBytes, syncWrites)
+		w := newWALWriter(walDir, uint32(i), opts.WALSegmentBytes, opts.WALExtentBytes, syncWrites)
 		s.parts[i] = newPartition(uint32(i), s, w)
 	}
 	defer func() {

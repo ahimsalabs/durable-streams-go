@@ -12,9 +12,7 @@ import (
 	"time"
 )
 
-// walExtentBytes bounds eager WAL allocation while keeping enough space ahead
-// of the writer to avoid extending the file for each commit group.
-const walExtentBytes int64 = 16 << 20
+const walExtentBytes int64 = DefaultWALExtentBytes
 
 // walWriter owns one partition's WAL segment files. Only the partition stager
 // calls writeGroup and roll; the committer syncs the exact returned file while
@@ -23,6 +21,7 @@ type walWriter struct {
 	dir          string
 	partition    uint32
 	segmentBytes int64
+	extentBytes  int64
 	sync         bool
 
 	// mu guards segments. Segment files are append-only and their descriptors
@@ -46,11 +45,12 @@ type walWriter struct {
 	syncHook  func() error
 }
 
-func newWALWriter(dir string, partition uint32, segmentBytes int64, syncWrites bool) *walWriter {
+func newWALWriter(dir string, partition uint32, segmentBytes, extentBytes int64, syncWrites bool) *walWriter {
 	return &walWriter{
 		dir:          dir,
 		partition:    partition,
 		segmentBytes: segmentBytes,
+		extentBytes:  extentBytes,
 		sync:         syncWrites,
 		segments:     make(map[uint64]*os.File),
 		logicalBytes: make(map[uint64]int64),
@@ -223,13 +223,13 @@ func (w *walWriter) roll() error {
 	w.activeSeq = seq
 	w.writePos = walSegmentHeaderSize
 	w.activeBytes.Store(walSegmentHeaderSize)
-	w.extentEnd = walExtentEnd(w.writePos, w.segmentBytes)
+	w.extentEnd = walExtentEnd(w.writePos, w.segmentBytes, w.extentBytes)
 	return nil
 }
 
 // initSegment preallocates the first extent and writes its durable header.
 func (w *walWriter) initSegment(f *os.File, seq uint64) error {
-	if err := preallocate(f, walExtentEnd(walSegmentHeaderSize, w.segmentBytes)); err != nil {
+	if err := preallocate(f, walExtentEnd(walSegmentHeaderSize, w.segmentBytes, w.extentBytes)); err != nil {
 		return fmt.Errorf("seglog: preallocate WAL segment: %w", err)
 	}
 	hdr := encodeWALSegmentHeader(w.partition, seq, time.Now().UnixNano())
@@ -245,9 +245,19 @@ func (w *walWriter) initSegment(f *os.File, seq uint64) error {
 	return nil
 }
 
-func walExtentEnd(pos, segmentBytes int64) int64 {
-	end := ((pos + walExtentBytes - 1) / walExtentBytes) * walExtentBytes
-	return min(end, segmentBytes)
+func walExtentEnd(pos, segmentBytes, extentBytes int64) int64 {
+	if pos >= segmentBytes {
+		return segmentBytes
+	}
+	remainder := pos % extentBytes
+	if remainder == 0 {
+		return pos
+	}
+	delta := extentBytes - remainder
+	if delta > segmentBytes-pos {
+		return segmentBytes
+	}
+	return pos + delta
 }
 
 // grow reserves all bytes that the next write can touch. The logical segment
@@ -256,7 +266,7 @@ func (w *walWriter) grow(requiredEnd int64) error {
 	if requiredEnd <= w.extentEnd {
 		return nil
 	}
-	end := walExtentEnd(requiredEnd, w.segmentBytes)
+	end := walExtentEnd(requiredEnd, w.segmentBytes, w.extentBytes)
 	if err := preallocate(w.active, end); err != nil {
 		return fmt.Errorf("seglog: grow WAL segment to %d bytes: %w", end, err)
 	}

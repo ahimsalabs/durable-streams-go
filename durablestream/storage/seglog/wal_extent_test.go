@@ -8,7 +8,7 @@ import (
 func TestWALAllocation_GrowsByExtentBeforeWriteAndKeepsRollCap(t *testing.T) {
 	dir := t.TempDir()
 	segmentBytes := 2*walExtentBytes + 4096
-	w := newWALWriter(dir, 0, segmentBytes, false)
+	w := newWALWriter(dir, 0, segmentBytes, DefaultWALExtentBytes, false)
 	t.Cleanup(func() { _ = w.close() })
 
 	if _, _, _, err := w.writeGroup(make([]byte, walExtentBytes-walSegmentHeaderSize)); err != nil {
@@ -48,7 +48,7 @@ func TestRezeroTail_ReextendsOnlyCurrentExtentAndClearsTornBytes(t *testing.T) {
 	if _, err := f.WriteAt([]byte("torn"), validEnd); err != nil {
 		t.Fatal(err)
 	}
-	if err := rezeroTail(f, validEnd, 4*walExtentBytes); err != nil {
+	if err := rezeroTail(f, validEnd, 4*walExtentBytes, DefaultWALExtentBytes); err != nil {
 		t.Fatal(err)
 	}
 	assertFileSize(t, f, 2*walExtentBytes)
@@ -59,6 +59,23 @@ func TestRezeroTail_ReextendsOnlyCurrentExtentAndClearsTornBytes(t *testing.T) {
 	if string(buf) != "\x00\x00\x00\x00" {
 		t.Errorf("tail = %q, want zeros", buf)
 	}
+}
+
+func TestRezeroTail_UsesConfiguredExtent(t *testing.T) {
+	const extent int64 = 4096
+	f, err := os.CreateTemp(t.TempDir(), "wal")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = f.Close() })
+	validEnd := extent + 17
+	if err := f.Truncate(3 * extent); err != nil {
+		t.Fatal(err)
+	}
+	if err := rezeroTail(f, validEnd, 8*extent, extent); err != nil {
+		t.Fatal(err)
+	}
+	assertFileSize(t, f, 2*extent)
 }
 
 func assertFileSize(t *testing.T, f *os.File, want int64) {
