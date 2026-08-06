@@ -45,10 +45,10 @@ type walLoc struct {
 
 // streamState is the in-memory state of one stream incarnation.
 //
-// Ownership: two goroutines mutate disjoint field groups, both always under
-// mu, so each may read its own fields lock-free while readers take mu.RLock
-// for consistent snapshots (invariant I5). The partition worker owns the
-// logical state: cfg, retention, floor, closed, deleted, lastSeq, nextIndex, and walTail
+// Ownership: the partition committer and materializer mutate disjoint field
+// groups, always under mu; readers and the partition stager take mu.RLock for
+// consistent snapshots (invariant I5). The committer owns the logical state:
+// cfg, retention, floor, closed, deleted, lastSeq, nextIndex, and walTail
 // appends. The partition's materializer owns the materialized state: sealed,
 // activeView, materializedThrough, and walTail pruning (firstLive). A new
 // incarnation of the same stream ID is a new *streamState; waiters pin the

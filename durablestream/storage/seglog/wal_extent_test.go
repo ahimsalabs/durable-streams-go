@@ -11,22 +11,22 @@ func TestWALAllocation_GrowsByExtentBeforeWriteAndKeepsRollCap(t *testing.T) {
 	w := newWALWriter(dir, 0, segmentBytes, false)
 	t.Cleanup(func() { _ = w.close() })
 
-	if _, _, err := w.appendGroup(make([]byte, walExtentBytes-walSegmentHeaderSize)); err != nil {
+	if _, _, _, err := w.writeGroup(make([]byte, walExtentBytes-walSegmentHeaderSize)); err != nil {
 		t.Fatalf("fill first extent: %v", err)
 	}
 	assertFileSize(t, w.active, walExtentBytes)
 
-	if _, _, err := w.appendGroup([]byte{1}); err != nil {
+	if _, _, _, err := w.writeGroup([]byte{1}); err != nil {
 		t.Fatalf("cross first extent: %v", err)
 	}
 	assertFileSize(t, w.active, 2*walExtentBytes)
 
 	first := w.active
-	if _, _, err := w.appendGroup(make([]byte, walExtentBytes)); err != nil {
+	if _, _, _, err := w.writeGroup(make([]byte, walExtentBytes)); err != nil {
 		t.Fatalf("fill second extent: %v", err)
 	}
 	assertFileSize(t, first, segmentBytes)
-	if _, _, err := w.appendGroup(make([]byte, 4096)); err != nil {
+	if _, _, _, err := w.writeGroup(make([]byte, 4096)); err != nil {
 		t.Fatalf("roll at logical cap: %v", err)
 	}
 	if w.activeSeq != 2 {

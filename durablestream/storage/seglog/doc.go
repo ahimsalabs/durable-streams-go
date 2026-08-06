@@ -5,12 +5,13 @@
 // # Architecture
 //
 // Stream IDs hash (XXH64, stable across restarts) to one of N logical
-// partitions. A single worker goroutine owns each partition: it is the only
-// writer of the partition's WAL and the only mutator of the in-memory state of
-// the partition's streams, which gives per-stream ordering, deduplication, and
-// offset assignment without a global write lock. Independent requests are
-// group-committed: their frames share one write and one fdatasync, but each
-// frame commits or fails on its own — requests are never atomically coupled.
+// partitions. Each partition has a bounded two-stage worker: one stager owns
+// validation, offset and transaction allocation, encoding, and WAL writes;
+// one committer fdatasyncs and publishes staged groups in FIFO order. While a
+// group flushes, the stager forms the next group against an in-flight logical
+// overlay, making the device's flush latency the adaptive batching window.
+// Independent requests share one write and fdatasync, but each frame remains
+// independently replayable — requests are never atomically coupled.
 //
 // The WAL is the sole durable commit point. Every mutation — create, append,
 // close, delete, touch, fork, retention, trim — is one transaction frame in
@@ -31,9 +32,12 @@
 //	I4: A stream's partition assignment never changes: the hash is stable and
 //	    the partition count is persisted in the FORMAT file. Open refuses a
 //	    conflicting Options.Partitions.
-//	I5: Only the owning partition worker mutates a stream's state; readers
-//	    take consistent snapshots under RLock and never do file I/O while
-//	    holding it.
+//	I5: Per partition, the stager owns validation, encoding, transaction and
+//	    offset allocation, and WAL writes; the committer alone publishes logical
+//	    stream state. Their bounded FIFO handoff preserves order. The stager
+//	    carries uncommitted logical end-state in its private overlay and takes
+//	    stream RLock when seeding from published state. Other readers also take
+//	    consistent snapshots under RLock and never do file I/O while holding it.
 //	I6: All mutations of one stream flow through its single partition worker,
 //	    so per-stream operations are totally ordered without cross-partition
 //	    coordination.

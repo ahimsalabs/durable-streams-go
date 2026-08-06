@@ -3,6 +3,7 @@ package seglog
 import (
 	"encoding/json"
 	"fmt"
+	"os"
 	"sync"
 	"time"
 
@@ -58,9 +59,8 @@ type result struct {
 // published. The materializer uses it to bound checkpoint advancement.
 const opBarrier opKind = 0xff
 
-// partition is one WAL partition and its worker. The worker goroutine is the
-// only writer of the partition's WAL and the only mutator of its streams'
-// state (invariants I5/I6).
+// partition is one WAL partition and its bounded stager/committer worker
+// (invariants I5/I6).
 type partition struct {
 	id  uint32
 	st  *Storage
@@ -77,12 +77,20 @@ type partition struct {
 	stop        chan struct{}
 	senders     sync.WaitGroup
 
-	// Worker-owned state, touched only by run() (and recovery, before run
-	// starts).
+	// Stager-owned state, touched only by run() (and recovery, before run
+	// starts). These allocation cursors may run ahead of publication.
 	nextTxnID uint64
 	lastTS    int64
 	encodeBuf []byte
-	broken    error // latched fail-stop error after a WAL I/O failure
+
+	// broken is latched by the committer after the first FIFO WAL failure and
+	// read by the stager to stop further encoding. published* is committer-owned
+	// while run is active and read after run exits by finalMaterialize.
+	brokenMu        sync.Mutex
+	broken          error
+	publishedSeq    uint64
+	publishedOff    int64
+	publishedNextTx uint64
 
 	// Materializer coordination. The worker adds under dirtyMu at publish
 	// time; the materializer swaps the containers each round.
@@ -198,27 +206,95 @@ func (p *partition) closeAdmission() {
 	close(p.queue)
 }
 
-// run is the worker loop: collect a group, commit it, apply it, repeat until
-// the queue drains closed.
+// stagedGroup is the ownership boundary between the partition's stager and
+// committer. The stager never reads or mutates a group after handing it off.
+type stagedGroup struct {
+	id uint64
+
+	ops []*stagedOp
+
+	segment *os.File
+	segSeq  uint64
+	base    int64
+
+	endSeq     uint64
+	endOff     int64
+	endNextTxn uint64
+
+	writeAttempted bool
+	writeErr       error
+}
+
+type retiredGroup struct {
+	id        uint64
+	published bool
+}
+
+// partitionStager owns the in-flight validation overlay and the bounded
+// channels connecting it to the committer. A capacity-one handoff permits one
+// group to wait behind the flushing group; GroupMaxBytes and QueueDepth bound
+// the forming group and admission queue.
+type partitionStager struct {
+	p        *partition
+	handoff  chan<- *stagedGroup
+	retired  <-chan retiredGroup
+	inflight map[string]*pendingStream
+	last     map[string]uint64
+
+	nextGroupID  uint64
+	outstanding  int
+	writeStopped bool
+}
+
+// run owns both pipeline stages. It starts exactly one committer, drains the
+// admission queue, closes the FIFO handoff, consumes every retirement, and
+// joins the committer before returning.
 func (p *partition) run() {
+	p.publishedSeq = p.wal.activeSeq
+	p.publishedOff = p.wal.writePos
+	p.publishedNextTx = p.nextTxnID
+	handoff := make(chan *stagedGroup, 1)
+	retired := make(chan retiredGroup, 1)
+	committerDone := make(chan struct{})
+	// run owns and joins this goroutine. It terminates after handoff closes and
+	// every staged group has been published or failed.
+	go func() {
+		p.commitGroups(handoff, retired)
+		close(committerDone)
+	}()
+	stager := partitionStager{
+		p: p, handoff: handoff, retired: retired,
+		inflight: make(map[string]*pendingStream), last: make(map[string]uint64),
+		nextGroupID: 1,
+	}
+
 	var carry *request
 	for {
 		first := carry
 		if first == nil {
 			var ok bool
-			first, ok = <-p.queue
+			first, ok = stager.nextRequest()
 			if !ok {
-				return
+				break
 			}
 		}
 		var queueClosed bool
 		var group []*request
-		group, queueClosed, carry = p.collect(first)
-		p.processGroup(group)
+		group, queueClosed, carry = stager.collect(first)
+		stager.send(p.stageGroup(stager.nextGroupID, group, stager.inflight, stager.last, stager.writeStopped))
+		if p.brokenErr() != nil {
+			stager.writeStopped = true
+		}
+		stager.nextGroupID++
 		if queueClosed {
-			return
+			break
 		}
 	}
+	close(handoff)
+	for stager.outstanding > 0 {
+		stager.retire(<-retired)
+	}
+	<-committerDone
 }
 
 // Guaranteed upper bounds on encoded JSON meta documents. createMetaBound
@@ -253,25 +329,41 @@ func estimateFrameBytes(req *request) int64 {
 	return encodedFrameSize(len(req.streamID), metaLen, req.messages)
 }
 
-// collect gathers requests for one commit group, stopping at GroupMaxBytes.
-// With the default zero GroupLinger it drains only the requests already
-// queued and commits immediately: batching under concurrency comes from
-// arrivals during the previous group's fdatasync, so sequential callers never
-// pay an artificial wait. A positive GroupLinger holds the group open for
-// that long after the first request. A request that would cross the byte
-// bound is carried into the next group rather than split.
-func (p *partition) collect(first *request) (group []*request, queueClosed bool, carry *request) {
+func (s *partitionStager) nextRequest() (*request, bool) {
+	for s.outstanding > 0 {
+		select {
+		case req, ok := <-s.p.queue:
+			return req, ok
+		case ack := <-s.retired:
+			s.retire(ack)
+		}
+	}
+	req, ok := <-s.p.queue
+	return req, ok
+}
+
+// collect gathers one bounded commit group. A barrier is a strict queue cut
+// and always forms a standalone marker. The first group behind the committer
+// drains what is already queued and fills the handoff; while both pipeline
+// slots are occupied, the next group remains open until retirement, making
+// fdatasync the adaptive clock. Only a fully idle pipeline uses GroupLinger.
+// A request crossing GroupMaxBytes is carried, never split.
+func (s *partitionStager) collect(first *request) (group []*request, queueClosed bool, carry *request) {
 	group = []*request{first}
+	if first.op == opBarrier {
+		return group, false, nil
+	}
 	groupBytes := estimateFrameBytes(first)
 	// The segment capacity is a hard bound (a group never spans segments);
 	// GroupMaxBytes is the tuning bound within it.
-	maxBytes := min(p.st.opts.GroupMaxBytes, p.wal.capacity())
+	maxBytes := min(s.p.st.opts.GroupMaxBytes, s.p.wal.capacity())
 	if groupBytes >= maxBytes {
 		return group, false, nil
 	}
 
+	flushClocked := s.outstanding >= 2
 	var timerC <-chan time.Time
-	if linger := p.st.opts.GroupLinger; linger > 0 {
+	if linger := s.p.st.opts.GroupLinger; s.outstanding == 0 && linger > 0 && !s.writeStopped {
 		timer := time.NewTimer(linger)
 		timerC = timer.C
 		defer stopTimer(timer)
@@ -280,15 +372,23 @@ func (p *partition) collect(first *request) (group []*request, queueClosed bool,
 	for {
 		var req *request
 		var ok bool
-		if timerC == nil {
+		switch {
+		case flushClocked:
 			select {
-			case req, ok = <-p.queue:
+			case req, ok = <-s.p.queue:
+			case ack := <-s.retired:
+				s.retire(ack)
+				return group, false, nil
+			}
+		case timerC == nil:
+			select {
+			case req, ok = <-s.p.queue:
 			default:
 				return group, false, nil
 			}
-		} else {
+		default:
 			select {
-			case req, ok = <-p.queue:
+			case req, ok = <-s.p.queue:
 			case <-timerC:
 				return group, false, nil
 			}
@@ -296,12 +396,46 @@ func (p *partition) collect(first *request) (group []*request, queueClosed bool,
 		if !ok {
 			return group, true, nil
 		}
+		if req.op == opBarrier {
+			return group, false, req
+		}
 		size := estimateFrameBytes(req)
 		if groupBytes > maxBytes-size {
 			return group, false, req
 		}
 		groupBytes += size
 		group = append(group, req)
+	}
+}
+
+func (s *partitionStager) send(group *stagedGroup) {
+	for {
+		select {
+		case s.handoff <- group:
+			s.outstanding++
+			if group.writeErr != nil {
+				s.writeStopped = true
+			}
+			return
+		case ack := <-s.retired:
+			s.retire(ack)
+		}
+	}
+}
+
+func (s *partitionStager) retire(ack retiredGroup) {
+	if s.outstanding > 0 {
+		s.outstanding--
+	}
+	if !ack.published {
+		s.writeStopped = true
+		return
+	}
+	for streamID, groupID := range s.last {
+		if groupID == ack.id {
+			delete(s.last, streamID)
+			delete(s.inflight, streamID)
+		}
 	}
 }
 
@@ -381,32 +515,34 @@ func (op *stagedOp) hasFrame() bool {
 		op.applyRetention != nil || op.applyTrim != nil || op.applyFork != nil
 }
 
-// pendingStream is the staging overlay for one stream within a group: later
-// requests in the same group observe the effects of earlier staged ones.
+// pendingStream is the stager-owned logical overlay for one stream. It remains
+// live across groups until the committer confirms that the last group touching
+// the stream published.
 type pendingStream struct {
 	state  *streamState // live state, or the staged new state for creations
 	exists bool
 
-	cfg       durablestream.StreamConfig
-	closed    bool
-	nextIndex int64
-	lastSeq   string
-	retention Retention
-	floor     int64
+	cfg         durablestream.StreamConfig
+	closed      bool
+	softDeleted bool
+	nextIndex   int64
+	lastSeq     string
+	retention   Retention
+	floor       int64
 }
 
-// processGroup validates and encodes every request, commits the encoded
-// frames with one write and one fdatasync, then publishes and completes them
-// in order. Requests are never atomically coupled: each frame stands alone,
-// and only a WAL I/O failure — which fail-stops the partition — is group-wide.
-func (p *partition) processGroup(group []*request) {
-	if p.broken != nil {
-		for _, req := range group {
-			req.done <- result{err: p.broken}
+// stageGroup validates and encodes a request group against the cross-group
+// overlay, then writes it without syncing. It never publishes catalog state,
+// wakes readers, or completes requests; those are committer-only operations.
+func (p *partition) stageGroup(groupID uint64, group []*request, inflight map[string]*pendingStream, last map[string]uint64, writeStopped bool) *stagedGroup {
+	batch := &stagedGroup{id: groupID, endSeq: p.wal.activeSeq, endOff: p.wal.writePos, endNextTxn: p.nextTxnID}
+	if writeStopped || p.brokenErr() != nil {
+		batch.ops = make([]*stagedOp, len(group))
+		for i, req := range group {
+			batch.ops[i] = &stagedOp{req: req}
 		}
-		return
+		return batch
 	}
-
 	buf := p.encodeBuf[:0]
 	pending := make(map[string]*pendingStream)
 	staged := make([]*stagedOp, 0, len(group))
@@ -415,7 +551,7 @@ func (p *partition) processGroup(group []*request) {
 	p.lastTS = ts
 
 	for _, req := range group {
-		op, frame := p.stage(req, pending, now, ts)
+		op, frame := p.stage(req, pending, inflight, now, ts)
 		if op.hasFrame() {
 			frame.txnID = p.nextTxnID
 			p.nextTxnID++
@@ -425,55 +561,91 @@ func (p *partition) processGroup(group []*request) {
 				op.payloadLens[i] = int32(len(pl))
 			}
 			op.ts = ts
+			inflight[req.streamID] = pending[req.streamID]
+			last[req.streamID] = groupID
+		} else if op.barrier {
+			op.res.walSeq = p.wal.activeSeq
+			op.res.walOff = p.wal.writePos
+			op.res.nextTxn = p.nextTxnID
 		}
 		staged = append(staged, op)
 	}
 
-	var segSeq uint64
-	var base int64
+	batch.ops = staged
 	if len(buf) > 0 {
-		var err error
-		segSeq, base, err = p.wal.appendGroup(buf)
-		if err != nil {
-			// Fail-stop: after a failed write or sync the durable state of
-			// the WAL tail is unknowable, so the partition refuses further
-			// work rather than risk acknowledging after a failed sync.
-			p.broken = fmt.Errorf("seglog: partition %d WAL failure: %w", p.id, err)
-			p.st.opts.SLogger.Error("seglog partition failed, refusing further writes",
-				"partition", p.id, "error", err)
-			for _, op := range staged {
-				if op.hasFrame() {
-					op.res = result{err: p.broken, ambiguous: true}
-				}
-				op.req.done <- op.res
-			}
-			return
-		}
+		batch.writeAttempted = true
+		batch.segSeq, batch.base, batch.segment, batch.writeErr = p.wal.writeGroup(buf)
 	}
+	batch.endSeq = p.wal.activeSeq
+	batch.endOff = p.wal.writePos
+	batch.endNextTxn = p.nextTxnID
 	if cap(buf) <= maxRetainedEncodeBuf {
 		p.encodeBuf = buf[:0]
 	} else {
 		p.encodeBuf = nil
 	}
+	return batch
+}
 
-	// Publish everything before delivering any result: a barrier's result
-	// must not reach the materializer while frames later in this group are
-	// still unpublished, or a checkpoint could advance past them.
-	for _, op := range staged {
-		p.publish(op, segSeq, base)
+// commitGroups serially establishes durability, publishes in FIFO order, and
+// completes requests. One committer per partition is invariant I1/I3's owner.
+func (p *partition) commitGroups(handoff <-chan *stagedGroup, retired chan<- retiredGroup) {
+	for batch := range handoff {
+		published := p.commitGroup(batch)
+		retired <- retiredGroup{id: batch.id, published: published}
 	}
-	// Capture the exact dirty/removal frontier only after the whole group is
-	// published. Doing this in the materializer after receiving the barrier
-	// would race the next group and could checkpoint a post-barrier create.
-	for _, op := range staged {
+}
+
+func (p *partition) commitGroup(batch *stagedGroup) bool {
+	err := batch.writeErr
+	if err == nil {
+		err = p.brokenErr()
+	}
+	if err == nil {
+		err = p.wal.syncSegment(batch.segment)
+	}
+	if err != nil {
+		broken := p.latchBroken(err)
+		for _, op := range batch.ops {
+			op.req.done <- result{err: broken, ambiguous: batch.writeAttempted && op.hasFrame()}
+		}
+		return false
+	}
+
+	for _, op := range batch.ops {
+		p.publish(op, batch.segSeq, batch.base)
+	}
+	// Barriers are standalone queue cuts. Swap the exact dirty/removal
+	// frontier only after every preceding FIFO group has published.
+	for _, op := range batch.ops {
 		if op.barrier && op.req.captureDirty {
 			op.res.dirty, op.res.removals = p.swapDirty()
-			break
 		}
 	}
-	for _, op := range staged {
+	p.publishedSeq = batch.endSeq
+	p.publishedOff = batch.endOff
+	p.publishedNextTx = batch.endNextTxn
+	for _, op := range batch.ops {
 		op.req.done <- op.res
 	}
+	return true
+}
+
+func (p *partition) brokenErr() error {
+	p.brokenMu.Lock()
+	defer p.brokenMu.Unlock()
+	return p.broken
+}
+
+func (p *partition) latchBroken(err error) error {
+	p.brokenMu.Lock()
+	defer p.brokenMu.Unlock()
+	if p.broken == nil {
+		p.broken = fmt.Errorf("seglog: partition %d WAL failure: %w", p.id, err)
+		p.st.opts.SLogger.Error("seglog partition failed, refusing further writes",
+			"partition", p.id, "error", err)
+	}
+	return p.broken
 }
 
 // maxRetainedEncodeBuf caps the group buffer kept across groups so one huge
@@ -485,11 +657,9 @@ const maxRetainedEncodeBuf = 8 << 20
 func (p *partition) publish(op *stagedOp, segSeq uint64, base int64) {
 	switch {
 	case op.barrier:
-		// Everything submitted before this barrier is committed and
-		// published; report the WAL frontier for checkpointing.
-		op.res.walSeq = p.wal.activeSeq
-		op.res.walOff = p.wal.writePos
-		op.res.nextTxn = p.nextTxnID
+		// The stager captured the marker's frontier after every preceding
+		// group write. FIFO arrival here proves those groups are durable and
+		// published without reading staging cursors from this goroutine.
 	case op.applyCreate != nil:
 		a := op.applyCreate
 		st := a.newState
@@ -584,22 +754,32 @@ func (p *partition) publish(op *stagedOp, segSeq uint64, base int64) {
 	}
 }
 
-// loadPending resolves the staging overlay for a stream, seeding it from the
-// catalog on first use. Worker-owned fields are read lock-free (I5).
-func (p *partition) loadPending(pending map[string]*pendingStream, streamID string) *pendingStream {
+// loadPending resolves the current group's view from the cross-group overlay
+// first. Only after the last touching group retires does it seed from the live
+// catalog, taking RLock because the committer now owns logical publication.
+func (p *partition) loadPending(pending, inflight map[string]*pendingStream, streamID string) *pendingStream {
 	if ps, ok := pending[streamID]; ok {
 		return ps
 	}
+	if ps, ok := inflight[streamID]; ok {
+		pending[streamID] = ps
+		return ps
+	}
 	ps := &pendingStream{}
-	if state, ok := p.st.streams.Load(streamID); ok && !state.deleted {
-		ps.state = state
-		ps.exists = true
-		ps.cfg = state.cfg
-		ps.closed = state.closed
-		ps.nextIndex = state.nextIndex
-		ps.lastSeq = state.lastSeq
-		ps.retention = state.retention
-		ps.floor = state.floor
+	if state, ok := p.st.streams.Load(streamID); ok {
+		state.mu.RLock()
+		if !state.deleted {
+			ps.state = state
+			ps.exists = true
+			ps.cfg = state.cfg
+			ps.closed = state.closed
+			ps.softDeleted = state.softDeleted
+			ps.nextIndex = state.nextIndex
+			ps.lastSeq = state.lastSeq
+			ps.retention = state.retention
+			ps.floor = state.floor
+		}
+		state.mu.RUnlock()
 	}
 	pending[streamID] = ps
 	return ps
@@ -607,13 +787,13 @@ func (p *partition) loadPending(pending map[string]*pendingStream, streamID stri
 
 // stage validates one request against the overlay and, when it mutates the
 // stream, prepares its frame spec and apply context.
-func (p *partition) stage(req *request, pending map[string]*pendingStream, now time.Time, ts int64) (*stagedOp, frameSpec) {
+func (p *partition) stage(req *request, pending, inflight map[string]*pendingStream, now time.Time, ts int64) (*stagedOp, frameSpec) {
 	op := &stagedOp{req: req}
 	if req.op == opBarrier {
 		op.barrier = true // resolved in publish, after the group commits
 		return op, frameSpec{}
 	}
-	ps := p.loadPending(pending, req.streamID)
+	ps := p.loadPending(pending, inflight, req.streamID)
 	expired := ps.exists && !ps.cfg.ExpiresAt.IsZero() && now.After(ps.cfg.ExpiresAt)
 
 	switch req.op {
@@ -718,6 +898,7 @@ func (p *partition) stageCreate(op *stagedOp, req *request, ps *pendingStream, e
 	ps.exists = true
 	ps.cfg = cfg
 	ps.closed = cfg.Closed
+	ps.softDeleted = false
 	ps.nextIndex = newState.nextIndex
 	ps.lastSeq = ""
 	ps.retention = newState.retention
@@ -740,7 +921,7 @@ func (p *partition) stageAppend(op *stagedOp, req *request, ps *pendingStream, e
 		op.res = result{err: fmt.Errorf("seglog: stream %q not found: %w", req.streamID, durablestream.ErrNotFound)}
 		return frameSpec{}
 	}
-	if ps.state.softDeleted {
+	if ps.softDeleted {
 		op.res = result{err: softDeletedErr(req.streamID)}
 		return frameSpec{}
 	}
@@ -810,12 +991,13 @@ func (p *partition) stageDelete(op *stagedOp, req *request, ps *pendingStream, t
 		return frameSpec{}
 	}
 	state := ps.state
-	if state.softDeleted && !req.hardCascade {
+	if ps.softDeleted && !req.hardCascade {
 		op.res = result{err: softDeletedErr(req.streamID)}
 		return frameSpec{}
 	}
 	if req.softDelete {
 		op.applyDelete = &deleteApply{state: state, soft: true}
+		ps.softDeleted = true
 		return frameSpec{op: opDelete, flags: flagSoftDelete, streamID: req.streamID, inc: state.inc, ts: ts}
 	}
 	ps.exists = false
@@ -835,7 +1017,7 @@ func (p *partition) stageTouch(op *stagedOp, req *request, ps *pendingStream, ex
 		op.res = result{err: fmt.Errorf("seglog: stream %q not found: %w", req.streamID, durablestream.ErrNotFound)}
 		return frameSpec{}
 	}
-	if ps.state.softDeleted {
+	if ps.softDeleted {
 		op.res = result{err: softDeletedErr(req.streamID)}
 		return frameSpec{}
 	}
@@ -876,7 +1058,7 @@ func (p *partition) stageRetention(op *stagedOp, req *request, ps *pendingStream
 		op.res = result{err: notFoundErr(req.streamID)}
 		return frameSpec{}
 	}
-	if ps.state.softDeleted {
+	if ps.softDeleted {
 		op.res = result{err: softDeletedErr(req.streamID)}
 		return frameSpec{}
 	}

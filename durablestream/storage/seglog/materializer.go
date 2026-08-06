@@ -186,7 +186,7 @@ func (s *Storage) finalMaterialize(p *partition) error {
 		}
 		prepared[st] = draft
 	}
-	barrier := result{walSeq: p.wal.activeSeq, walOff: p.wal.writePos, nextTxn: p.nextTxnID}
+	barrier := result{walSeq: p.publishedSeq, walOff: p.publishedOff, nextTxn: p.publishedNextTx}
 	batch := &materializationBatch{
 		barrier:  barrier,
 		prepared: prepared,

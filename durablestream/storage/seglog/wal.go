@@ -15,9 +15,9 @@ import (
 // of the writer to avoid extending the file for each commit group.
 const walExtentBytes int64 = 16 << 20
 
-// walWriter owns one partition's WAL segment files. Only the partition worker
-// calls appendGroup and roll; concurrent readers resolve payloads through
-// readPayload, which takes the segments lock only to look up a descriptor.
+// walWriter owns one partition's WAL segment files. Only the partition stager
+// calls writeGroup and roll; the committer syncs the exact returned file while
+// concurrent readers resolve payloads through readPayload.
 type walWriter struct {
 	dir          string
 	partition    uint32
@@ -34,11 +34,12 @@ type walWriter struct {
 	writePos  int64
 	extentEnd int64
 
-	// failMu and failWrite are a test seam for exercising partition fail-stop.
-	// Production code never installs an error; taking it consumes exactly one
-	// append attempt and is safe even if a test races writers.
+	// writeHook and syncHook are one-shot test seams for a failure or blocked
+	// operation. Production code never installs either hook; taking one consumes
+	// exactly one operation and is safe even if a test races the worker.
 	failMu    sync.Mutex
-	failWrite error
+	writeHook func() error
+	syncHook  func() error
 }
 
 func newWALWriter(dir string, partition uint32, segmentBytes int64, syncWrites bool) *walWriter {
@@ -70,54 +71,109 @@ func (w *walWriter) adopt(seq uint64, f *os.File, writePos int64) {
 // capacity reports the payload capacity of one segment.
 func (w *walWriter) capacity() int64 { return w.segmentBytes - walSegmentHeaderSize }
 
-// failNextWrite causes the next appendGroup call to fail before touching the
+// failNextWrite causes the next writeGroup call to fail before touching the
 // active segment. It exists solely for deterministic fail-stop tests.
 func (w *walWriter) failNextWrite(err error) {
 	w.failMu.Lock()
-	w.failWrite = err
+	w.writeHook = func() error { return err }
 	w.failMu.Unlock()
 }
 
-func (w *walWriter) takeWriteFailure() error {
+// blockNextWrite holds the next writeGroup before it touches the file. It
+// exists solely to prove staging overlap in deterministic pipeline tests.
+func (w *walWriter) blockNextWrite(started chan<- struct{}, release <-chan struct{}) {
 	w.failMu.Lock()
-	defer w.failMu.Unlock()
-	err := w.failWrite
-	w.failWrite = nil
-	return err
+	w.writeHook = func() error {
+		close(started)
+		<-release
+		return nil
+	}
+	w.failMu.Unlock()
 }
 
-// appendGroup writes one encoded commit group contiguously and, when sync is
-// enabled, fdatasyncs it. It returns the segment sequence and file offset at
-// which buf begins. Rolling to a new segment happens first when the group
-// does not fit the active one; a group never spans segments.
-func (w *walWriter) appendGroup(buf []byte) (seq uint64, base int64, err error) {
-	if err := w.takeWriteFailure(); err != nil {
-		return 0, 0, fmt.Errorf("seglog: injected WAL write failure: %w", err)
+func (w *walWriter) takeWriteHook() func() error {
+	w.failMu.Lock()
+	defer w.failMu.Unlock()
+	hook := w.writeHook
+	w.writeHook = nil
+	return hook
+}
+
+// failNextSync causes the next syncSegment call to fail before fdatasync. It
+// exists solely for deterministic pipeline fail-stop tests.
+func (w *walWriter) failNextSync(err error) {
+	w.failMu.Lock()
+	w.syncHook = func() error { return err }
+	w.failMu.Unlock()
+}
+
+// blockNextSync holds the next syncSegment call after reporting that it
+// started. It exists solely for deterministic pipeline ordering tests.
+func (w *walWriter) blockNextSync(started chan<- struct{}, release <-chan struct{}) {
+	w.failMu.Lock()
+	w.syncHook = func() error {
+		close(started)
+		<-release
+		return nil
+	}
+	w.failMu.Unlock()
+}
+
+func (w *walWriter) takeSyncHook() func() error {
+	w.failMu.Lock()
+	defer w.failMu.Unlock()
+	hook := w.syncHook
+	w.syncHook = nil
+	return hook
+}
+
+// writeGroup writes one encoded commit group contiguously without syncing it.
+// It returns the segment sequence, file offset, and exact file containing the
+// group. Rolling happens first when the group does not fit; a group never spans
+// segments. The partition committer later syncs the returned file.
+func (w *walWriter) writeGroup(buf []byte) (seq uint64, base int64, file *os.File, err error) {
+	if hook := w.takeWriteHook(); hook != nil {
+		if err := hook(); err != nil {
+			return 0, 0, nil, fmt.Errorf("seglog: injected WAL write failure: %w", err)
+		}
 	}
 	if int64(len(buf)) > w.capacity() {
 		// Callers bound frames to one segment; a group that outgrew it is a
 		// programmer error upstream, reported rather than split.
-		return 0, 0, fmt.Errorf("seglog: commit group of %d bytes exceeds segment capacity %d", len(buf), w.capacity())
+		return 0, 0, nil, fmt.Errorf("seglog: commit group of %d bytes exceeds segment capacity %d", len(buf), w.capacity())
 	}
 	if w.active == nil || w.writePos+int64(len(buf)) > w.segmentBytes {
 		if err := w.roll(); err != nil {
-			return 0, 0, err
+			return 0, 0, nil, err
 		}
 	}
 	base = w.writePos
 	if err := w.grow(base + int64(len(buf))); err != nil {
-		return 0, 0, err
+		return 0, 0, nil, err
 	}
 	if _, err := w.active.WriteAt(buf, base); err != nil {
-		return 0, 0, fmt.Errorf("seglog: write WAL group: %w", err)
-	}
-	if w.sync {
-		if err := fdatasync(w.active); err != nil {
-			return 0, 0, fmt.Errorf("seglog: sync WAL group: %w", err)
-		}
+		return 0, 0, nil, fmt.Errorf("seglog: write WAL group: %w", err)
 	}
 	w.writePos = base + int64(len(buf))
-	return w.activeSeq, base, nil
+	return w.activeSeq, base, w.active, nil
+}
+
+// syncSegment establishes the commit point for one group. The file is the
+// exact descriptor returned by writeGroup, so a concurrent stager roll cannot
+// redirect an older group's flush to the new active segment.
+func (w *walWriter) syncSegment(file *os.File) error {
+	if !w.sync || file == nil {
+		return nil
+	}
+	if hook := w.takeSyncHook(); hook != nil {
+		if err := hook(); err != nil {
+			return fmt.Errorf("seglog: injected WAL sync failure: %w", err)
+		}
+	}
+	if err := fdatasync(file); err != nil {
+		return fmt.Errorf("seglog: sync WAL group: %w", err)
+	}
+	return nil
 }
 
 // roll creates the next segment file: header written and fsync'd, file

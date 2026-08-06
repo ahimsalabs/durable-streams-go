@@ -254,7 +254,7 @@ func (p *partition) stageFork(op *stagedOp, req *request, ps *pendingStream, now
 	st.nextIndex = req.forkBoundary + 1 + int64(len(req.messages))
 	op.applyFork = &createApply{newState: st}
 	op.res = result{created: true, offset: storage.FormatSimpleOffset(st.nextIndex - 1)}
-	ps.state, ps.exists, ps.cfg, ps.closed, ps.nextIndex = st, true, st.cfg, st.closed, st.nextIndex
+	ps.state, ps.exists, ps.cfg, ps.closed, ps.softDeleted, ps.nextIndex = st, true, st.cfg, st.closed, false, st.nextIndex
 	return frameSpec{op: opFork, streamID: req.streamID, inc: inc, meta: req.forkMetaRaw, firstIndex: req.forkBoundary + 1, ts: ts, payloads: req.messages}
 }
 
