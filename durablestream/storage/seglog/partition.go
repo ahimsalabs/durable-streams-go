@@ -107,6 +107,9 @@ type partition struct {
 	materializerMu sync.Mutex
 	dirty          map[*streamState]struct{}
 	removals       []*streamState // dead incarnations awaiting directory removal
+	// materializeWake is a coalescing doorbell. Publication never blocks when
+	// the materializer is already awake or a signal is pending.
+	materializeWake chan struct{}
 
 	// Materializer-owned: the last durably written checkpoint position.
 	ckptSeq   uint64
@@ -115,7 +118,9 @@ type partition struct {
 	// materializedEntries is the cumulative image including materialization
 	// rounds published since the checkpoint became durable. Materializer-owned.
 	materializedEntries map[string]streamCheckpointEntry
-	lastCheckpoint      time.Time
+	// uncheckpointedSince is the time of the first successful materialization
+	// not covered by a checkpoint. Additional rounds and failures preserve it.
+	uncheckpointedSince time.Time
 	pending             *materializationBatch
 	// unsyncedFiles are segment payloads and sidecars published since the last
 	// checkpoint. The WAL covers them until checkpoint-time batch sync makes
@@ -126,9 +131,12 @@ type partition struct {
 	// sealedSidecars become removable only after a checkpoint durably names
 	// their payload files as sealed. Delayed-checkpoint rounds accumulate them
 	// here until that checkpoint commits.
-	sealedSidecars map[string]struct{}
-	cleanupPaths   map[string]struct{}
-	cleanupDirs    map[string]struct{}
+	sealedSidecars      map[string]struct{}
+	cleanupPaths        map[string]struct{}
+	cleanupDirs         map[string]struct{}
+	walReclaimBefore    uint64
+	checkpointWriteHook func() error // one-shot test seam; guarded by checkpointHookMu
+	checkpointHookMu    sync.Mutex
 }
 
 func newPartition(id uint32, st *Storage, wal *walWriter) *partition {
@@ -140,6 +148,7 @@ func newPartition(id uint32, st *Storage, wal *walWriter) *partition {
 		accepting:           true,
 		stop:                make(chan struct{}),
 		pendingSpace:        make(chan struct{}, 1),
+		materializeWake:     make(chan struct{}, 1),
 		nextTxnID:           1,
 		dirty:               make(map[*streamState]struct{}),
 		materializedEntries: make(map[string]streamCheckpointEntry),
@@ -158,6 +167,7 @@ func (p *partition) markDirty(st *streamState) {
 	p.dirtyMu.Lock()
 	p.dirty[st] = struct{}{}
 	p.dirtyMu.Unlock()
+	p.wakeMaterializer()
 }
 
 // markRemoval queues a dead incarnation's directory for removal.
@@ -165,6 +175,28 @@ func (p *partition) markRemoval(st *streamState) {
 	p.dirtyMu.Lock()
 	p.removals = append(p.removals, st)
 	p.dirtyMu.Unlock()
+	p.wakeMaterializer()
+}
+
+func (p *partition) wakeMaterializer() {
+	select {
+	case p.materializeWake <- struct{}{}:
+	default:
+	}
+}
+
+func (p *partition) hasRemovals() bool {
+	p.dirtyMu.Lock()
+	defer p.dirtyMu.Unlock()
+	return len(p.removals) > 0
+}
+
+func (p *partition) takeCheckpointWriteHook() func() error {
+	p.checkpointHookMu.Lock()
+	defer p.checkpointHookMu.Unlock()
+	hook := p.checkpointWriteHook
+	p.checkpointWriteHook = nil
+	return hook
 }
 
 // swapDirty hands the current dirty set and removal list to the materializer.
@@ -731,6 +763,10 @@ func (p *partition) commitRecord(record *stagedRecord, syncErr error) bool {
 	p.publish(record.op, record.segSeq, record.base)
 	if frameBytes > 0 {
 		p.stats.publishWALFrame(frameBytes, record.op.ts)
+		// publish can ring the dirty doorbell before the frontier counters are
+		// advanced. Ring it again after both become visible so a fast consumer
+		// cannot lose the transition that crosses a pressure threshold.
+		p.wakeMaterializer()
 	}
 	// A barrier is a queue marker. Swap the exact dirty/removal frontier only
 	// after every preceding FIFO record has published.

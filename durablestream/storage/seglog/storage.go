@@ -321,7 +321,7 @@ func New(opts Options) (_ *Storage, retErr error) {
 	}
 	for _, p := range s.parts {
 		s.workers.Go(p.run)
-		if opts.MaterializeInterval != -1 {
+		if opts.MaterializeMaxAge != -1 {
 			s.workers.Go(func() { s.runMaterializer(p) })
 		}
 	}

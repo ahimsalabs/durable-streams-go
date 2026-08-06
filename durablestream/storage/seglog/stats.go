@@ -33,6 +33,10 @@ type PartitionStats struct {
 	// durability barrier runs.
 	PendingWALBytes int64
 
+	// UnmaterializedWALBytes is the number of committed WAL-frame bytes not
+	// yet covered by a completed per-stream materialization barrier.
+	UnmaterializedWALBytes int64
+
 	// OldestUnmaterializedAge is the age of the oldest committed WAL frame not
 	// yet covered by a completed per-stream materialization barrier.
 	OldestUnmaterializedAge time.Duration
@@ -123,6 +127,7 @@ func (s *partitionStats) snapshot(now time.Time, wal walUsage) PartitionStats {
 		oldestAge = time.Duration(now.UnixNano() - oldestTS)
 	}
 	pendingBytes := s.pendingWALBytes
+	unmaterializedBytes := s.committedWALBytes - s.materializedWALBytes
 	materializedBytes := s.materializedWALBytes - s.checkpointedWALBytes
 	checkpointPosition := s.checkpointPosition
 	s.frontierMu.Unlock()
@@ -137,6 +142,7 @@ func (s *partitionStats) snapshot(now time.Time, wal walUsage) PartitionStats {
 		SyncfsCalls:                      s.syncfsCalls.Load(),
 		CheckpointRounds:                 s.checkpointRounds.Load(),
 		PendingWALBytes:                  pendingBytes,
+		UnmaterializedWALBytes:           unmaterializedBytes,
 		OldestUnmaterializedAge:          oldestAge,
 		MaterializedNotCheckpointedBytes: materializedBytes,
 		UnreclaimedWALBytes:              wal.retainedBytes,
@@ -167,6 +173,7 @@ func (s *PartitionStats) add(other PartitionStats) {
 	s.SyncfsCalls += other.SyncfsCalls
 	s.CheckpointRounds += other.CheckpointRounds
 	s.PendingWALBytes += other.PendingWALBytes
+	s.UnmaterializedWALBytes += other.UnmaterializedWALBytes
 	s.OldestUnmaterializedAge = max(s.OldestUnmaterializedAge, other.OldestUnmaterializedAge)
 	s.MaterializedNotCheckpointedBytes += other.MaterializedNotCheckpointedBytes
 	s.UnreclaimedWALBytes += other.UnreclaimedWALBytes
@@ -175,6 +182,27 @@ func (s *PartitionStats) add(other PartitionStats) {
 	for i := range s.GroupSizeHist {
 		s.GroupSizeHist[i] += other.GroupSizeHist[i]
 	}
+}
+
+func (s *partitionStats) frontierPressure(now time.Time) (unmaterialized int64, oldestAge time.Duration, uncheckpointed int64) {
+	s.frontierMu.Lock()
+	defer s.frontierMu.Unlock()
+	unmaterialized = s.committedWALBytes - s.materializedWALBytes
+	uncheckpointed = s.materializedWALBytes - s.checkpointedWALBytes
+	oldestTS := s.oldestUnmaterializedTS
+	if oldestTS == 0 {
+		oldestTS = s.postBarrierOldestTS
+	}
+	if oldestTS > 0 && now.UnixNano() > oldestTS {
+		oldestAge = time.Duration(now.UnixNano() - oldestTS)
+	}
+	return unmaterialized, oldestAge, uncheckpointed
+}
+
+func (s *partitionStats) checkpointBytesAt(frontier statsFrontier) int64 {
+	s.frontierMu.Lock()
+	defer s.frontierMu.Unlock()
+	return frontier.committedWALBytes - s.checkpointedWALBytes
 }
 
 func (s *partitionStats) addPendingWALBytes(bytes int64) {

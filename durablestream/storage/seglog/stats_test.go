@@ -168,7 +168,7 @@ func TestStats_MaterializationAndCheckpointAdvanceFrontiers(t *testing.T) {
 		t.Errorf("checkpoint position = %+v, want unchanged %+v", got, firstCheckpoint)
 	}
 
-	storage.parts[0].lastCheckpoint = time.Time{}
+	storage.parts[0].uncheckpointedSince = time.Time{}.Add(-time.Hour)
 	storage.materializeRound(storage.parts[0])
 	checkpointed := storage.Stats()
 	if checkpointed.MaterializedNotCheckpointedBytes != 0 {

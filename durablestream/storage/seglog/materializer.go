@@ -78,23 +78,84 @@ type materializationBatch struct {
 }
 
 func (s *Storage) runMaterializer(p *partition) {
-	ticker := time.NewTicker(s.opts.MaterializeInterval)
-	defer ticker.Stop()
-	lastSweep := time.Now()
+	timer := time.NewTimer(time.Hour)
+	stopTimer(timer)
+	defer stopTimer(timer)
+	now := time.Now()
+	lastSweep := now
+	var retryAfter time.Time
 	for {
+		now = time.Now()
+		// Check before waiting so continuous publication wakeups cannot starve
+		// retention work by repeatedly winning the select.
+		if s.opts.RetentionInterval != -1 && now.Sub(lastSweep) >= s.opts.RetentionInterval {
+			if err := s.retentionSweep(p); err != nil {
+				s.opts.SLogger.Error("seglog: retention sweep failed", "partition", p.id, "error", err)
+			}
+			lastSweep = time.Now()
+			now = lastSweep
+		}
+		unmaterialized, oldestAge, uncheckpointed := p.stats.frontierPressure(now)
+		materializeDue := unmaterialized >= s.opts.MaterializeBytes ||
+			(unmaterialized > 0 && oldestAge >= s.opts.MaterializeMaxAge)
+		checkpointDue := uncheckpointed >= s.opts.CheckpointBytes ||
+			(uncheckpointed > 0 && (s.opts.CheckpointMaxAge == -1 ||
+				(!p.uncheckpointedSince.IsZero() && now.Sub(p.uncheckpointedSince) >= s.opts.CheckpointMaxAge)))
+		maintenanceDue := p.hasRemovals() || len(p.cleanupPaths) > 0 || len(p.cleanupDirs) > 0 || p.walReclaimBefore > 0
+		workDue := materializeDue || checkpointDue || p.pending != nil || maintenanceDue
+		if workDue && !now.Before(retryAfter) {
+			s.materializeRound(p)
+			// Back off only when due work remains after an attempt. Successful
+			// progress can immediately expose another batched frontier.
+			unmaterialized, oldestAge, uncheckpointed = p.stats.frontierPressure(time.Now())
+			stillDue := unmaterialized >= s.opts.MaterializeBytes ||
+				(unmaterialized > 0 && oldestAge >= s.opts.MaterializeMaxAge) ||
+				uncheckpointed >= s.opts.CheckpointBytes || p.pending != nil || p.hasRemovals() ||
+				len(p.cleanupPaths) > 0 || len(p.cleanupDirs) > 0 || p.walReclaimBefore > 0
+			if stillDue {
+				retryAfter = time.Now().Add(100 * time.Millisecond)
+			} else {
+				retryAfter = time.Time{}
+			}
+			continue
+		}
+
+		deadline := time.Time{}
+		if unmaterialized > 0 {
+			deadline = now.Add(s.opts.MaterializeMaxAge - oldestAge)
+		}
+		if uncheckpointed > 0 && s.opts.CheckpointMaxAge != -1 {
+			deadline = earlier(deadline, p.uncheckpointedSince.Add(s.opts.CheckpointMaxAge))
+		}
+		if s.opts.RetentionInterval != -1 {
+			deadline = earlier(deadline, lastSweep.Add(s.opts.RetentionInterval))
+		}
+		if !retryAfter.IsZero() && workDue {
+			deadline = earlier(deadline, retryAfter)
+		}
+		var timerC <-chan time.Time
+		if !deadline.IsZero() {
+			stopTimer(timer)
+			timer.Reset(max(time.Until(deadline), time.Nanosecond))
+			timerC = timer.C
+		} else {
+			stopTimer(timer)
+		}
 		select {
 		case <-s.shutdownCh:
 			return
-		case <-ticker.C:
-			s.materializeRound(p)
-			if s.opts.RetentionInterval != -1 && time.Since(lastSweep) >= s.opts.RetentionInterval {
-				if err := s.retentionSweep(p); err != nil {
-					s.opts.SLogger.Error("seglog: retention sweep failed", "partition", p.id, "error", err)
-				}
-				lastSweep = time.Now()
-			}
+		case <-p.materializeWake:
+		case <-timerC:
 		}
+		stopTimer(timer)
 	}
+}
+
+func earlier(a, b time.Time) time.Time {
+	if a.IsZero() || b.Before(a) {
+		return b
+	}
+	return a
 }
 
 func (s *Storage) materializeRound(p *partition) {
@@ -149,7 +210,9 @@ func (s *Storage) materializeRoundLocked(p *partition) error {
 		p.stats.cancelMaterializationFrontier(barrier.frontier)
 		return nil
 	}
-	forceCheckpoint := s.opts.CheckpointInterval == -1 || time.Since(p.lastCheckpoint) >= s.opts.CheckpointInterval ||
+	checkpointBytes := p.stats.checkpointBytesAt(barrier.frontier)
+	forceCheckpoint := s.opts.CheckpointMaxAge == -1 || checkpointBytes >= s.opts.CheckpointBytes ||
+		(checkpointBytes > 0 && !p.uncheckpointedSince.IsZero() && time.Since(p.uncheckpointedSince) >= s.opts.CheckpointMaxAge) ||
 		barrier.walSeq > p.ckptSeq || len(removals) > 0 || batchHasVictims(prepared)
 	if len(prepared) == 0 && len(removals) == 0 && !forceCheckpoint {
 		p.stats.cancelMaterializationFrontier(barrier.frontier)
@@ -230,7 +293,7 @@ func (s *Storage) finishMaterialization(p *partition, batch *materializationBatc
 		clear(p.unsyncedFiles)
 		clear(p.unsyncedDirs)
 		clear(p.unsyncedParents)
-		p.lastCheckpoint = time.Now()
+		p.uncheckpointedSince = time.Time{}
 		for _, draft := range batch.prepared {
 			for _, sidecar := range draft.sealedSidecars {
 				p.sealedSidecars[sidecar] = struct{}{}
@@ -244,6 +307,11 @@ func (s *Storage) finishMaterialization(p *partition, batch *materializationBatc
 	frontier := WALPosition{SegmentSeq: batch.barrier.walSeq, Offset: batch.barrier.walOff}
 	p.stats.advanceMaterializationFrontier(batch.barrier.frontier, frontier, checkpoint)
 	if !checkpoint {
+		// Checkpoint age is measured from the first successful materialization,
+		// not from the previous checkpoint or from the original WAL commit.
+		if p.uncheckpointedSince.IsZero() {
+			p.uncheckpointedSince = time.Now()
+		}
 		for _, draft := range batch.prepared {
 			for path := range draft.touched {
 				p.unsyncedFiles[path] = struct{}{}
@@ -288,6 +356,9 @@ func (s *Storage) finishMaterialization(p *partition, batch *materializationBatc
 	}
 	if err := p.wal.removeBefore(batch.barrier.walSeq); err != nil {
 		s.opts.SLogger.Error("seglog: WAL reclaim failed", "partition", p.id, "error", err)
+		p.walReclaimBefore = max(p.walReclaimBefore, batch.barrier.walSeq)
+	} else if p.walReclaimBefore <= batch.barrier.walSeq {
+		p.walReclaimBefore = 0
 	}
 	s.releasePrepared(batch.prepared)
 	p.pending = nil
@@ -475,6 +546,13 @@ func (s *Storage) abortPrepared(p *partition, prepared map[*streamState]*prepare
 
 func (s *Storage) retryCleanup(p *partition) error {
 	var firstErr error
+	if p.walReclaimBefore > 0 {
+		if err := p.wal.removeBefore(p.walReclaimBefore); err != nil {
+			firstErr = fmt.Errorf("reclaim WAL before %d: %w", p.walReclaimBefore, err)
+		} else {
+			p.walReclaimBefore = 0
+		}
+	}
 	for path := range p.cleanupPaths {
 		if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
 			if firstErr == nil {
@@ -510,6 +588,11 @@ func (s *Storage) advanceCheckpoint(p *partition, barrier result, entries map[st
 	data, err := json.Marshal(c)
 	if err != nil {
 		return fmt.Errorf("encode checkpoint: %w", err)
+	}
+	if hook := p.takeCheckpointWriteHook(); hook != nil {
+		if err := hook(); err != nil {
+			return fmt.Errorf("write checkpoint: %w", err)
+		}
 	}
 	if err := atomicWrite(filepath.Join(p.wal.dir, checkpointFileName), data, 0o644); err != nil {
 		return err

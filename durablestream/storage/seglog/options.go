@@ -14,12 +14,17 @@ const (
 	DefaultWALSegmentBytes = 256 << 20
 	// DefaultGroupLinger remains for source compatibility. The write-at-arrival
 	// pipeline does not read it; commit waves now self-clock.
-	DefaultGroupLinger         = time.Duration(0)
-	DefaultGroupMaxBytes       = 4 << 20
-	DefaultQueueDepth          = 256
-	DefaultShutdownTimeout     = 30 * time.Second
-	DefaultMaterializeInterval = 25 * time.Millisecond
-	DefaultCheckpointInterval  = 250 * time.Millisecond
+	DefaultGroupLinger       = time.Duration(0)
+	DefaultGroupMaxBytes     = 4 << 20
+	DefaultQueueDepth        = 256
+	DefaultShutdownTimeout   = 30 * time.Second
+	DefaultMaterializeBytes  = 4 << 20
+	DefaultMaterializeMaxAge = 250 * time.Millisecond
+	DefaultCheckpointBytes   = 32 << 20
+	DefaultCheckpointMaxAge  = 3 * time.Second
+	// Deprecated interval names remain aliases for source compatibility.
+	DefaultMaterializeInterval = DefaultMaterializeMaxAge
+	DefaultCheckpointInterval  = DefaultCheckpointMaxAge
 	DefaultRetentionInterval   = 30 * time.Second
 	DefaultStreamSegmentBytes  = 128 << 20
 	// One hour avoids surprising segment churn for low-traffic streams while
@@ -106,17 +111,26 @@ type Options struct {
 	// ShutdownTimeout bounds how long Close waits for workers to drain.
 	ShutdownTimeout time.Duration
 
-	// MaterializeInterval is how often each partition's materializer copies
-	// committed WAL records into per-stream segments, writes a checkpoint,
-	// advances the checkpoint, and reclaims fully-reflected WAL segments.
-	// -1 disables materialization: reads stay WAL-resident and the WAL is
-	// never reclaimed (useful for tests).
+	// MaterializeBytes and MaterializeMaxAge bound the unmaterialized WAL
+	// frontier. A partition materializes when either limit is reached. Their
+	// zero values select DefaultMaterializeBytes and DefaultMaterializeMaxAge.
+	// MaterializeMaxAge -1 disables the background materializer.
+	MaterializeBytes  int64
+	MaterializeMaxAge time.Duration
+
+	// MaterializeInterval is deprecated. A nonzero value supplies
+	// MaterializeMaxAge when that field is zero; -1 still disables the worker.
 	MaterializeInterval time.Duration
 
-	// CheckpointInterval is the minimum time between ordinary checkpoint
-	// writes. Materialized segment state is still published every
-	// MaterializeInterval. -1 checkpoints every materialization round, which
-	// is useful for tests that require tight coupling.
+	// CheckpointBytes and CheckpointMaxAge bound materialized data that is not
+	// covered by a durable checkpoint. A checkpoint is written when either
+	// limit is reached. Zero values select the documented defaults;
+	// CheckpointMaxAge -1 checkpoints every materialization round.
+	CheckpointBytes  int64
+	CheckpointMaxAge time.Duration
+
+	// CheckpointInterval is deprecated. A nonzero value supplies
+	// CheckpointMaxAge when that field is zero.
 	CheckpointInterval time.Duration
 
 	// DefaultRetention is copied to each stream when it is created.
@@ -162,11 +176,25 @@ func (o Options) withDefaults() Options {
 	if o.ShutdownTimeout == 0 {
 		o.ShutdownTimeout = DefaultShutdownTimeout
 	}
-	if o.MaterializeInterval == 0 {
-		o.MaterializeInterval = DefaultMaterializeInterval
+	if o.MaterializeBytes == 0 {
+		o.MaterializeBytes = DefaultMaterializeBytes
 	}
-	if o.CheckpointInterval == 0 {
-		o.CheckpointInterval = DefaultCheckpointInterval
+	if o.MaterializeMaxAge == 0 {
+		if o.MaterializeInterval != 0 {
+			o.MaterializeMaxAge = o.MaterializeInterval
+		} else {
+			o.MaterializeMaxAge = DefaultMaterializeMaxAge
+		}
+	}
+	if o.CheckpointBytes == 0 {
+		o.CheckpointBytes = DefaultCheckpointBytes
+	}
+	if o.CheckpointMaxAge == 0 {
+		if o.CheckpointInterval != 0 {
+			o.CheckpointMaxAge = o.CheckpointInterval
+		} else {
+			o.CheckpointMaxAge = DefaultCheckpointMaxAge
+		}
 	}
 	if o.RetentionInterval == 0 {
 		o.RetentionInterval = DefaultRetentionInterval
@@ -211,11 +239,17 @@ func (o Options) validate() error {
 	if _, err := o.SyncWrites.enabled(); err != nil {
 		errs = append(errs, err)
 	}
-	if o.MaterializeInterval < 0 && o.MaterializeInterval != -1 {
-		errs = append(errs, fmt.Errorf("option MaterializeInterval must be positive or -1, got %v", o.MaterializeInterval))
+	if o.MaterializeBytes < 1 {
+		errs = append(errs, fmt.Errorf("option MaterializeBytes must be positive, got %d", o.MaterializeBytes))
 	}
-	if o.CheckpointInterval < 0 && o.CheckpointInterval != -1 {
-		errs = append(errs, fmt.Errorf("option CheckpointInterval must be positive or -1, got %v", o.CheckpointInterval))
+	if o.MaterializeMaxAge < 0 && o.MaterializeMaxAge != -1 {
+		errs = append(errs, fmt.Errorf("option MaterializeMaxAge must be positive or -1, got %v", o.MaterializeMaxAge))
+	}
+	if o.CheckpointBytes < 1 {
+		errs = append(errs, fmt.Errorf("option CheckpointBytes must be positive, got %d", o.CheckpointBytes))
+	}
+	if o.CheckpointMaxAge < 0 && o.CheckpointMaxAge != -1 {
+		errs = append(errs, fmt.Errorf("option CheckpointMaxAge must be positive or -1, got %v", o.CheckpointMaxAge))
 	}
 	if o.RetentionInterval < 0 && o.RetentionInterval != -1 {
 		errs = append(errs, fmt.Errorf("option RetentionInterval must be positive or -1, got %v", o.RetentionInterval))
