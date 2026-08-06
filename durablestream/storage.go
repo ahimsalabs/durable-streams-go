@@ -19,10 +19,14 @@ type StreamConfig struct {
 type StreamInfo struct {
 	ContentType string
 	NextOffset  Offset
-	TTL         time.Duration // Zero means no TTL
-	ExpiresAt   time.Time     // Zero means no expiry
-	IsPrivate   bool          // If true, use Cache-Control: private (Section 10.1)
-	Closed      bool          // True after the stream has reached permanent EOF
+	// LastSeq is the last non-empty producer sequence accepted for this stream.
+	// It is empty when no sequence has been accepted. Persistent backends retain
+	// it across reopen so producers can use Head to reseed after a restart.
+	LastSeq   string
+	TTL       time.Duration // Zero means no TTL
+	ExpiresAt time.Time     // Zero means no expiry
+	IsPrivate bool          // If true, use Cache-Control: private (Section 10.1)
+	Closed    bool          // True after the stream has reached permanent EOF
 
 	// IncarnationID is an opaque storage-internal token for this exact
 	// incarnation of the stream. A non-empty value is immutable for the
@@ -171,8 +175,9 @@ type Storage interface {
 	// Append writes data to a stream and returns the offset after the appended
 	// message. seq is an optional deduplication sequence number (Section 5.2);
 	// when non-empty it must sort lexicographically after the last seq accepted
-	// for the stream, otherwise Append fails with ErrConflict and writes
-	// nothing.
+	// for the stream, otherwise Append fails with ErrSequenceConflict and
+	// ErrConflict and writes nothing. Callers can inspect SequenceConflictError
+	// for the accepted sequence and, when known, its final offset.
 	//
 	// Append is atomic: on error nothing is appended and no partial message
 	// becomes visible. An error MAY still consume an offset, leaving a gap in

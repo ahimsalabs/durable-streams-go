@@ -1043,10 +1043,15 @@ func (s *Storage) Head(ctx context.Context, streamID string) (*durablestream.Str
 		if err != nil {
 			return fmt.Errorf("badgerstore: get tail offset: %w", err)
 		}
+		lastSeq, err := s.getLastSeq(txn, streamID)
+		if err != nil && !errors.Is(err, badger.ErrKeyNotFound) {
+			return fmt.Errorf("badgerstore: get last seq: %w", err)
+		}
 
 		info = &durablestream.StreamInfo{
 			ContentType:   rec.ContentType,
 			NextOffset:    tailOffset,
+			LastSeq:       lastSeq,
 			TTL:           rec.TTL,
 			ExpiresAt:     rec.ExpiresAt,
 			IsPrivate:     rec.IsPrivate,
@@ -1163,9 +1168,14 @@ func (s *Storage) TouchHead(ctx context.Context, streamID string) (*durablestrea
 		if err != nil {
 			return fmt.Errorf("badgerstore: get tail offset: %w", err)
 		}
+		lastSeq, err := s.getLastSeq(txn, streamID)
+		if err != nil && !errors.Is(err, badger.ErrKeyNotFound) {
+			return fmt.Errorf("badgerstore: get last seq: %w", err)
+		}
 		info = &durablestream.StreamInfo{
 			ContentType:   rec.ContentType,
 			NextOffset:    tailOffset,
+			LastSeq:       lastSeq,
 			TTL:           rec.TTL,
 			ExpiresAt:     rec.ExpiresAt,
 			IsPrivate:     rec.IsPrivate,

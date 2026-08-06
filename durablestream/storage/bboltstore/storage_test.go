@@ -55,6 +55,13 @@ func TestAppendReadReopen(t *testing.T) {
 	if len(r.Messages) != 2 || string(r.Messages[0].Data) != "two" {
 		t.Fatalf("reopen read: %+v", r)
 	}
+	info, err := s.Head(t.Context(), "alpha")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.LastSeq != "0002" {
+		t.Fatalf("recovered Head LastSeq = %q, want %q", info.LastSeq, "0002")
+	}
 }
 
 func TestRetentionBytesReturnsGone(t *testing.T) {

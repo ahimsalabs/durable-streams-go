@@ -338,7 +338,7 @@ func (f *Storage) appendLocked(s *stream, messages [][]byte, seq string, closeAf
 		return "", durablestream.ErrStreamClosed
 	}
 	if seq != "" && s.lastSeq != "" && seq <= s.lastSeq {
-		return "", fmt.Errorf("filestore: sequence regression: %w", durablestream.ErrConflict)
+		return "", fmt.Errorf("filestore: sequence regression: %w", &durablestream.SequenceConflictError{LastSeq: s.lastSeq})
 	}
 	for i, m := range messages {
 		if len(m) == 0 {
@@ -664,7 +664,7 @@ func (f *Storage) Head(ctx context.Context, id string) (*durablestream.StreamInf
 	if f.expired(s) {
 		return nil, durablestream.ErrNotFound
 	}
-	return &durablestream.StreamInfo{ContentType: s.config.ContentType, NextOffset: storage.FormatSimpleOffset(s.nextIndex - 1), TTL: s.config.TTL, ExpiresAt: s.config.ExpiresAt, IsPrivate: s.config.IsPrivate, Closed: s.config.Closed, IncarnationID: s.incarnationID}, nil
+	return &durablestream.StreamInfo{ContentType: s.config.ContentType, NextOffset: storage.FormatSimpleOffset(s.nextIndex - 1), LastSeq: s.lastSeq, TTL: s.config.TTL, ExpiresAt: s.config.ExpiresAt, IsPrivate: s.config.IsPrivate, Closed: s.config.Closed, IncarnationID: s.incarnationID}, nil
 }
 
 func (f *Storage) Touch(ctx context.Context, id string) error {

@@ -21,12 +21,13 @@ type streamCheckpointEntry struct {
 	ExpiresAt   time.Time `json:"expiresAt,omitzero"`
 	IsPrivate   bool      `json:"isPrivate,omitempty"`
 
-	Closed      bool                `json:"closed,omitempty"`
-	LastSeq     string              `json:"lastSeq,omitempty"`
-	Retention   checkpointRetention `json:"retention,omitzero"`
-	FloorIndex  int64               `json:"floorIndex,omitempty"`
-	SoftDeleted bool                `json:"softDeleted,omitempty"`
-	Parent      *checkpointParent   `json:"parent,omitempty"`
+	Closed        bool                 `json:"closed,omitempty"`
+	LastSeq       string               `json:"lastSeq,omitempty"`
+	LastSeqOffset durablestream.Offset `json:"lastSeqOffset,omitempty"`
+	Retention     checkpointRetention  `json:"retention,omitzero"`
+	FloorIndex    int64                `json:"floorIndex,omitempty"`
+	SoftDeleted   bool                 `json:"softDeleted,omitempty"`
+	Parent        *checkpointParent    `json:"parent,omitempty"`
 
 	MaterializedThrough int64               `json:"materializedThrough"`
 	Sealed              []checkpointSegment `json:"sealed,omitempty"`

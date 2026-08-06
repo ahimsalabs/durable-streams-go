@@ -55,6 +55,34 @@ var (
 	ErrParseError = errors.New("parse error: malformed protocol response")
 )
 
+// SequenceConflictError reports an append rejected because its sequence did
+// not sort after the stream's last accepted sequence. It matches both
+// [ErrSequenceConflict] and [ErrConflict], preserving the specific and generic
+// conflict classifications.
+type SequenceConflictError struct {
+	// LastSeq is the stream's last accepted non-empty sequence.
+	LastSeq string
+
+	// LastOffset is the final offset of the append that carried LastSeq when
+	// the backend knows it. The zero Offset means unknown. For an exact-duplicate
+	// retry whose incoming sequence equals LastSeq, a known LastOffset is the
+	// deduplicated record's final position.
+	LastOffset Offset
+}
+
+func (e *SequenceConflictError) Error() string {
+	if e.LastOffset.IsZero() {
+		return fmt.Sprintf("sequence does not advance past %q", e.LastSeq)
+	}
+	return fmt.Sprintf("sequence does not advance past %q at offset %q", e.LastSeq, e.LastOffset)
+}
+
+// Unwrap makes SequenceConflictError match both sequence-specific and generic
+// conflicts with errors.Is.
+func (e *SequenceConflictError) Unwrap() []error {
+	return []error{ErrSequenceConflict, ErrConflict}
+}
+
 // StreamClosedError reports an append rejected because another mutation has
 // permanently closed the stream. It unwraps to [ErrStreamClosed], so callers
 // can use errors.Is for the general condition and errors.As when they need the

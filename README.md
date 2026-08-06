@@ -21,7 +21,12 @@ The sole client failure expects an automatic retry of a bare POST append. This c
 ## Known limitations
 
 - Subscriptions are not implemented yet, accounting for the 6 skipped server cases above.
-- Idempotent-producer state and Handler lifecycle coordination are process-local. Use one Handler per Storage; producer deduplication state does not survive a process restart.
+- Handler lifecycle coordination is process-local; use one Handler per Storage.
+  Producer sequence-rejection state is also process-local in memorystorage, but
+  persistent backends retain it across process restarts. An append can commit
+  even when its acknowledgement is lost, so after restart reseed the producer
+  by reading `Head(stream).LastSeq` and continue with a sequence that sorts
+  after it.
 - Fork creation is currently exposed by the Handler's HTTP protocol surface and storage APIs, but not by the typed `Client`/`transport.CreateRequest` API. Typed-client callers that need to create forks must issue the fork protocol headers through an HTTP request for now.
 
 ## Offset Format

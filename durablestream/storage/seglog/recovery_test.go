@@ -2,6 +2,7 @@ package seglog
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
@@ -122,6 +123,95 @@ func TestReopenPreservesState(t *testing.T) {
 	if _, err := r.Append(ctx, "seqd", []byte("m"), "s3"); err != nil {
 		t.Errorf("advancing seq after reopen: %v", err)
 	}
+}
+
+func TestRecovery_OldCheckpointWithoutLastSeqOffsetLoadsWithUnknownOffset(t *testing.T) {
+	dir := t.TempDir()
+	opts := singlePartitionOptions(dir)
+	opts.MaterializeInterval = -1
+	opts.CheckpointInterval = -1
+
+	s := openTest(t, opts)
+	if _, err := s.Create(t.Context(), "seq-checkpoint", durablestream.StreamConfig{}); err != nil {
+		t.Fatal(err)
+	}
+	acceptedOffset, err := s.Append(t.Context(), "seq-checkpoint", []byte("accepted"), "seq-0001")
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.materializeRound(s.parts[0])
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	checkpointPath := filepath.Join(dir, "wal", "p0000", checkpointFileName)
+	c, ok, err := loadCheckpoint(filepath.Dir(checkpointPath))
+	if err != nil || !ok {
+		t.Fatalf("load checkpoint = (%v, %v), want (true, nil)", ok, err)
+	}
+	entry := c.Streams["seq-checkpoint"]
+	if entry.LastSeqOffset != acceptedOffset {
+		t.Fatalf("checkpoint LastSeqOffset = %q, want %q", entry.LastSeqOffset, acceptedOffset)
+	}
+	entry.LastSeqOffset = ""
+	c.Streams["seq-checkpoint"] = entry
+	frames := scanFrames(t, walSegments(t, dir)[0])
+	foundSeqFrame := false
+	for _, frame := range frames {
+		if frame.op == opAppend && frame.flags&flagHasSeq != 0 {
+			// Exercise tolerant materialized-prefix replay: the checkpoint's
+			// logical state already includes this frame, but recovery scans it
+			// again. An old omitted offset must remain unknown.
+			c.Replay.Offset = frame.start
+			c.NextTxnID = frame.txnID
+			foundSeqFrame = true
+			break
+		}
+	}
+	if !foundSeqFrame {
+		t.Fatal("sequence append frame missing from WAL")
+	}
+	raw, err := json.Marshal(c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := atomicWrite(checkpointPath, raw, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	r := openTest(t, opts)
+	if got := mustHeadLastSeq(t, r, "seq-checkpoint"); got != "seq-0001" {
+		t.Errorf("recovered LastSeq = %q, want %q", got, "seq-0001")
+	}
+	_, err = r.Append(t.Context(), "seq-checkpoint", []byte("duplicate"), "seq-0001")
+	var conflict *durablestream.SequenceConflictError
+	if !errors.As(err, &conflict) {
+		t.Fatalf("duplicate error = %v, want *SequenceConflictError", err)
+	}
+	if !conflict.LastOffset.IsZero() {
+		t.Errorf("old checkpoint conflict LastOffset = %q, want unknown", conflict.LastOffset)
+	}
+
+	nextOffset, err := r.Append(t.Context(), "seq-checkpoint", []byte("next"), "seq-0002")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = r.Append(t.Context(), "seq-checkpoint", []byte("duplicate"), "seq-0002")
+	if !errors.As(err, &conflict) {
+		t.Fatalf("new duplicate error = %v, want *SequenceConflictError", err)
+	}
+	if conflict.LastOffset != nextOffset {
+		t.Errorf("new duplicate LastOffset = %q, want %q", conflict.LastOffset, nextOffset)
+	}
+}
+
+func mustHeadLastSeq(t *testing.T, s *Storage, streamID string) string {
+	t.Helper()
+	info, err := s.Head(t.Context(), streamID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return info.LastSeq
 }
 
 // walSegments lists partition 0's segment paths in sequence order.

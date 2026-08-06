@@ -55,12 +55,13 @@ type forkMetadata struct {
 type memoryStream struct {
 	mu sync.RWMutex
 
-	config    durablestream.StreamConfig
-	messages  []memoryMessage // target-owned suffix only
-	tailIndex int64
-	lastSeq   string
-	nextBatch uint64
-	notifyCh  chan struct{}
+	config        durablestream.StreamConfig
+	messages      []memoryMessage // target-owned suffix only
+	tailIndex     int64
+	lastSeq       string
+	lastSeqOffset durablestream.Offset
+	nextBatch     uint64
+	notifyCh      chan struct{}
 
 	deleted     bool
 	softDeleted bool
@@ -139,6 +140,7 @@ func streamInfoLocked(stream *memoryStream) *durablestream.StreamInfo {
 	return &durablestream.StreamInfo{
 		ContentType:   stream.config.ContentType,
 		NextOffset:    tailOffset(stream),
+		LastSeq:       stream.lastSeq,
 		TTL:           stream.config.TTL,
 		ExpiresAt:     stream.config.ExpiresAt,
 		IsPrivate:     stream.config.IsPrivate,
@@ -660,6 +662,7 @@ func appendLocked(stream *memoryStream, messages [][]byte, seq string) durablest
 	}
 	if seq != "" {
 		stream.lastSeq = seq
+		stream.lastSeqOffset = tailOffset(stream)
 	}
 	wakeLocked(stream)
 	return tailOffset(stream)
@@ -693,9 +696,10 @@ func (m *Storage) AppendBatch(ctx context.Context, streamID string, messages [][
 		return "", durablestream.ErrStreamClosed
 	}
 	if seq != "" && stream.lastSeq != "" && seq <= stream.lastSeq {
+		conflict := &durablestream.SequenceConflictError{LastSeq: stream.lastSeq, LastOffset: stream.lastSeqOffset}
 		stream.mu.Unlock()
 		m.topologyMu.RUnlock()
-		return "", fmt.Errorf("sequence regression detected: %w", durablestream.ErrConflict)
+		return "", fmt.Errorf("sequence regression detected: %w", conflict)
 	}
 	offset := appendLocked(stream, cloned, seq)
 	stream.mu.Unlock()
@@ -736,9 +740,10 @@ func (m *Storage) CloseStream(ctx context.Context, streamID string, messages [][
 		return "", durablestream.ErrStreamClosed
 	}
 	if seq != "" && stream.lastSeq != "" && seq <= stream.lastSeq {
+		conflict := &durablestream.SequenceConflictError{LastSeq: stream.lastSeq, LastOffset: stream.lastSeqOffset}
 		stream.mu.Unlock()
 		m.topologyMu.RUnlock()
-		return "", fmt.Errorf("sequence regression detected: %w", durablestream.ErrConflict)
+		return "", fmt.Errorf("sequence regression detected: %w", conflict)
 	}
 
 	offset := tailOffset(stream)
@@ -747,6 +752,7 @@ func (m *Storage) CloseStream(ctx context.Context, streamID string, messages [][
 	} else {
 		if seq != "" {
 			stream.lastSeq = seq
+			stream.lastSeqOffset = offset
 		}
 		wakeLocked(stream)
 	}
@@ -1018,7 +1024,7 @@ func appendBatchToStream(stream *memoryStream, messages [][]byte, seq string) (d
 		return "", durablestream.ErrStreamClosed
 	}
 	if seq != "" && stream.lastSeq != "" && seq <= stream.lastSeq {
-		return "", fmt.Errorf("sequence regression detected: %w", durablestream.ErrConflict)
+		return "", fmt.Errorf("sequence regression detected: %w", &durablestream.SequenceConflictError{LastSeq: stream.lastSeq, LastOffset: stream.lastSeqOffset})
 	}
 	return appendLocked(stream, messages, seq), nil
 }

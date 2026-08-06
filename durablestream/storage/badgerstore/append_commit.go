@@ -421,7 +421,7 @@ func (s *Storage) prepareAppend(txn *badger.Txn, request *appendCommitRequest) (
 			return preparedAppend{}, fmt.Errorf("badgerstore: get last seq: %w", err)
 		}
 		if lastSeq != "" && request.seq <= lastSeq {
-			return preparedAppend{}, fmt.Errorf("badgerstore: sequence regression: %w", durablestream.ErrConflict)
+			return preparedAppend{}, fmt.Errorf("badgerstore: sequence regression: %w", &durablestream.SequenceConflictError{LastSeq: lastSeq})
 		}
 		entries = append(entries, appendEntry{key: lastSeqKey(request.streamID), value: []byte(request.seq)})
 	}

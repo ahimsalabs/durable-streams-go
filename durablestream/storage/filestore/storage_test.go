@@ -44,6 +44,13 @@ func TestRoundTripAndRecovery(t *testing.T) {
 	if err != nil || len(result.Messages) != 1 || string(result.Messages[0].Data) != `{"id":1}` {
 		t.Fatalf("recovered Read = %#v, %v", result, err)
 	}
+	info, err := f.Head(t.Context(), "orders/1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.LastSeq != "1" {
+		t.Fatalf("recovered Head LastSeq = %q, want %q", info.LastSeq, "1")
+	}
 	if _, err := f.Append(context.Background(), "orders/1", []byte("duplicate"), "1"); !errors.Is(err, durablestream.ErrConflict) {
 		t.Fatalf("sequence regression = %v", err)
 	}

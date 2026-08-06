@@ -110,6 +110,7 @@ var suites = []suite{
 	{"read replays the offsets append returned", testOffsetsRoundTrip},
 	{"concurrent appends get distinct offsets and land exactly once", testConcurrentAppends},
 	{"head reports the tail offset", testHeadReportsTail},
+	{"head reports the last sequence across a reopen", testHeadReportsLastSeq},
 	{"paging by next offset yields every message once", testPagingByNextOffset},
 	{"streams are isolated from each other", testStreamIsolation},
 	{"incarnation identity is stable across head and reads", testIncarnationIDStable},

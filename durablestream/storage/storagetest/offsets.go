@@ -201,6 +201,29 @@ func testHeadReportsTail(t *testing.T, cfg Config) {
 	}
 }
 
+func testHeadReportsLastSeq(t *testing.T, cfg Config) {
+	t.Parallel()
+	s := newStorage(t, cfg)
+	const (
+		streamID = "head-last-seq"
+		seq      = "producer-0001"
+	)
+	mustCreate(t, s, streamID)
+	if _, err := s.Append(t.Context(), streamID, []byte("data"), seq); err != nil {
+		t.Fatalf("Append with sequence: %v", err)
+	}
+	if got := mustHead(t, s, streamID).LastSeq; got != seq {
+		t.Errorf("Head LastSeq = %q, want %q", got, seq)
+	}
+	if cfg.Reopen == nil {
+		return
+	}
+	s = reopen(t, cfg, s)
+	if got := mustHead(t, s, streamID).LastSeq; got != seq {
+		t.Errorf("Head LastSeq after reopen = %q, want %q", got, seq)
+	}
+}
+
 // testPagingByNextOffset checks that a client that keeps feeding NextOffset back
 // to Read sees every message once, with no gaps and no repeats, even when the
 // byte limit forces many small pages.

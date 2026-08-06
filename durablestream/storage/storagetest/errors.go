@@ -3,6 +3,7 @@ package storagetest
 import (
 	"bytes"
 	"context"
+	"errors"
 	"testing"
 	"time"
 
@@ -102,7 +103,8 @@ func testSequenceRegression(t *testing.T, cfg Config) {
 	const streamID = "seq"
 	mustCreate(t, s, streamID)
 
-	if _, err := s.Append(t.Context(), streamID, []byte("first"), "0002"); err != nil {
+	firstOffset, err := s.Append(t.Context(), streamID, []byte("first"), "0002")
+	if err != nil {
 		t.Fatalf("Append with seq 0002: %v", err)
 	}
 
@@ -117,6 +119,17 @@ func testSequenceRegression(t *testing.T, cfg Config) {
 		t.Run(tt.name, func(t *testing.T) {
 			_, err := s.Append(t.Context(), streamID, []byte("rejected"), tt.seq)
 			assertErrorIs(t, "Append with seq "+tt.seq, err, durablestream.ErrConflict)
+			assertErrorIs(t, "Append with seq "+tt.seq, err, durablestream.ErrSequenceConflict)
+			var conflict *durablestream.SequenceConflictError
+			if !errors.As(err, &conflict) {
+				t.Fatalf("Append with seq %s returned %T, want *SequenceConflictError", tt.seq, err)
+			}
+			if conflict.LastSeq != "0002" {
+				t.Errorf("SequenceConflictError.LastSeq = %q, want %q", conflict.LastSeq, "0002")
+			}
+			if !conflict.LastOffset.IsZero() && conflict.LastOffset != firstOffset {
+				t.Errorf("SequenceConflictError.LastOffset = %q, want zero or %q", conflict.LastOffset, firstOffset)
+			}
 		})
 	}
 

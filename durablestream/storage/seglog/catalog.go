@@ -81,8 +81,9 @@ type streamState struct {
 	refCount       atomic.Int64
 	physicalMu     sync.Mutex
 
-	lastSeq   string
-	nextIndex int64 // next logical index to assign; the first message gets 1
+	lastSeq       string
+	lastSeqOffset durablestream.Offset
+	nextIndex     int64 // next logical index to assign; the first message gets 1
 
 	// walTail holds the location of every message not yet materialized.
 	// walTail[i] is the message at logical index firstLive+i, and firstLive
@@ -153,6 +154,7 @@ type readSnapshot struct {
 	parent         *streamState
 	parentBoundary int64
 	lastSeq        string
+	lastSeqOffset  durablestream.Offset
 	retention      Retention
 	floor          int64
 	tail           int64
@@ -176,6 +178,7 @@ func (st *streamState) snapshot() readSnapshot {
 		parent:         st.parent,
 		parentBoundary: st.parentBoundary,
 		lastSeq:        st.lastSeq,
+		lastSeqOffset:  st.lastSeqOffset,
 		retention:      st.retention,
 		floor:          st.floor,
 		tail:           st.nextIndex - 1,

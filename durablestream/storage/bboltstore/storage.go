@@ -332,7 +332,7 @@ func appendInBucket(b *bbolt.Bucket, m *streamMeta, messages [][]byte, seq strin
 		return durablestream.ErrStreamClosed
 	}
 	if seq != "" && m.LastSeq != "" && seq <= m.LastSeq {
-		return fmt.Errorf("sequence %q does not follow %q: %w", seq, m.LastSeq, durablestream.ErrConflict)
+		return fmt.Errorf("sequence %q does not follow %q: %w", seq, m.LastSeq, &durablestream.SequenceConflictError{LastSeq: m.LastSeq})
 	}
 	for _, data := range messages {
 		if len(data) == 0 {
@@ -460,7 +460,7 @@ func (s *Storage) CloseStream(ctx context.Context, id string, messages [][]byte,
 }
 
 func infoFromMeta(m streamMeta) *durablestream.StreamInfo {
-	return &durablestream.StreamInfo{ContentType: m.Config.ContentType, NextOffset: storage.FormatSimpleOffset(m.Seq - 1), TTL: m.Config.TTL, ExpiresAt: m.Config.ExpiresAt, IsPrivate: m.Config.IsPrivate, Closed: m.Config.Closed, IncarnationID: m.IncID}
+	return &durablestream.StreamInfo{ContentType: m.Config.ContentType, NextOffset: storage.FormatSimpleOffset(m.Seq - 1), LastSeq: m.LastSeq, TTL: m.Config.TTL, ExpiresAt: m.Config.ExpiresAt, IsPrivate: m.Config.IsPrivate, Closed: m.Config.Closed, IncarnationID: m.IncID}
 }
 
 // Head returns metadata without loading messages.

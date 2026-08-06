@@ -743,7 +743,7 @@ func (s *Storage) unlinkPrepared(p *partition, draft *preparedStream) error {
 }
 
 func buildCheckpointEntry(st *streamState, snap readSnapshot, sealed []*segmentFile, active *segmentFile, through int64) streamCheckpointEntry {
-	e := streamCheckpointEntry{IncarnationID: snap.inc.String(), ContentType: snap.cfg.ContentType, TTLNanos: int64(snap.cfg.TTL), ExpiresAt: snap.cfg.ExpiresAt, IsPrivate: snap.cfg.IsPrivate, Closed: snap.closed, LastSeq: snap.lastSeq, Retention: retentionCheckpointEntry(snap.retention), FloorIndex: snap.floor, SoftDeleted: snap.softDeleted, MaterializedThrough: through}
+	e := streamCheckpointEntry{IncarnationID: snap.inc.String(), ContentType: snap.cfg.ContentType, TTLNanos: int64(snap.cfg.TTL), ExpiresAt: snap.cfg.ExpiresAt, IsPrivate: snap.cfg.IsPrivate, Closed: snap.closed, LastSeq: snap.lastSeq, LastSeqOffset: snap.lastSeqOffset, Retention: retentionCheckpointEntry(snap.retention), FloorIndex: snap.floor, SoftDeleted: snap.softDeleted, MaterializedThrough: through}
 	if snap.parent != nil {
 		e.Parent = &checkpointParent{StreamID: snap.parent.id, IncarnationID: snap.parent.inc.String(), Fork: *st.fork}
 	}

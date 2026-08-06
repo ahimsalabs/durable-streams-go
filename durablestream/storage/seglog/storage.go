@@ -58,6 +58,74 @@ var (
 	_ durablestream.SpanReadStorage    = (*Storage)(nil)
 )
 
+// DiskUsage is a physical allocation snapshot for a seglog directory.
+type DiskUsage struct {
+	// TotalBytes is the allocated filesystem space for every regular file under
+	// Options.Dir, including WALs, checkpoints, stream files, and metadata.
+	TotalBytes int64
+
+	// PerStreamBytes maps each live stream ID to the allocated filesystem space
+	// for its materialized payload segments and active index sidecars. Data that
+	// still resides only in a shared partition WAL is included only in TotalBytes.
+	PerStreamBytes map[string]int64
+}
+
+// DiskUsage walks the complete storage directory and returns allocated bytes,
+// so its cost is O(number of directory entries) and it can race normal file
+// growth or reclamation. On platforms that do not expose allocated block
+// counts, it falls back to logical file sizes. The returned map belongs to the
+// caller.
+//
+// To enforce an external directory budget, measure usage, step each stream's
+// Retention.MaxBytes down as needed, wait for retention and reclamation, then
+// measure again. Repeat until TotalBytes is within budget. This method does not
+// apply retention or enforce a hard directory limit.
+func (s *Storage) DiskUsage(ctx context.Context) (DiskUsage, error) {
+	if err := s.checkClosed(); err != nil {
+		return DiskUsage{}, err
+	}
+	usage := DiskUsage{PerStreamBytes: make(map[string]int64)}
+	streamDirs := make(map[string]string)
+	s.streams.Range(func(streamID string, st *streamState) bool {
+		dir := filepath.Clean(streamDir(s.dir, streamID, st.inc))
+		streamDirs[dir] = streamID
+		usage.PerStreamBytes[streamID] = 0
+		return true
+	})
+	err := filepath.WalkDir(s.dir, func(path string, entry os.DirEntry, walkErr error) error {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if walkErr != nil {
+			if os.IsNotExist(walkErr) {
+				return nil
+			}
+			return walkErr
+		}
+		if !entry.Type().IsRegular() {
+			return nil
+		}
+		info, err := entry.Info()
+		if err != nil {
+			if os.IsNotExist(err) {
+				return nil
+			}
+			return err
+		}
+		bytes := allocatedFileBytes(info)
+		usage.TotalBytes += bytes
+		if streamID, ok := streamDirs[filepath.Clean(filepath.Dir(path))]; ok &&
+			(strings.HasSuffix(path, ".seg") || strings.HasSuffix(path, ".idx")) {
+			usage.PerStreamBytes[streamID] += bytes
+		}
+		return nil
+	})
+	if err != nil {
+		return DiskUsage{}, fmt.Errorf("seglog: measure disk usage: %w", err)
+	}
+	return usage, nil
+}
+
 // New opens (or initializes) a seglog storage rooted at opts.Dir, recovering
 // any existing WAL before serving requests. On recovery failure the directory
 // is left byte-for-byte intact.
@@ -454,6 +522,7 @@ func (s *Storage) Head(ctx context.Context, streamID string) (*durablestream.Str
 	return &durablestream.StreamInfo{
 		ContentType:   snap.cfg.ContentType,
 		NextOffset:    storage.FormatSimpleOffset(snap.tail),
+		LastSeq:       snap.lastSeq,
 		TTL:           snap.cfg.TTL,
 		ExpiresAt:     snap.cfg.ExpiresAt,
 		IsPrivate:     snap.cfg.IsPrivate,

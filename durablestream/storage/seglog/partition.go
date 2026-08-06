@@ -484,6 +484,7 @@ type appendApply struct {
 	firstIndex int64
 	count      int64
 	seq        string
+	seqOffset  durablestream.Offset
 	hasSeq     bool
 	close      bool
 }
@@ -520,13 +521,14 @@ type pendingStream struct {
 	state  *streamState // live state, or the staged new state for creations
 	exists bool
 
-	cfg         durablestream.StreamConfig
-	closed      bool
-	softDeleted bool
-	nextIndex   int64
-	lastSeq     string
-	retention   Retention
-	floor       int64
+	cfg           durablestream.StreamConfig
+	closed        bool
+	softDeleted   bool
+	nextIndex     int64
+	lastSeq       string
+	lastSeqOffset durablestream.Offset
+	retention     Retention
+	floor         int64
 }
 
 // stageRecord validates and encodes one request against the in-flight overlay,
@@ -808,6 +810,7 @@ func (p *partition) publish(op *stagedOp, segSeq uint64, base int64) {
 		}
 		if a.hasSeq {
 			st.lastSeq = a.seq
+			st.lastSeqOffset = a.seqOffset
 		}
 		if a.close {
 			st.closed = true
@@ -874,6 +877,7 @@ func (p *partition) loadPending(pending, inflight map[string]*pendingStream, str
 			ps.softDeleted = state.softDeleted
 			ps.nextIndex = state.nextIndex
 			ps.lastSeq = state.lastSeq
+			ps.lastSeqOffset = state.lastSeqOffset
 			ps.retention = state.retention
 			ps.floor = state.floor
 		}
@@ -999,6 +1003,7 @@ func (p *partition) stageCreate(op *stagedOp, req *request, ps *pendingStream, e
 	ps.softDeleted = false
 	ps.nextIndex = newState.nextIndex
 	ps.lastSeq = ""
+	ps.lastSeqOffset = ""
 	ps.retention = newState.retention
 	ps.floor = 0
 
@@ -1033,7 +1038,8 @@ func (p *partition) stageAppend(op *stagedOp, req *request, ps *pendingStream, e
 		return frameSpec{}
 	}
 	if req.hasSeq && req.seq <= ps.lastSeq {
-		op.res = result{err: fmt.Errorf("seglog: sequence %q does not advance past %q: %w", req.seq, ps.lastSeq, durablestream.ErrConflict)}
+		conflict := &durablestream.SequenceConflictError{LastSeq: ps.lastSeq, LastOffset: ps.lastSeqOffset}
+		op.res = result{err: fmt.Errorf("seglog: sequence %q does not advance past %q: %w", req.seq, ps.lastSeq, conflict)}
 		return frameSpec{}
 	}
 
@@ -1051,11 +1057,13 @@ func (p *partition) stageAppend(op *stagedOp, req *request, ps *pendingStream, e
 		firstIndex = ps.nextIndex
 	}
 
+	seqOffset := storage.FormatSimpleOffset(ps.nextIndex + int64(len(req.messages)) - 1)
 	op.applyAppend = &appendApply{
 		state:      ps.state,
 		firstIndex: firstIndex,
 		count:      int64(len(req.messages)),
 		seq:        req.seq,
+		seqOffset:  seqOffset,
 		hasSeq:     req.hasSeq,
 		close:      req.close,
 	}
@@ -1063,6 +1071,7 @@ func (p *partition) stageAppend(op *stagedOp, req *request, ps *pendingStream, e
 	ps.nextIndex += int64(len(req.messages))
 	if req.hasSeq {
 		ps.lastSeq = req.seq
+		ps.lastSeqOffset = seqOffset
 	}
 	if req.close {
 		ps.closed = true
@@ -1123,6 +1132,7 @@ func (p *partition) stageTouch(op *stagedOp, req *request, ps *pendingStream, ex
 		op.res.info = &durablestream.StreamInfo{
 			ContentType:   ps.cfg.ContentType,
 			NextOffset:    storage.FormatSimpleOffset(ps.nextIndex - 1),
+			LastSeq:       ps.lastSeq,
 			TTL:           ps.cfg.TTL,
 			ExpiresAt:     ps.cfg.ExpiresAt,
 			IsPrivate:     ps.cfg.IsPrivate,

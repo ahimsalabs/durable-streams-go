@@ -200,7 +200,7 @@ func (s *Storage) CreateFork(ctx context.Context, targetID string, req durablest
 }
 
 func infoFromSnapshot(s readSnapshot) *durablestream.StreamInfo {
-	return &durablestream.StreamInfo{ContentType: s.cfg.ContentType, NextOffset: storage.FormatSimpleOffset(s.tail), TTL: s.cfg.TTL, ExpiresAt: s.cfg.ExpiresAt, IsPrivate: s.cfg.IsPrivate, Closed: s.closed, IncarnationID: s.inc.String()}
+	return &durablestream.StreamInfo{ContentType: s.cfg.ContentType, NextOffset: storage.FormatSimpleOffset(s.tail), LastSeq: s.lastSeq, TTL: s.cfg.TTL, ExpiresAt: s.cfg.ExpiresAt, IsPrivate: s.cfg.IsPrivate, Closed: s.closed, IncarnationID: s.inc.String()}
 }
 
 func (s *Storage) resolveSubOffset(ctx context.Context, source *streamState, anchor int64, sub uint64) (int64, [][]byte, error) {

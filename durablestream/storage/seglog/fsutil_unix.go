@@ -9,6 +9,13 @@ import (
 	"golang.org/x/sys/unix"
 )
 
+func allocatedFileBytes(info os.FileInfo) int64 {
+	if stat, ok := info.Sys().(*unix.Stat_t); ok {
+		return stat.Blocks * 512
+	}
+	return info.Size()
+}
+
 // lockDir takes an exclusive advisory lock on dir's lock file, fencing the
 // storage against a second process opening the same directory. The returned
 // release func closes the descriptor (dropping the lock); the file itself is

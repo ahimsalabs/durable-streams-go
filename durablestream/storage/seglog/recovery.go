@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/ahimsalabs/durable-streams-go/durablestream"
+	"github.com/ahimsalabs/durable-streams-go/durablestream/storage"
 )
 
 // errCorrupt marks unrecoverable damage. New fails and leaves every byte
@@ -188,6 +189,7 @@ func (s *Storage) stateFromCheckpointEntry(streamID, dir string, m streamCheckpo
 	}()
 	st.closed = m.Closed
 	st.lastSeq = m.LastSeq
+	st.lastSeqOffset = m.LastSeqOffset
 	st.retention = m.Retention.retention()
 	st.floor = m.FloorIndex
 	st.softDeleted = m.SoftDeleted
@@ -689,6 +691,7 @@ func (s *Storage) applyRecovered(p *partition, scan *recoveryScan, segSeq uint64
 		if frame.flags&flagHasSeq != 0 {
 			if seq := string(frame.meta); seq > st.lastSeq {
 				st.lastSeq = seq
+				st.lastSeqOffset = storage.FormatSimpleOffset(st.nextIndex - 1)
 			}
 		}
 		if frame.flags&flagClose != 0 {

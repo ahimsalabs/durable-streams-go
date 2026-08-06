@@ -3,6 +3,7 @@ package badgerstore
 import (
 	"context"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"math"
 	"strings"
@@ -136,14 +137,19 @@ func writeLocalBatch(txn *badger.Txn, streamID string, gen generation, firstPosi
 	return offsets, nil
 }
 
-func streamInfoForRecord(txn *badger.Txn, streamID string, rec streamRecord) (*durablestream.StreamInfo, error) {
+func (s *Storage) streamInfoForRecord(txn *badger.Txn, streamID string, rec streamRecord) (*durablestream.StreamInfo, error) {
 	tail, err := streamTailOffset(txn, streamID, rec)
 	if err != nil {
 		return nil, err
 	}
+	lastSeq, err := s.getLastSeq(txn, streamID)
+	if err != nil && !errors.Is(err, badger.ErrKeyNotFound) {
+		return nil, fmt.Errorf("badgerstore: get last seq: %w", err)
+	}
 	return &durablestream.StreamInfo{
 		ContentType:   rec.ContentType,
 		NextOffset:    tail,
+		LastSeq:       lastSeq,
 		TTL:           rec.TTL,
 		ExpiresAt:     rec.ExpiresAt,
 		IsPrivate:     rec.IsPrivate,
@@ -235,7 +241,7 @@ func (s *Storage) CreateFork(ctx context.Context, targetStreamID string, req dur
 				// not re-resolve current source visibility here: deleting or expiring
 				// the source may retain it only for this target, and must not turn an
 				// otherwise safe retry into a conflict or not-found response.
-				info, err = streamInfoForRecord(txn, targetStreamID, existing)
+				info, err = s.streamInfoForRecord(txn, targetStreamID, existing)
 				return err
 			}
 
