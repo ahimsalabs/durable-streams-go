@@ -7,11 +7,13 @@
 // Stream IDs hash (XXH64, stable across restarts) to one of N logical
 // partitions. Each partition has a bounded two-stage worker: one stager owns
 // validation, offset and transaction allocation, encoding, and WAL writes;
-// one committer fdatasyncs and publishes staged groups in FIFO order. While a
-// group flushes, the stager forms the next group against an in-flight logical
-// overlay, making the device's flush latency the adaptive batching window.
-// Independent requests share one write and fdatasync, but each frame remains
-// independently replayable — requests are never atomically coupled.
+// one committer publishes staged groups in FIFO order. Committers enter one
+// storage-wide gate before fdatasyncing their own WAL segments concurrently;
+// arrivals during an active wave form the next wave. The completed global
+// wave, rather than each partition's individual return time, is the adaptive
+// batching clock. Independent requests share one write and fdatasync, but each
+// frame remains independently replayable — requests are never atomically
+// coupled.
 //
 // The WAL is the sole durable commit point. Every mutation — create, append,
 // close, delete, touch, fork, retention, trim — is one transaction frame in
@@ -22,9 +24,10 @@
 //
 // # Invariants
 //
-//	I1: A request is acknowledged only after its frame's group fdatasync.
-//	    Recovery keeps the longest valid frame prefix; anything discarded was
-//	    never acknowledged.
+//	I1: A request is acknowledged only after its frame's group joins a global
+//	    commit wave and its own segment's fdatasync returns successfully. A
+//	    sibling's completion cannot make it durable. Recovery keeps the longest
+//	    valid frame prefix; anything discarded was never acknowledged.
 //	I2: Frame txnIDs are strictly monotonic per partition. A txnID gap during
 //	    replay is corruption and open fails, leaving all bytes intact.
 //	I3: In-memory state and reader wakeups are published only after the frame
@@ -44,10 +47,10 @@
 //	I7: Every segment prefix, active dense-index prefix, and seal footer is
 //	    fsync'd before a checkpoint references it. Ordinary materialization
 //	    rounds publish unsynced derived prefixes while the WAL covers recovery;
-//	    checkpoint cadence establishes a filesystem durability barrier (Linux
-//	    syncfs, or a portable per-file/directory fallback), then writes the
-//	    partition checkpoint. A full reclaimable WAL segment or retention/removal
-//	    forces that sequence immediately.
+//	    checkpoint cadence establishes a coalesced storage-wide filesystem
+//	    durability barrier (Linux syncfs, or a portable per-file/directory
+//	    fallback), then writes the partition checkpoint. A full reclaimable WAL
+//	    segment or retention/removal forces that sequence immediately.
 //	I8: A checkpoint's replay position and cumulative stream map are one
 //	    atomic image of the same barrier frontier. Published derived state may
 //	    run ahead between checkpoint cadences, but the WAL remains authoritative

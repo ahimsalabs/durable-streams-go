@@ -48,13 +48,13 @@ func TestParseFlags_DefaultsAndSeglogOverrides(t *testing.T) {
 		t.Errorf("seglog defaults = %+v", defaults.seglog)
 	}
 
-	cfg, err := parseFlags([]string{"-seglog-partitions=4", "-seglog-wal-segment-bytes=64MiB", "-seglog-stream-segment-bytes=32MiB", "-seglog-materialize-interval=50ms", "-seglog-checkpoint-interval=2s"})
+	cfg, err := parseFlags([]string{"-seglog-partitions=4", "-seglog-wal-segment-bytes=64MiB", "-seglog-stream-segment-bytes=32MiB", "-seglog-materialize-interval=50ms", "-seglog-checkpoint-interval=2s", "-debug-stats-interval=1s"})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if cfg.seglog.Partitions != 4 || cfg.seglog.WALSegmentBytes != 64<<20 ||
 		cfg.seglog.StreamSegmentBytes != 32<<20 || cfg.seglog.MaterializeInterval != 50*time.Millisecond ||
-		cfg.seglog.CheckpointInterval != 2*time.Second {
+		cfg.seglog.CheckpointInterval != 2*time.Second || cfg.debugStatsInterval != time.Second {
 		t.Errorf("seglog overrides = %+v", cfg.seglog)
 	}
 }

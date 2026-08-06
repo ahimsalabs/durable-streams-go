@@ -13,8 +13,8 @@ const (
 	DefaultMaxMessageSize  = 10 << 20 // 10 MiB
 	DefaultWALSegmentBytes = 256 << 20
 	// DefaultGroupLinger is zero: an idle commit group closes as soon as the
-	// queue has no more waiting requests. Under load, the previous group's
-	// fdatasync clocks the forming group instead, so an artificial idle linger
+	// queue has no more waiting requests. Under load, the previous global commit
+	// wave clocks the forming group instead, so an artificial idle linger
 	// only taxes sequential-caller latency (measured at ~140x on stream creation
 	// with the previous 500µs default).
 	DefaultGroupLinger         = time.Duration(0)
@@ -91,11 +91,11 @@ type Options struct {
 	WALSegmentBytes int64
 
 	// GroupLinger is the idle-pipeline batching floor. While a previous group
-	// is flushing, its fdatasync is the batching clock and GroupLinger is
-	// ignored: the forming group stays open until that flush retires or the
-	// byte bound is reached. When the pipeline is idle, a positive value holds
-	// the first group open for that duration. Zero (the default) commits an
-	// idle group as soon as the queue is drained.
+	// is waiting for its global commit wave, that wave is the batching clock
+	// and GroupLinger is ignored: the forming group stays open until that flush
+	// retires or the byte bound is reached. When the pipeline is idle, a positive
+	// value holds the first group open for that duration. Zero (the default)
+	// commits an idle group as soon as the queue is drained.
 	GroupLinger time.Duration
 
 	// GroupMaxBytes bounds the encoded bytes of one commit group. A single

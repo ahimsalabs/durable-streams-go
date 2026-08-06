@@ -202,6 +202,7 @@ func (s *Storage) finalMaterialize(p *partition) error {
 
 func (s *Storage) finishMaterialization(p *partition, batch *materializationBatch, checkpoint bool) error {
 	if checkpoint {
+		p.stats.checkpointRounds.Add(1)
 		if !batch.synced {
 			if err := s.syncCheckpointFiles(p, batch); err != nil {
 				return err
@@ -291,20 +292,25 @@ func (s *Storage) syncCheckpointFiles(p *partition, batch *materializationBatch)
 		}
 	}
 	if len(paths) > 0 || len(p.unsyncedDirs) > 0 || len(p.unsyncedParents) > 0 {
-		root, err := os.Open(s.dir)
-		if err != nil {
-			return fmt.Errorf("open storage root for checkpoint sync: %w", err)
+		supported, performed, syncErr := s.checkpointBarrier.run(func() (bool, error) {
+			root, err := os.Open(s.dir)
+			if err != nil {
+				return false, fmt.Errorf("open storage root for checkpoint sync: %w", err)
+			}
+			supported, syncErr := syncFilesystem(root)
+			return supported, errors.Join(syncErr, root.Close())
+		})
+		if performed && supported {
+			p.stats.syncfsCalls.Add(1)
 		}
-		supported, syncErr := syncFilesystem(root)
-		closeErr := root.Close()
-		if syncErr != nil || closeErr != nil {
-			return fmt.Errorf("sync checkpoint filesystem: %w", errors.Join(syncErr, closeErr))
+		if syncErr != nil {
+			return fmt.Errorf("sync checkpoint filesystem: %w", syncErr)
 		}
 		if supported {
 			return nil
 		}
 	}
-	if err := s.syncFileBatch(paths); err != nil {
+	if err := s.syncFileBatch(p, paths); err != nil {
 		return err
 	}
 	dirs := make(map[string]struct{}, len(p.unsyncedDirs))
@@ -337,7 +343,7 @@ func (s *Storage) syncCheckpointFiles(p *partition, batch *materializationBatch)
 	return nil
 }
 
-func (s *Storage) syncFileBatch(paths map[string]struct{}) error {
+func (s *Storage) syncFileBatch(p *partition, paths map[string]struct{}) error {
 	// A checkpoint deliberately issues a broad flush wave so independent files
 	// reach the block layer together instead of serializing one device cache
 	// flush per stream. Across the default 32 partitions this bounds checkpoint
@@ -352,6 +358,7 @@ func (s *Storage) syncFileBatch(paths map[string]struct{}) error {
 		for path := range work {
 			pin, err := s.fdCache.pin(path, true)
 			if err == nil {
+				p.stats.materializerSyncs.Add(1)
 				err = fdatasync(pin.file())
 				err = errors.Join(err, pin.release())
 			}

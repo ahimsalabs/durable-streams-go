@@ -22,6 +22,7 @@ import (
 	"os/signal"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -57,6 +58,17 @@ func run() error {
 		return err
 	}
 	defer cleanup()
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	var workers sync.WaitGroup
+	defer func() {
+		stop()
+		workers.Wait()
+	}()
+	if cfg.debugStatsInterval > 0 {
+		if seglogStorage, ok := storage.(*seglog.Storage); ok {
+			workers.Go(func() { runSeglogStats(ctx, seglogStorage, cfg.debugStatsInterval) })
+		}
+	}
 
 	// The conformance server is intentionally accessible to browser-based test
 	// clients. Production deployments should choose their own origin policy.
@@ -74,15 +86,12 @@ func run() error {
 		IdleTimeout:       idleTimeout,
 	}
 
-	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
-	defer stop()
-
 	errCh := make(chan error, 1)
-	go func() {
+	workers.Go(func() {
 		log.Printf("Durable Streams test server listening on http://%s", addr)
 		log.Printf("Stream URLs: http://%s/v1/stream/{stream-id}", addr)
 		errCh <- server.ListenAndServe()
-	}()
+	})
 
 	select {
 	case err := <-errCh:
@@ -106,11 +115,12 @@ func run() error {
 }
 
 type serverConfig struct {
-	host        string
-	port        int
-	storageKind string
-	dataDir     string
-	seglog      seglog.Options
+	host               string
+	port               int
+	storageKind        string
+	dataDir            string
+	seglog             seglog.Options
+	debugStatsInterval time.Duration
 }
 
 func parseFlags(args []string) (serverConfig, error) {
@@ -131,10 +141,67 @@ func parseFlags(args []string) (serverConfig, error) {
 	fs.Var(byteSizeValue{target: &cfg.seglog.StreamSegmentBytes}, "seglog-stream-segment-bytes", "seglog stream segment size (default 128MiB)")
 	fs.DurationVar(&cfg.seglog.MaterializeInterval, "seglog-materialize-interval", cfg.seglog.MaterializeInterval, "seglog materialization interval")
 	fs.DurationVar(&cfg.seglog.CheckpointInterval, "seglog-checkpoint-interval", cfg.seglog.CheckpointInterval, "seglog checkpoint interval")
+	fs.DurationVar(&cfg.debugStatsInterval, "debug-stats-interval", 0, "interval for seglog delta statistics (default off)")
 	if err := fs.Parse(args); err != nil {
 		return serverConfig{}, err
 	}
+	if cfg.debugStatsInterval < 0 {
+		return serverConfig{}, fmt.Errorf("-debug-stats-interval must not be negative")
+	}
 	return cfg, nil
+}
+
+func runSeglogStats(ctx context.Context, storage *seglog.Storage, interval time.Duration) {
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	previous := storage.Stats()
+	lastTick := time.Now()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case now := <-ticker.C:
+			current := storage.Stats()
+			logSeglogStats(current, previous, now.Sub(lastTick))
+			previous = current
+			lastTick = now
+		}
+	}
+}
+
+func logSeglogStats(current, previous seglog.Stats, elapsed time.Duration) {
+	delta := current.PartitionStats
+	commitWaves := current.CommitWaves - previous.CommitWaves
+	delta.GroupsCommitted -= previous.GroupsCommitted
+	delta.OpsCommitted -= previous.OpsCommitted
+	delta.WALBytesWritten -= previous.WALBytesWritten
+	delta.CommitFdatasyncNanos -= previous.CommitFdatasyncNanos
+	delta.CommitterIdleNanos -= previous.CommitterIdleNanos
+	delta.MaterializerSyncs -= previous.MaterializerSyncs
+	delta.SyncfsCalls -= previous.SyncfsCalls
+	delta.CheckpointRounds -= previous.CheckpointRounds
+	for i := range delta.GroupSizeHist {
+		delta.GroupSizeHist[i] -= previous.GroupSizeHist[i]
+	}
+	seconds := elapsed.Seconds()
+	var opsPerGroup, opsPerWave, fsyncMeanMillis, idlePercent float64
+	if delta.GroupsCommitted > 0 {
+		opsPerGroup = float64(delta.OpsCommitted) / float64(delta.GroupsCommitted)
+		fsyncMeanMillis = float64(delta.CommitFdatasyncNanos) / float64(delta.GroupsCommitted) / float64(time.Millisecond)
+	}
+	if commitWaves > 0 {
+		opsPerWave = float64(delta.OpsCommitted) / float64(commitWaves)
+	}
+	if partitions := len(current.PerPartition); partitions > 0 {
+		idlePercent = float64(delta.CommitterIdleNanos) / float64(elapsed.Nanoseconds()*int64(partitions)) * 100
+		// A receive that spans ticks is charged when it completes, so its raw
+		// delta can briefly exceed one interval.
+		idlePercent = min(idlePercent, 100)
+	}
+	log.Printf("seglog-stats: ops=%.0f/s groups=%.0f/s waves=%.0f/s ops/group=%.1f ops/wave=%.1f wal_bytes=%.0f/s fsync_mean=%.1fms idle=%.0f%% hist=%v mat_syncs=%.0f/s syncfs=%.0f/s checkpoints=%.0f/s",
+		float64(delta.OpsCommitted)/seconds, float64(delta.GroupsCommitted)/seconds, float64(commitWaves)/seconds, opsPerGroup, opsPerWave,
+		float64(delta.WALBytesWritten)/seconds, fsyncMeanMillis, idlePercent, delta.GroupSizeHist,
+		float64(delta.MaterializerSyncs)/seconds, float64(delta.SyncfsCalls)/seconds, float64(delta.CheckpointRounds)/seconds)
 }
 
 type byteSizeValue struct{ target *int64 }

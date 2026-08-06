@@ -62,9 +62,10 @@ const opBarrier opKind = 0xff
 // partition is one WAL partition and its bounded stager/committer worker
 // (invariants I5/I6).
 type partition struct {
-	id  uint32
-	st  *Storage
-	wal *walWriter
+	id    uint32
+	st    *Storage
+	wal   *walWriter
+	stats partitionStats
 
 	queue chan *request
 
@@ -231,13 +232,16 @@ type retiredGroup struct {
 }
 
 // partitionStager owns the in-flight validation overlay and the bounded
-// channels connecting it to the committer. A capacity-one handoff permits one
-// group to wait behind the flushing group; GroupMaxBytes and QueueDepth bound
-// the forming group and admission queue.
+// channels connecting it to the committer. The forming group stays open until
+// the committer signals hunger on ready (a rendezvous, so a group closes at
+// the moment a flush wave can actually take it), a barrier arrives, or the
+// byte bound is reached; GroupMaxBytes and QueueDepth bound the forming group
+// and admission queue.
 type partitionStager struct {
 	p        *partition
 	handoff  chan<- *stagedGroup
 	retired  <-chan retiredGroup
+	ready    <-chan struct{}
 	inflight map[string]*pendingStream
 	last     map[string]uint64
 
@@ -255,15 +259,16 @@ func (p *partition) run() {
 	p.publishedNextTx = p.nextTxnID
 	handoff := make(chan *stagedGroup, 1)
 	retired := make(chan retiredGroup, 1)
+	ready := make(chan struct{}) // unbuffered: hunger is a rendezvous
 	committerDone := make(chan struct{})
 	// run owns and joins this goroutine. It terminates after handoff closes and
 	// every staged group has been published or failed.
 	go func() {
-		p.commitGroups(handoff, retired)
+		p.commitGroups(handoff, retired, ready)
 		close(committerDone)
 	}()
 	stager := partitionStager{
-		p: p, handoff: handoff, retired: retired,
+		p: p, handoff: handoff, retired: retired, ready: ready,
 		inflight: make(map[string]*pendingStream), last: make(map[string]uint64),
 		nextGroupID: 1,
 	}
@@ -343,11 +348,11 @@ func (s *partitionStager) nextRequest() (*request, bool) {
 }
 
 // collect gathers one bounded commit group. A barrier is a strict queue cut
-// and always forms a standalone marker. The first group behind the committer
-// drains what is already queued and fills the handoff; while both pipeline
-// slots are occupied, the next group remains open until retirement, making
-// fdatasync the adaptive clock. Only a fully idle pipeline uses GroupLinger.
-// A request crossing GroupMaxBytes is carried, never split.
+// and always forms a standalone marker. The forming group stays open until the
+// committer's hunger rendezvous closes it — the moment a flush wave can take
+// it — so every op admitted while the previous wave was in flight rides the
+// next wave. Only a fully idle pipeline uses GroupLinger. A request crossing
+// GroupMaxBytes is carried, never split.
 func (s *partitionStager) collect(first *request) (group []*request, queueClosed bool, carry *request) {
 	group = []*request{first}
 	if first.op == opBarrier {
@@ -361,51 +366,67 @@ func (s *partitionStager) collect(first *request) (group []*request, queueClosed
 		return group, false, nil
 	}
 
-	flushClocked := s.outstanding >= 2
-	var timerC <-chan time.Time
+	// GroupLinger idle floor: hold the first group open for the linger window,
+	// deaf to hunger, before falling through to the hunger clock.
 	if linger := s.p.st.opts.GroupLinger; s.outstanding == 0 && linger > 0 && !s.writeStopped {
 		timer := time.NewTimer(linger)
-		timerC = timer.C
 		defer stopTimer(timer)
+	lingerLoop:
+		for {
+			select {
+			case req, ok := <-s.p.queue:
+				var closed bool
+				if group, groupBytes, closed, queueClosed, carry = s.admit(group, groupBytes, maxBytes, req, ok); closed {
+					return group, queueClosed, carry
+				}
+			case <-timer.C:
+				break lingerLoop
+			}
+		}
 	}
 
 	for {
-		var req *request
-		var ok bool
-		switch {
-		case flushClocked:
-			select {
-			case req, ok = <-s.p.queue:
-			case ack := <-s.retired:
-				s.retire(ack)
-				return group, false, nil
+		select {
+		case req, ok := <-s.p.queue:
+			var closed bool
+			if group, groupBytes, closed, queueClosed, carry = s.admit(group, groupBytes, maxBytes, req, ok); closed {
+				return group, queueClosed, carry
 			}
-		case timerC == nil:
-			select {
-			case req, ok = <-s.p.queue:
-			default:
-				return group, false, nil
+		case ack := <-s.retired:
+			s.retire(ack)
+		case <-s.ready:
+			// Final sweep: everything already admitted to the queue rides
+			// this group rather than waiting a full wave for the next one.
+			for {
+				select {
+				case req, ok := <-s.p.queue:
+					var closed bool
+					if group, groupBytes, closed, queueClosed, carry = s.admit(group, groupBytes, maxBytes, req, ok); closed {
+						return group, queueClosed, carry
+					}
+				default:
+					return group, false, nil
+				}
 			}
-		default:
-			select {
-			case req, ok = <-s.p.queue:
-			case <-timerC:
-				return group, false, nil
-			}
 		}
-		if !ok {
-			return group, true, nil
-		}
-		if req.op == opBarrier {
-			return group, false, req
-		}
-		size := estimateFrameBytes(req)
-		if groupBytes > maxBytes-size {
-			return group, false, req
-		}
-		groupBytes += size
-		group = append(group, req)
 	}
+}
+
+// admit folds one queue receive into the forming group. closed reports that
+// the group must close now: queue closed, barrier cut, or byte bound reached
+// (the crossing request is carried, never split).
+func (s *partitionStager) admit(group []*request, groupBytes, maxBytes int64, req *request, ok bool) (_ []*request, _ int64, closed, queueClosed bool, carry *request) {
+	if !ok {
+		return group, groupBytes, true, true, nil
+	}
+	if req.op == opBarrier {
+		return group, groupBytes, true, false, req
+	}
+	size := estimateFrameBytes(req)
+	if groupBytes > maxBytes-size {
+		return group, groupBytes, true, false, req
+	}
+	return append(group, req), groupBytes + size, false, false, nil
 }
 
 func (s *partitionStager) send(group *stagedGroup) {
@@ -589,20 +610,89 @@ func (p *partition) stageGroup(groupID uint64, group []*request, inflight map[st
 
 // commitGroups serially establishes durability, publishes in FIFO order, and
 // completes requests. One committer per partition is invariant I1/I3's owner.
-func (p *partition) commitGroups(handoff <-chan *stagedGroup, retired chan<- retiredGroup) {
-	for batch := range handoff {
-		published := p.commitGroup(batch)
-		retired <- retiredGroup{id: batch.id, published: published}
+func (p *partition) commitGroups(handoff <-chan *stagedGroup, retired chan<- retiredGroup, ready chan<- struct{}) {
+	for {
+		idleStart := time.Now()
+		var batch *stagedGroup
+		var ok bool
+		select {
+		case ready <- struct{}{}:
+			// Hunger rendezvous accepted: the stager closes the open group at
+			// this moment and delivers it (or run closes the handoff after the
+			// stager exits, so shutdown cannot strand this receive).
+			batch, ok = <-handoff
+		case batch, ok = <-handoff:
+			// A group closed on its own: barrier cut, byte bound, or shutdown
+			// flush.
+		}
+		p.stats.committerIdleNanos.Add(time.Since(idleStart).Nanoseconds())
+		if !ok {
+			return
+		}
+		batches := append(make([]*stagedGroup, 0, 4), batch)
+		syncErr := p.syncWave(&batches, handoff)
+		for _, b := range batches {
+			published := p.commitGroup(b, syncErr)
+			retired <- retiredGroup{id: b.id, published: published}
+		}
 	}
 }
 
-func (p *partition) commitGroup(batch *stagedGroup) bool {
+// syncWave establishes durability for one flush wave. Groups the stager closed
+// while the wave formed are drained from the handoff and board the same wave:
+// the WAL is append-ordered, so the fdatasync that covers the last group covers
+// every group written before it. Boarding late keeps an op's queue-to-ack path
+// near one wave instead of one wave per pipeline stage.
+func (p *partition) syncWave(batches *[]*stagedGroup, handoff <-chan *stagedGroup) error {
+	first := (*batches)[0]
+	if !p.wal.sync || first.segment == nil || first.writeErr != nil {
+		// Nothing durable to establish (sync disabled, barrier-only group, or
+		// a failed write): publish immediately, off the wave cadence.
+		return nil
+	}
+	admission, err := p.st.commitGate.admit()
+	if err != nil {
+		return err
+	}
+	// The drain is bounded: closing another group needs a retirement from this
+	// very wave, so at most the handoff slot and one closed group in send().
+drain:
+	for {
+		select {
+		case extra, ok := <-handoff:
+			if !ok {
+				break drain
+			}
+			*batches = append(*batches, extra)
+		default:
+			break drain
+		}
+	}
+	syncStart := time.Now()
+	var synced *os.File
+	for _, b := range *batches {
+		if b.segment == nil || b.writeErr != nil || b.segment == synced {
+			continue
+		}
+		if err = p.wal.syncSegment(b.segment); err != nil {
+			break
+		}
+		synced = b.segment
+	}
+	p.stats.commitFdatasyncNanos.Add(time.Since(syncStart).Nanoseconds())
+	// Completion is unconditional: a failed member must not prevent the next
+	// device-wide wave from being admitted.
+	admission.complete()
+	return err
+}
+
+func (p *partition) commitGroup(batch *stagedGroup, syncErr error) bool {
 	err := batch.writeErr
 	if err == nil {
 		err = p.brokenErr()
 	}
 	if err == nil {
-		err = p.wal.syncSegment(batch.segment)
+		err = syncErr
 	}
 	if err != nil {
 		broken := p.latchBroken(err)
@@ -610,6 +700,17 @@ func (p *partition) commitGroup(batch *stagedGroup) bool {
 			op.req.done <- result{err: broken, ambiguous: batch.writeAttempted && op.hasFrame()}
 		}
 		return false
+	}
+	var ops int64
+	for _, op := range batch.ops {
+		if op.hasFrame() {
+			ops++
+		}
+	}
+	if ops > 0 {
+		p.stats.opsCommitted.Add(ops)
+		p.stats.walBytesWritten.Add(batch.endOff - batch.base)
+		p.stats.groupSizeHist[groupSizeBucket(ops)].Add(1)
 	}
 
 	for _, op := range batch.ops {
