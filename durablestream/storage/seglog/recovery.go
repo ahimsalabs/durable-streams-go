@@ -551,6 +551,11 @@ func (s *Storage) recoverSegment(p *partition, scan *recoveryScan, seq uint64, l
 	}
 
 	if last {
+		// A clean EOF can come from a previously short extent. Reserve the
+		// current boundary before this segment becomes writable again.
+		if err := preallocate(f, walExtentEnd(scanner.off, s.opts.WALSegmentBytes)); err != nil {
+			return fmt.Errorf("seglog: re-extend WAL segment: %w", err)
+		}
 		p.wal.adopt(seq, f, scanner.off)
 	} else {
 		p.wal.segments[seq] = f
@@ -560,13 +565,13 @@ func (s *Storage) recoverSegment(p *partition, scan *recoveryScan, seq uint64, l
 }
 
 // rezeroTail discards a torn tail: truncate to the valid end, re-extend to
-// the full preallocated size (extended bytes read as zeros), and make it
+// its current allocation extent (extended bytes read as zeros), and make it
 // durable so stale bytes cannot resurface after a second crash.
 func rezeroTail(f *os.File, validEnd, segmentBytes int64) error {
 	if err := f.Truncate(validEnd); err != nil {
 		return fmt.Errorf("seglog: truncate torn WAL tail: %w", err)
 	}
-	if err := preallocate(f, segmentBytes); err != nil {
+	if err := preallocate(f, walExtentEnd(validEnd, segmentBytes)); err != nil {
 		return fmt.Errorf("seglog: re-preallocate WAL segment: %w", err)
 	}
 	if err := f.Sync(); err != nil {

@@ -54,6 +54,7 @@ type preparedStream struct {
 	through        int64
 	touched        map[string]struct{}
 	touchedDirs    map[string]struct{}
+	touchedParents map[string]struct{}
 	victims        []*segmentFile
 	created        []*segmentFile
 	pins           []*fdPin
@@ -212,6 +213,7 @@ func (s *Storage) finishMaterialization(p *partition, batch *materializationBatc
 		}
 		clear(p.unsyncedFiles)
 		clear(p.unsyncedDirs)
+		clear(p.unsyncedParents)
 		p.lastCheckpoint = time.Now()
 		for _, draft := range batch.prepared {
 			for _, sidecar := range draft.sealedSidecars {
@@ -230,6 +232,9 @@ func (s *Storage) finishMaterialization(p *partition, batch *materializationBatc
 			}
 			for dir := range draft.touchedDirs {
 				p.unsyncedDirs[dir] = struct{}{}
+			}
+			for dir := range draft.touchedParents {
+				p.unsyncedParents[dir] = struct{}{}
 			}
 			for _, sidecar := range draft.sealedSidecars {
 				p.sealedSidecars[sidecar] = struct{}{}
@@ -285,6 +290,20 @@ func (s *Storage) syncCheckpointFiles(p *partition, batch *materializationBatch)
 			paths[path] = struct{}{}
 		}
 	}
+	if len(paths) > 0 || len(p.unsyncedDirs) > 0 || len(p.unsyncedParents) > 0 {
+		root, err := os.Open(s.dir)
+		if err != nil {
+			return fmt.Errorf("open storage root for checkpoint sync: %w", err)
+		}
+		supported, syncErr := syncFilesystem(root)
+		closeErr := root.Close()
+		if syncErr != nil || closeErr != nil {
+			return fmt.Errorf("sync checkpoint filesystem: %w", errors.Join(syncErr, closeErr))
+		}
+		if supported {
+			return nil
+		}
+	}
 	if err := s.syncFileBatch(paths); err != nil {
 		return err
 	}
@@ -300,14 +319,19 @@ func (s *Storage) syncCheckpointFiles(p *partition, batch *materializationBatch)
 	if err := syncDirectoryBatch(dirs); err != nil {
 		return err
 	}
-	parents := make(map[string]struct{}, len(dirs))
-	for dir := range dirs {
-		parents[filepath.Dir(dir)] = struct{}{}
+	parents := make(map[string]struct{}, len(p.unsyncedParents))
+	for dir := range p.unsyncedParents {
+		parents[dir] = struct{}{}
+	}
+	for _, draft := range batch.prepared {
+		for dir := range draft.touchedParents {
+			parents[dir] = struct{}{}
+		}
 	}
 	if err := syncDirectoryBatch(parents); err != nil {
 		return err
 	}
-	if len(dirs) > 0 {
+	if len(parents) > 0 {
 		return syncDir(filepath.Join(s.dir, "streams"))
 	}
 	return nil
@@ -535,7 +559,7 @@ func (st *streamState) closeSegments() {
 // partition image before publish.
 func (s *Storage) materializeStream(p *partition, st *streamState) (*preparedStream, error) {
 	snap := st.snapshot()
-	draft := &preparedStream{st: st, snap: snap, sealed: slices.Clone(snap.sealed), through: snap.through, touched: make(map[string]struct{}), touchedDirs: make(map[string]struct{})}
+	draft := &preparedStream{st: st, snap: snap, sealed: slices.Clone(snap.sealed), through: snap.through, touched: make(map[string]struct{}), touchedDirs: make(map[string]struct{}), touchedParents: make(map[string]struct{})}
 	if snap.deleted {
 		return draft, nil
 	}
@@ -544,12 +568,6 @@ func (s *Storage) materializeStream(p *partition, st *streamState) (*preparedStr
 		draft.active = &copy
 	}
 	dir := streamDir(s.dir, st.id, st.inc)
-	if draft.active == nil && len(draft.sealed) == 0 {
-		if err := os.MkdirAll(dir, 0o755); err != nil {
-			return draft, fmt.Errorf("create stream dir: %w", err)
-		}
-		draft.touchedDirs[dir] = struct{}{}
-	}
 	if snap.floor > 0 {
 		st.physicalMu.Lock()
 		draft.locked = true
@@ -586,6 +604,17 @@ func (s *Storage) materializeStream(p *partition, st *streamState) (*preparedStr
 			draft.active = nil
 		}
 		if draft.active == nil {
+			_, statErr := os.Stat(dir)
+			newDir := os.IsNotExist(statErr)
+			if statErr != nil && !newDir {
+				return draft, fmt.Errorf("stat stream dir: %w", statErr)
+			}
+			if err := os.MkdirAll(dir, 0o755); err != nil {
+				return draft, fmt.Errorf("create stream dir: %w", err)
+			}
+			if newDir {
+				draft.touchedParents[filepath.Dir(dir)] = struct{}{}
+			}
 			draft.active, err = s.createDraftActiveSegment(dir, st.inc, idx)
 			if err != nil {
 				return draft, err

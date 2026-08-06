@@ -40,7 +40,8 @@
 //	I7: Every segment prefix, active dense-index prefix, and seal footer is
 //	    fsync'd before a checkpoint references it. Ordinary materialization
 //	    rounds publish unsynced derived prefixes while the WAL covers recovery;
-//	    checkpoint cadence batch-syncs all accumulated files, then writes the
+//	    checkpoint cadence establishes a filesystem durability barrier (Linux
+//	    syncfs, or a portable per-file/directory fallback), then writes the
 //	    partition checkpoint. A full reclaimable WAL segment or retention/removal
 //	    forces that sequence immediately.
 //	I8: A checkpoint's replay position and cumulative stream map are one

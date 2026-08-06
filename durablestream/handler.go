@@ -1276,11 +1276,39 @@ func (h *Handler) handleCatchupRead(w http.ResponseWriter, r *http.Request, stre
 		return
 	}
 
-	// Read data
-	result, err := h.storage.Read(r.Context(), streamID, offset, h.chunkSize)
-	if err != nil {
-		writeStorageError(w, err)
-		return
+	// A span is safe for direct response writing only when it explicitly says
+	// that it is wholly file-backed. Span implementations backed by copied
+	// memory (for example active, WAL, or fork reads) take the normal Read path.
+	var spanResult *SpanReadResult
+	if !protocol.IsJSONContentType(info.ContentType) {
+		if spanStorage, ok := h.storage.(SpanReadStorage); ok {
+			candidate, spanErr := spanStorage.ReadSpans(r.Context(), streamID, offset, h.chunkSize)
+			if candidate != nil {
+				defer closeReadSpans(candidate.Spans)
+			}
+			if spanErr == nil && readSpansDirectWriteEligible(candidate) {
+				spanResult = candidate
+			} else if candidate != nil {
+				closeReadSpans(candidate.Spans)
+				candidate.Spans = nil
+			}
+		}
+	}
+
+	var result *ReadResult
+	if spanResult == nil {
+		result, err = h.storage.Read(r.Context(), streamID, offset, h.chunkSize)
+		if err != nil {
+			writeStorageError(w, err)
+			return
+		}
+	} else {
+		result = &ReadResult{
+			NextOffset:    spanResult.NextOffset,
+			TailOffset:    spanResult.TailOffset,
+			IncarnationID: spanResult.IncarnationID,
+			Closed:        spanResult.Closed,
+		}
 	}
 	if !incarnationMatches(info.IncarnationID, result.IncarnationID) {
 		writeStorageError(w, ErrNotFound)
@@ -1335,11 +1363,44 @@ func (h *Handler) handleCatchupRead(w http.ResponseWriter, r *http.Request, stre
 		}
 	}
 
-	// Format response based on content type
-	responseBody := formatResponseBody(result.Messages, info.ContentType)
-
 	w.WriteHeader(http.StatusOK)
-	_, _ = w.Write(responseBody)
+	if spanResult != nil {
+		for _, span := range spanResult.Spans {
+			if _, err := span.WriteTo(w); err != nil {
+				return
+			}
+		}
+		return
+	}
+
+	// Format response based on content type.
+	_, _ = w.Write(formatResponseBody(result.Messages, info.ContentType))
+}
+
+// directWriteEligibleSpan is implemented by spans that can guarantee their
+// complete range is backed by an immutable file. It deliberately remains an
+// optional capability because SpanReadStorage also permits copied spans.
+type directWriteEligibleSpan interface {
+	DirectWriteEligible() bool
+}
+
+func readSpansDirectWriteEligible(result *SpanReadResult) bool {
+	if result == nil {
+		return false
+	}
+	for _, span := range result.Spans {
+		eligible, ok := span.(directWriteEligibleSpan)
+		if !ok || !eligible.DirectWriteEligible() {
+			return false
+		}
+	}
+	return true
+}
+
+func closeReadSpans(spans []ReadSpan) {
+	for _, span := range spans {
+		_ = span.Close()
+	}
 }
 
 // handleLongPoll implements long-poll reads (Section 5.7)

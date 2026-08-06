@@ -20,6 +20,8 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
@@ -45,13 +47,12 @@ func main() {
 }
 
 func run() error {
-	host := flag.String("host", "127.0.0.1", "host to listen on")
-	port := flag.Int("port", 4437, "port to listen on")
-	storageKind := flag.String("storage", "memory", "storage backend: memory, badger, or seglog")
-	dataDir := flag.String("data-dir", "", "data directory for disk-backed storage (default: a temp dir removed on exit)")
-	flag.Parse()
+	cfg, err := parseFlags(os.Args[1:])
+	if err != nil {
+		return err
+	}
 
-	storage, cleanup, err := newStorage(*storageKind, *dataDir)
+	storage, cleanup, err := newStorage(cfg.storageKind, cfg.dataDir, cfg.seglog)
 	if err != nil {
 		return err
 	}
@@ -64,7 +65,7 @@ func run() error {
 	mux := http.NewServeMux()
 	mux.Handle("/v1/stream/", http.StripPrefix("/v1/stream/", handler))
 
-	addr := fmt.Sprintf("%s:%d", *host, *port)
+	addr := fmt.Sprintf("%s:%d", cfg.host, cfg.port)
 	server := &http.Server{
 		Addr:              addr,
 		Handler:           mux,
@@ -104,9 +105,86 @@ func run() error {
 	return nil
 }
 
+type serverConfig struct {
+	host        string
+	port        int
+	storageKind string
+	dataDir     string
+	seglog      seglog.Options
+}
+
+func parseFlags(args []string) (serverConfig, error) {
+	cfg := serverConfig{seglog: seglog.Options{
+		Partitions:          seglog.DefaultPartitions,
+		WALSegmentBytes:     seglog.DefaultWALSegmentBytes,
+		StreamSegmentBytes:  seglog.DefaultStreamSegmentBytes,
+		MaterializeInterval: seglog.DefaultMaterializeInterval,
+		CheckpointInterval:  seglog.DefaultCheckpointInterval,
+	}}
+	fs := flag.NewFlagSet("testserver", flag.ContinueOnError)
+	fs.StringVar(&cfg.host, "host", "127.0.0.1", "host to listen on")
+	fs.IntVar(&cfg.port, "port", 4437, "port to listen on")
+	fs.StringVar(&cfg.storageKind, "storage", "memory", "storage backend: memory, badger, or seglog")
+	fs.StringVar(&cfg.dataDir, "data-dir", "", "data directory for disk-backed storage (default: a temp dir removed on exit)")
+	fs.IntVar(&cfg.seglog.Partitions, "seglog-partitions", cfg.seglog.Partitions, "seglog WAL partitions")
+	fs.Var(byteSizeValue{target: &cfg.seglog.WALSegmentBytes}, "seglog-wal-segment-bytes", "seglog logical WAL segment size (default 256MiB)")
+	fs.Var(byteSizeValue{target: &cfg.seglog.StreamSegmentBytes}, "seglog-stream-segment-bytes", "seglog stream segment size (default 128MiB)")
+	fs.DurationVar(&cfg.seglog.MaterializeInterval, "seglog-materialize-interval", cfg.seglog.MaterializeInterval, "seglog materialization interval")
+	fs.DurationVar(&cfg.seglog.CheckpointInterval, "seglog-checkpoint-interval", cfg.seglog.CheckpointInterval, "seglog checkpoint interval")
+	if err := fs.Parse(args); err != nil {
+		return serverConfig{}, err
+	}
+	return cfg, nil
+}
+
+type byteSizeValue struct{ target *int64 }
+
+func (v byteSizeValue) String() string { return formatByteSize(*v.target) }
+
+func (v byteSizeValue) Set(raw string) error {
+	n, err := parseByteSize(raw)
+	if err != nil {
+		return err
+	}
+	*v.target = n
+	return nil
+}
+
+func parseByteSize(raw string) (int64, error) {
+	s := strings.TrimSpace(raw)
+	multiplier := int64(1)
+	for _, suffix := range []struct {
+		name string
+		mult int64
+	}{{"GiB", 1 << 30}, {"MiB", 1 << 20}, {"KiB", 1 << 10}, {"GB", 1_000_000_000}, {"MB", 1_000_000}, {"KB", 1_000}} {
+		if strings.HasSuffix(strings.ToLower(s), strings.ToLower(suffix.name)) {
+			multiplier = suffix.mult
+			s = strings.TrimSpace(s[:len(s)-len(suffix.name)])
+			break
+		}
+	}
+	n, err := strconv.ParseInt(s, 10, 64)
+	if err != nil || n < 0 || (multiplier != 0 && n > int64(^uint64(0)>>1)/multiplier) {
+		return 0, fmt.Errorf("invalid byte size %q", raw)
+	}
+	return n * multiplier, nil
+}
+
+func formatByteSize(n int64) string {
+	for _, unit := range []struct {
+		suffix string
+		bytes  int64
+	}{{"GiB", 1 << 30}, {"MiB", 1 << 20}, {"KiB", 1 << 10}} {
+		if n%unit.bytes == 0 && n >= unit.bytes {
+			return fmt.Sprintf("%d%s", n/unit.bytes, unit.suffix)
+		}
+	}
+	return strconv.FormatInt(n, 10)
+}
+
 // newStorage builds the requested storage backend. The returned cleanup
 // function closes the storage and removes any temporary data directory.
-func newStorage(kind, dataDir string) (durablestream.Storage, func(), error) {
+func newStorage(kind, dataDir string, seglogOpts seglog.Options) (durablestream.Storage, func(), error) {
 	switch kind {
 	case "memory":
 		log.Println("Using memory storage")
@@ -160,7 +238,8 @@ func newStorage(kind, dataDir string) (durablestream.Storage, func(), error) {
 			}
 			removeDir = true
 		}
-		s, err := seglog.New(seglog.Options{Dir: dir})
+		seglogOpts.Dir = dir
+		s, err := seglog.New(seglogOpts)
 		if err != nil {
 			if removeDir {
 				if rmErr := os.RemoveAll(dir); rmErr != nil {

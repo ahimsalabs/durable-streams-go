@@ -5,7 +5,10 @@ import (
 	"context"
 	"errors"
 	"io"
+	"net/http"
+	"net/http/httptest"
 	"os"
+	"reflect"
 	"testing"
 
 	"github.com/ahimsalabs/durable-streams-go/durablestream"
@@ -87,6 +90,31 @@ func TestReadSpans_PinDefersSegmentUnlinkUntilClose(t *testing.T) {
 	}
 	if _, err := os.Stat(path); !os.IsNotExist(err) {
 		t.Fatalf("segment after release: %v", err)
+	}
+}
+
+func TestHandlerCatchup_FileSpanWireMatchesCopiedPath(t *testing.T) {
+	s := newSpanTestStorage(t)
+	for _, payload := range [][]byte{{0, 1, 2, 3}, []byte("sealed-binary\x00tail")} {
+		if _, err := s.Append(t.Context(), "s", payload, ""); err != nil {
+			t.Fatal(err)
+		}
+	}
+	sealSpanTestStream(t, s, "s")
+
+	serve := func(storage durablestream.Storage) *httptest.ResponseRecorder {
+		t.Helper()
+		recorder := httptest.NewRecorder()
+		request := httptest.NewRequest(http.MethodGet, "/s?offset=-1&cursor=wire", nil)
+		request.Header.Set("If-None-Match", `"not-a-match"`)
+		durablestream.NewHandler(storage, nil).ServeHTTP(recorder, request)
+		return recorder
+	}
+	direct := serve(s)
+	copied := serve(struct{ durablestream.Storage }{Storage: s})
+	if direct.Code != copied.Code || !reflect.DeepEqual(direct.Header(), copied.Header()) || !bytes.Equal(direct.Body.Bytes(), copied.Body.Bytes()) {
+		t.Fatalf("span response differs from copied response:\nspan: status=%d headers=%v body=%q\ncopy: status=%d headers=%v body=%q",
+			direct.Code, direct.Header(), direct.Body.Bytes(), copied.Code, copied.Header(), copied.Body.Bytes())
 	}
 }
 

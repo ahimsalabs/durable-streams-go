@@ -24,6 +24,21 @@ func fdatasync(f *os.File) error {
 	}
 }
 
+// syncFilesystem establishes one durability barrier for every pending file
+// and directory update on f's filesystem. Checkpoint cadence uses this on
+// Linux to avoid issuing one device-cache flush per dirty stream file.
+func syncFilesystem(f *os.File) (bool, error) {
+	for {
+		err := unix.Syncfs(int(f.Fd()))
+		if err == nil {
+			return true, nil
+		}
+		if !errors.Is(err, unix.EINTR) {
+			return true, &os.PathError{Op: "syncfs", Path: f.Name(), Err: err}
+		}
+	}
+}
+
 // preallocate reserves size bytes for f so later appends cannot fail with
 // ENOSPC mid-group and fdatasync does not need to journal size changes.
 // Filesystems without fallocate support fall back to a sparse truncate.

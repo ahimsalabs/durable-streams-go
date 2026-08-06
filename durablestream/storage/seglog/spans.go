@@ -169,6 +169,10 @@ type ownedReadSpan struct {
 	used   bool
 }
 
+// DirectWriteEligible reports that an owned fallback must use the handler's
+// copied response path rather than direct file-range serving.
+func (*ownedReadSpan) DirectWriteEligible() bool { return false }
+
 func (s *ownedReadSpan) WriteTo(w io.Writer) (int64, error) {
 	s.mu.Lock()
 	if s.closed || s.used {
@@ -197,6 +201,10 @@ type fileReadSpan struct {
 	closed bool
 	used   bool
 }
+
+// DirectWriteEligible reports that this complete range is pinned to an
+// immutable sealed segment and can be written directly to the response.
+func (*fileReadSpan) DirectWriteEligible() bool { return true }
 
 func (s *fileReadSpan) WriteTo(w io.Writer) (int64, error) {
 	s.mu.Lock()

@@ -102,8 +102,9 @@ type partition struct {
 	// unsyncedFiles are segment payloads and sidecars published since the last
 	// checkpoint. The WAL covers them until checkpoint-time batch sync makes
 	// their current prefixes durable.
-	unsyncedFiles map[string]struct{}
-	unsyncedDirs  map[string]struct{}
+	unsyncedFiles   map[string]struct{}
+	unsyncedDirs    map[string]struct{}
+	unsyncedParents map[string]struct{}
 	// sealedSidecars become removable only after a checkpoint durably names
 	// their payload files as sealed. Delayed-checkpoint rounds accumulate them
 	// here until that checkpoint commits.
@@ -125,6 +126,7 @@ func newPartition(id uint32, st *Storage, wal *walWriter) *partition {
 		materializedEntries: make(map[string]streamCheckpointEntry),
 		unsyncedFiles:       make(map[string]struct{}),
 		unsyncedDirs:        make(map[string]struct{}),
+		unsyncedParents:     make(map[string]struct{}),
 		sealedSidecars:      make(map[string]struct{}),
 		cleanupPaths:        make(map[string]struct{}),
 		cleanupDirs:         make(map[string]struct{}),

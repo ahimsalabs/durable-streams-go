@@ -37,8 +37,9 @@ single-file recovery. Delta checkpoint compaction is a possible future
 optimization if very large catalogs make that rewrite cost significant.
 Ordinary materializer rounds issue no data flushes. Checkpoints run on their
 independent `CheckpointInterval`; `-1` couples them to every round for tests.
-Each checkpoint batch-syncs accumulated payload and sidecar paths back-to-back
-before its one atomic metadata write. A round that can reclaim a full WAL
+Each checkpoint establishes one Linux `syncfs` durability barrier before its
+atomic metadata write; portable builds batch-sync accumulated payload, sidecar,
+and directory paths individually. A round that can reclaim a full WAL
 segment, trim segment files, or remove a dead stream always checkpoints first.
 There are no per-stream metadata flushes.
 
@@ -108,6 +109,15 @@ Current limitations are explicit:
 - Linux uses `fdatasync` and `fallocate`; portable builds fall back to full
   `fsync` and sparse `truncate`.
 - There is no remote tiering or offload path.
+
+## Deployment sizing
+
+On an OVH instance with 4 vCPUs, 7.6 GiB of memory, and HDD storage, 4 WAL
+partitions with 64 MiB WAL segments worked well. The package defaults remain
+32 partitions and 256 MiB WAL segments. Those defaults formerly allocated
+about 3.2 GiB for a small data set because every active partition segment was
+allocated at its full logical size. WAL segments now grow in 16 MiB extents,
+which avoids that eager allocation while preserving the 256 MiB roll cap.
 
 ## Benchmarks
 

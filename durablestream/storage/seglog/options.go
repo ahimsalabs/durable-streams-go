@@ -85,8 +85,9 @@ type Options struct {
 	// with ErrPayloadTooLarge.
 	MaxMessageSize int
 
-	// WALSegmentBytes is the preallocated size of one WAL segment file. It
-	// also bounds a single logical mutation: a frame must fit one segment.
+	// WALSegmentBytes is the logical size of one WAL segment file. Disk space
+	// is preallocated incrementally. It also bounds a single logical mutation:
+	// a frame must fit one segment.
 	WALSegmentBytes int64
 
 	// GroupLinger is how long a partition worker waits for more requests

@@ -528,6 +528,168 @@ type baseStorageOnly struct {
 	Storage
 }
 
+type handlerTestReadSpan struct {
+	data       []byte
+	eligible   bool
+	writeErr   error
+	closeCount int
+}
+
+func (s *handlerTestReadSpan) WriteTo(w io.Writer) (int64, error) {
+	n, err := w.Write(s.data)
+	if err != nil {
+		return int64(n), err
+	}
+	return int64(n), s.writeErr
+}
+
+func (s *handlerTestReadSpan) Close() error {
+	s.closeCount++
+	return nil
+}
+
+func (s *handlerTestReadSpan) DirectWriteEligible() bool { return s.eligible }
+
+type handlerTestSpanStorage struct {
+	*testStorage
+	spans     []*handlerTestReadSpan
+	spanErr   error
+	readCount int
+}
+
+func (s *handlerTestSpanStorage) Read(ctx context.Context, streamID string, offset Offset, limit int) (*ReadResult, error) {
+	s.readCount++
+	return s.testStorage.Read(ctx, streamID, offset, limit)
+}
+
+func (s *handlerTestSpanStorage) ReadSpans(ctx context.Context, streamID string, offset Offset, limit int) (*SpanReadResult, error) {
+	read, err := s.testStorage.Read(ctx, streamID, offset, limit)
+	if err != nil {
+		return nil, err
+	}
+	result := &SpanReadResult{
+		NextOffset:    read.NextOffset,
+		TailOffset:    read.TailOffset,
+		IncarnationID: read.IncarnationID,
+		Closed:        read.Closed,
+	}
+	for _, span := range s.spans {
+		result.Spans = append(result.Spans, span)
+	}
+	return result, s.spanErr
+}
+
+func TestHandlerCatchupRead_FileSpansMatchCopiedResponse(t *testing.T) {
+	storage := newTestStorage()
+	if created, err := storage.Create(t.Context(), "/stream", StreamConfig{ContentType: "application/octet-stream"}); err != nil || !created {
+		t.Fatalf("Create() = (%v, %v), want (true, nil)", created, err)
+	}
+	for _, data := range [][]byte{{0, 1, 2, 3}, []byte("binary\x00tail")} {
+		if _, err := storage.Append(t.Context(), "/stream", data, ""); err != nil {
+			t.Fatalf("Append(): %v", err)
+		}
+	}
+
+	request := func(handler http.Handler) *httptest.ResponseRecorder {
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodGet, "/stream?offset=-1&cursor=12", nil)
+		req.Header.Set("If-None-Match", `"not-a-match"`)
+		handler.ServeHTTP(rec, req)
+		return rec
+	}
+
+	copied := request(NewHandler(&baseStorageOnly{Storage: storage}, nil))
+	spanStorage := &handlerTestSpanStorage{
+		testStorage: storage,
+		spans: []*handlerTestReadSpan{
+			{data: []byte{0, 1, 2, 3}, eligible: true},
+			{data: []byte("binary\x00tail"), eligible: true},
+		},
+	}
+	direct := request(NewHandler(spanStorage, nil))
+
+	if direct.Code != copied.Code {
+		t.Errorf("status = %d, copied path = %d", direct.Code, copied.Code)
+	}
+	if !reflect.DeepEqual(direct.Header(), copied.Header()) {
+		t.Errorf("headers differ:\n direct: %#v\n copied: %#v", direct.Header(), copied.Header())
+	}
+	if !bytes.Equal(direct.Body.Bytes(), copied.Body.Bytes()) {
+		t.Errorf("body = %q, copied path = %q", direct.Body.Bytes(), copied.Body.Bytes())
+	}
+	if spanStorage.readCount != 0 {
+		t.Errorf("Read called %d times, want 0", spanStorage.readCount)
+	}
+	for i, span := range spanStorage.spans {
+		if span.closeCount == 0 {
+			t.Errorf("span %d was not closed", i)
+		}
+	}
+}
+
+func TestHandlerCatchupRead_IneligibleAndSpanErrorCloseBeforeFallback(t *testing.T) {
+	for _, test := range []struct {
+		name    string
+		spanErr error
+	}{
+		{name: "ineligible span"},
+		{name: "span read error", spanErr: errors.New("injected span read error")},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			storage := newTestStorage()
+			if created, err := storage.Create(t.Context(), "/stream", StreamConfig{ContentType: "text/plain"}); err != nil || !created {
+				t.Fatalf("Create() = (%v, %v), want (true, nil)", created, err)
+			}
+			if _, err := storage.Append(t.Context(), "/stream", []byte("copied response"), ""); err != nil {
+				t.Fatalf("Append(): %v", err)
+			}
+			span := &handlerTestReadSpan{data: []byte("must not be written"), eligible: test.spanErr != nil}
+			spanStorage := &handlerTestSpanStorage{testStorage: storage, spans: []*handlerTestReadSpan{span}, spanErr: test.spanErr}
+
+			rec := httptest.NewRecorder()
+			NewHandler(spanStorage, nil).ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/stream?offset=-1", nil))
+
+			if rec.Code != http.StatusOK || rec.Body.String() != "copied response" {
+				t.Errorf("response = (%d, %q), want (200, %q)", rec.Code, rec.Body.String(), "copied response")
+			}
+			if spanStorage.readCount != 1 {
+				t.Errorf("Read called %d times, want 1", spanStorage.readCount)
+			}
+			if span.closeCount == 0 {
+				t.Error("span was not closed")
+			}
+		})
+	}
+}
+
+func TestHandlerCatchupRead_WriterToFailureTerminatesWithoutFallback(t *testing.T) {
+	storage := newTestStorage()
+	if created, err := storage.Create(t.Context(), "/stream", StreamConfig{ContentType: "text/plain"}); err != nil || !created {
+		t.Fatalf("Create() = (%v, %v), want (true, nil)", created, err)
+	}
+	if _, err := storage.Append(t.Context(), "/stream", []byte("copied response"), ""); err != nil {
+		t.Fatalf("Append(): %v", err)
+	}
+	first := &handlerTestReadSpan{data: []byte("partial"), eligible: true, writeErr: errors.New("injected write error")}
+	second := &handlerTestReadSpan{data: []byte("must not be written"), eligible: true}
+	spanStorage := &handlerTestSpanStorage{testStorage: storage, spans: []*handlerTestReadSpan{first, second}}
+
+	rec := httptest.NewRecorder()
+	NewHandler(spanStorage, nil).ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/stream?offset=-1", nil))
+
+	if rec.Code != http.StatusOK || rec.Body.String() != "partial" {
+		t.Errorf("response = (%d, %q), want committed partial response", rec.Code, rec.Body.String())
+	}
+	if spanStorage.readCount != 0 {
+		t.Errorf("Read called %d times after WriterTo failure, want 0", spanStorage.readCount)
+	}
+	for i, span := range spanStorage.spans {
+		if span.closeCount == 0 {
+			t.Errorf("span %d was not closed", i)
+		}
+	}
+}
+
 type failOnceBatchStorage struct {
 	AtomicBatchStorage
 	mu       sync.Mutex
