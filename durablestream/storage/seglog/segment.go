@@ -22,6 +22,9 @@ const (
 	segmentHeaderSize        = 64
 	denseEntrySize           = 16
 	segmentFooterSize        = 56
+
+	materializerPayloadBufferBytes = 1 << 20
+	materializerIndexBufferBytes   = 64 << 10
 )
 
 var errBadSegment = errors.New("seglog: invalid stream segment")
@@ -145,11 +148,29 @@ func openActiveSegment(path, name string, inc incarnation, payloadEnd, count, mi
 	return &segmentFile{name: name, path: path, indexPath: idxPath, firstIndex: first, lastIndex: first + count - 1, payloadEnd: payloadEnd, count: count, minTS: minTS, maxTS: maxTS, createdUnixNano: created}, nil
 }
 
-func (sf *segmentFile) appendRecord(payloadFile, indexFile *os.File, rec segmentRecord, payload []byte) error {
+type writerAt interface {
+	WriteAt([]byte, int64) (int, error)
+}
+
+func writeAtFull(w writerAt, data []byte, offset int64) error {
+	if len(data) == 0 {
+		return nil
+	}
+	n, err := w.WriteAt(data, offset)
+	if err != nil {
+		return err
+	}
+	if n != len(data) {
+		return io.ErrShortWrite
+	}
+	return nil
+}
+
+func (sf *segmentFile) appendRecord(payloadFile, indexFile writerAt, rec segmentRecord, payload []byte) error {
 	if rec.index != sf.firstIndex+sf.count || rec.batchFirst > rec.index || rec.index-rec.batchFirst > int64(^uint32(0)) {
 		return fmt.Errorf("%w: invalid dense entry geometry", errBadSegment)
 	}
-	if _, err := payloadFile.WriteAt(payload, sf.payloadEnd); err != nil {
+	if err := writeAtFull(payloadFile, payload, sf.payloadEnd); err != nil {
 		return err
 	}
 	end := sf.payloadEnd + int64(len(payload))
@@ -157,14 +178,77 @@ func (sf *segmentFile) appendRecord(payloadFile, indexFile *os.File, rec segment
 	binary.LittleEndian.PutUint64(e[:8], uint64(end))
 	binary.LittleEndian.PutUint32(e[8:12], crc32.Checksum(payload, crcTable))
 	binary.LittleEndian.PutUint32(e[12:16], uint32(rec.index-rec.batchFirst))
-	if _, err := indexFile.WriteAt(e[:], sf.count*denseEntrySize); err != nil {
+	if err := writeAtFull(indexFile, e[:], sf.count*denseEntrySize); err != nil {
 		return err
 	}
+	sf.advance(rec, end)
+	return nil
+}
+
+func (sf *segmentFile) advance(rec segmentRecord, end int64) {
 	sf.payloadEnd, sf.count, sf.lastIndex = end, sf.count+1, rec.index
 	if sf.count == 1 && sf.minTS == 0 {
 		sf.minTS = rec.ts
 	}
 	sf.maxTS = max(sf.maxTS, rec.ts)
+}
+
+type segmentWriteBuffer struct {
+	payload       []byte
+	index         []byte
+	payloadOffset int64
+	indexOffset   int64
+}
+
+func (b *segmentWriteBuffer) reset() {
+	if cap(b.payload) != materializerPayloadBufferBytes {
+		b.payload = make([]byte, 0, materializerPayloadBufferBytes)
+	} else {
+		b.payload = b.payload[:0]
+	}
+	if cap(b.index) != materializerIndexBufferBytes {
+		b.index = make([]byte, 0, materializerIndexBufferBytes)
+	} else {
+		b.index = b.index[:0]
+	}
+	b.payloadOffset = 0
+	b.indexOffset = 0
+}
+
+func (b *segmentWriteBuffer) wouldExceed(payloadBytes int) bool {
+	return len(b.payload)+payloadBytes > materializerPayloadBufferBytes ||
+		len(b.index)+denseEntrySize > materializerIndexBufferBytes
+}
+
+func (b *segmentWriteBuffer) append(sf *segmentFile, rec segmentRecord, payload []byte) error {
+	if rec.index != sf.firstIndex+sf.count || rec.batchFirst > rec.index || rec.index-rec.batchFirst > int64(^uint32(0)) {
+		return fmt.Errorf("%w: invalid dense entry geometry", errBadSegment)
+	}
+	if len(b.index) == 0 {
+		b.payloadOffset = sf.payloadEnd
+		b.indexOffset = sf.count * denseEntrySize
+	}
+	end := sf.payloadEnd + int64(len(payload))
+	b.payload = append(b.payload, payload...)
+	b.index = binary.LittleEndian.AppendUint64(b.index, uint64(end))
+	b.index = binary.LittleEndian.AppendUint32(b.index, crc32.Checksum(payload, crcTable))
+	b.index = binary.LittleEndian.AppendUint32(b.index, uint32(rec.index-rec.batchFirst))
+	sf.advance(rec, end)
+	return nil
+}
+
+func (b *segmentWriteBuffer) flush(payloadFile, indexFile writerAt) error {
+	if len(b.index) == 0 {
+		return nil
+	}
+	if err := writeAtFull(payloadFile, b.payload, b.payloadOffset); err != nil {
+		return fmt.Errorf("write coalesced segment payload: %w", err)
+	}
+	if err := writeAtFull(indexFile, b.index, b.indexOffset); err != nil {
+		return fmt.Errorf("write coalesced segment index: %w", err)
+	}
+	b.payload = b.payload[:0]
+	b.index = b.index[:0]
 	return nil
 }
 

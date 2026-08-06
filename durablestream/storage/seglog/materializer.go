@@ -731,6 +731,23 @@ func (st *streamState) closeSegments() {
 func (s *Storage) materializeStream(p *partition, st *streamState) (*preparedStream, error) {
 	snap := st.snapshot()
 	draft := &preparedStream{st: st, snap: snap, sealed: slices.Clone(snap.sealed), through: snap.through, touched: make(map[string]struct{}), touchedDirs: make(map[string]struct{}), touchedParents: make(map[string]struct{})}
+	writes := &p.segmentWrites
+	writes.reset()
+	flushWrites := func() error {
+		if len(writes.index) == 0 {
+			return nil
+		}
+		payloadPin, indexPin, err := s.pinDraftActive(draft)
+		if err != nil {
+			return err
+		}
+		if err := writes.flush(payloadPin.file(), indexPin.file()); err != nil {
+			return err
+		}
+		draft.touched[draft.active.path] = struct{}{}
+		draft.touched[draft.active.indexPath] = struct{}{}
+		return nil
+	}
 	if snap.deleted {
 		return draft, nil
 	}
@@ -761,6 +778,9 @@ func (s *Storage) materializeStream(p *partition, st *streamState) (*preparedStr
 			return draft, fmt.Errorf("read WAL payload for %s index %d: %w", st.id, idx, err)
 		}
 		if draft.active != nil && draft.active.payloadEnd-segmentHeaderSize >= snap.policy.TargetBytes {
+			if err := flushWrites(); err != nil {
+				return draft, err
+			}
 			payloadPin, indexPin, err := s.pinDraftActive(draft)
 			if err != nil {
 				return draft, err
@@ -794,15 +814,32 @@ func (s *Storage) materializeStream(p *partition, st *streamState) (*preparedStr
 			draft.touchedDirs[dir] = struct{}{}
 		}
 		rec := segmentRecord{index: idx, batchFirst: loc.batchFirst, ts: loc.ts, length: loc.length}
-		payloadPin, indexPin, err := s.pinDraftActive(draft)
-		if err != nil {
+		if len(payload) > materializerPayloadBufferBytes {
+			if err := flushWrites(); err != nil {
+				return draft, err
+			}
+			payloadPin, indexPin, err := s.pinDraftActive(draft)
+			if err != nil {
+				return draft, err
+			}
+			if err := draft.active.appendRecord(payloadPin.file(), indexPin.file(), rec, payload); err != nil {
+				return draft, err
+			}
+			draft.touched[draft.active.path] = struct{}{}
+			draft.touched[draft.active.indexPath] = struct{}{}
+			continue
+		}
+		if writes.wouldExceed(len(payload)) {
+			if err := flushWrites(); err != nil {
+				return draft, err
+			}
+		}
+		if err := writes.append(draft.active, rec, payload); err != nil {
 			return draft, err
 		}
-		if err := draft.active.appendRecord(payloadPin.file(), indexPin.file(), rec, payload); err != nil {
-			return draft, err
-		}
-		draft.touched[draft.active.path] = struct{}{}
-		draft.touched[draft.active.indexPath] = struct{}{}
+	}
+	if err := flushWrites(); err != nil {
+		return draft, err
 	}
 	if snap.forceSeal && draft.active != nil && draft.active.createdUnixNano == snap.activeCreated &&
 		draft.active.lastIndex >= draft.active.firstIndex {

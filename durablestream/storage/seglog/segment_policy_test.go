@@ -2,8 +2,11 @@ package seglog
 
 import (
 	"bytes"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
+	"hash/crc32"
+	"io"
 	"os"
 	"strings"
 	"testing"
@@ -11,6 +14,211 @@ import (
 
 	"github.com/ahimsalabs/durable-streams-go/durablestream"
 )
+
+type recordingWriterAt struct {
+	data   []byte
+	writes int
+	short  bool
+}
+
+func (w *recordingWriterAt) WriteAt(p []byte, off int64) (int, error) {
+	w.writes++
+	if w.short && len(p) > 0 {
+		return len(p) - 1, nil
+	}
+	end := int(off) + len(p)
+	if len(w.data) < end {
+		w.data = append(w.data, make([]byte, end-len(w.data))...)
+	}
+	copy(w.data[off:], p)
+	return len(p), nil
+}
+
+func TestSegmentWriteBuffer_CoalescesPayloadAndDenseIndex(t *testing.T) {
+	var b segmentWriteBuffer
+	b.reset()
+	sf := &segmentFile{firstIndex: 1, lastIndex: 0, payloadEnd: segmentHeaderSize}
+	payloads := [][]byte{[]byte("a"), []byte("bc"), []byte("def")}
+	for i, payload := range payloads {
+		rec := segmentRecord{index: int64(i + 1), batchFirst: 1, ts: int64(100 + i)}
+		if err := b.append(sf, rec, payload); err != nil {
+			t.Fatal(err)
+		}
+	}
+	payloadFile, indexFile := &recordingWriterAt{}, &recordingWriterAt{}
+	if err := b.flush(payloadFile, indexFile); err != nil {
+		t.Fatal(err)
+	}
+	if payloadFile.writes != 1 || indexFile.writes != 1 {
+		t.Fatalf("payload/index writes = %d/%d, want 1/1", payloadFile.writes, indexFile.writes)
+	}
+	if got := payloadFile.data[segmentHeaderSize:]; !bytes.Equal(got, []byte("abcdef")) {
+		t.Fatalf("payload = %q, want abcdef", got)
+	}
+	wantEnds := []uint64{segmentHeaderSize + 1, segmentHeaderSize + 3, segmentHeaderSize + 6}
+	for i, payload := range payloads {
+		entry := indexFile.data[i*denseEntrySize : (i+1)*denseEntrySize]
+		if got := binary.LittleEndian.Uint64(entry[:8]); got != wantEnds[i] {
+			t.Errorf("entry %d end = %d, want %d", i, got, wantEnds[i])
+		}
+		if got := binary.LittleEndian.Uint32(entry[8:12]); got != crc32.Checksum(payload, crcTable) {
+			t.Errorf("entry %d CRC = %08x", i, got)
+		}
+		if got := binary.LittleEndian.Uint32(entry[12:16]); got != uint32(i) {
+			t.Errorf("entry %d batch delta = %d, want %d", i, got, i)
+		}
+	}
+	if sf.payloadEnd != segmentHeaderSize+6 || sf.count != 3 || sf.lastIndex != 3 || sf.minTS != 100 || sf.maxTS != 102 {
+		t.Errorf("segment geometry after flush = %+v", sf)
+	}
+}
+
+func TestSegmentWriteBuffer_RejectsShortWrites(t *testing.T) {
+	newBuffer := func(t *testing.T) segmentWriteBuffer {
+		t.Helper()
+		var b segmentWriteBuffer
+		b.reset()
+		sf := &segmentFile{firstIndex: 1, lastIndex: 0, payloadEnd: segmentHeaderSize}
+		if err := b.append(sf, segmentRecord{index: 1, batchFirst: 1}, []byte("payload")); err != nil {
+			t.Fatal(err)
+		}
+		return b
+	}
+	t.Run("payload", func(t *testing.T) {
+		b := newBuffer(t)
+		err := b.flush(&recordingWriterAt{short: true}, &recordingWriterAt{})
+		if !errors.Is(err, io.ErrShortWrite) {
+			t.Fatalf("flush error = %v, want io.ErrShortWrite", err)
+		}
+	})
+	t.Run("index", func(t *testing.T) {
+		b := newBuffer(t)
+		err := b.flush(&recordingWriterAt{}, &recordingWriterAt{short: true})
+		if !errors.Is(err, io.ErrShortWrite) {
+			t.Fatalf("flush error = %v, want io.ErrShortWrite", err)
+		}
+	})
+}
+
+func TestSegmentWriteBuffer_RetryOverwritesUnpublishedSuffix(t *testing.T) {
+	published := segmentFile{firstIndex: 1, lastIndex: 1, payloadEnd: segmentHeaderSize + 1, count: 1}
+	payloadFile := &recordingWriterAt{data: append(make([]byte, segmentHeaderSize), 'a')}
+	indexFile := &recordingWriterAt{data: make([]byte, denseEntrySize), short: true}
+	stage := func(t *testing.T, sf *segmentFile) segmentWriteBuffer {
+		t.Helper()
+		var b segmentWriteBuffer
+		b.reset()
+		for i, payload := range [][]byte{[]byte("bc"), []byte("def")} {
+			if err := b.append(sf, segmentRecord{index: int64(i + 2), batchFirst: 2}, payload); err != nil {
+				t.Fatal(err)
+			}
+		}
+		return b
+	}
+	failedDraft := published
+	b := stage(t, &failedDraft)
+	if err := b.flush(payloadFile, indexFile); !errors.Is(err, io.ErrShortWrite) {
+		t.Fatalf("first flush error = %v, want io.ErrShortWrite", err)
+	}
+	if published.payloadEnd != segmentHeaderSize+1 || published.count != 1 {
+		t.Fatalf("published geometry changed after failed draft: %+v", published)
+	}
+
+	indexFile.short = false
+	retryDraft := published
+	b = stage(t, &retryDraft)
+	if err := b.flush(payloadFile, indexFile); err != nil {
+		t.Fatal(err)
+	}
+	if got := payloadFile.data[segmentHeaderSize:retryDraft.payloadEnd]; !bytes.Equal(got, []byte("abcdef")) {
+		t.Fatalf("payload after retry = %q, want abcdef", got)
+	}
+	if retryDraft.count != 3 || retryDraft.lastIndex != 3 {
+		t.Fatalf("retry geometry = %+v", retryDraft)
+	}
+}
+
+func TestMaterializer_CoalescesAcrossFlushesAndRollovers(t *testing.T) {
+	dir := t.TempDir()
+	opts := singlePartitionOptions(dir)
+	opts.MaxMessageSize = 3 << 20
+	opts.WALSegmentBytes = 8 << 20
+	opts.WALExtentBytes = 4 << 20
+	opts.MaterializeMaxAge = -1
+	opts.RetentionInterval = -1
+	opts.DefaultSegmentPolicy = SegmentPolicy{TargetBytes: 2 << 20}
+	s := openTest(t, opts)
+	if _, err := s.Create(t.Context(), "s", durablestream.StreamConfig{}); err != nil {
+		t.Fatal(err)
+	}
+	payloads := [][]byte{
+		bytes.Repeat([]byte{'a'}, 600<<10),
+		bytes.Repeat([]byte{'b'}, 424<<10),
+		bytes.Repeat([]byte{'c'}, 600<<10),
+		bytes.Repeat([]byte{'d'}, 500<<10),
+		bytes.Repeat([]byte{'e'}, (2<<20)+1),
+		[]byte("tail"),
+	}
+	if _, err := s.AppendBatch(t.Context(), "s", payloads, ""); err != nil {
+		t.Fatal(err)
+	}
+	s.materializeRound(s.parts[0])
+	st, _ := s.streams.Load("s")
+	snap := st.snapshot()
+	if len(snap.sealed) != 2 || snap.activeView.count != 1 {
+		t.Fatalf("sealed segments = %d, active records = %d; want 2 and 1", len(snap.sealed), snap.activeView.count)
+	}
+	assertSegment(t, snap.sealed[0], 1, 4, bytes.Join(payloads[:4], nil))
+	assertSegment(t, snap.sealed[1], 5, 5, payloads[4])
+	assertSegment(t, st.activeSeg, 6, 6, payloads[5])
+	for segmentNumber, sf := range append(append([]*segmentFile(nil), snap.sealed...), st.activeSeg) {
+		var index []byte
+		var err error
+		if sf.sealed {
+			raw, readErr := os.ReadFile(sf.path)
+			err = readErr
+			index = raw[sf.payloadEnd : sf.payloadEnd+sf.count*denseEntrySize]
+		} else {
+			index, err = os.ReadFile(sf.indexPath)
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		for i := range sf.count {
+			entry := index[i*denseEntrySize : (i+1)*denseEntrySize]
+			logicalIndex := sf.firstIndex + i
+			if got, want := binary.LittleEndian.Uint32(entry[12:16]), uint32(logicalIndex-1); got != want {
+				t.Errorf("segment %d record %d batch delta = %d, want %d", segmentNumber, logicalIndex, got, want)
+			}
+		}
+	}
+	want := make([]string, len(payloads))
+	for i := range payloads {
+		want[i] = string(payloads[i])
+	}
+	if got := readAll(t, s, "s"); !equalStrings(got, want) {
+		t.Fatalf("read before reopen returned %d records, want %d", len(got), len(want))
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	r := openTest(t, opts)
+	if got := readAll(t, r, "s"); !equalStrings(got, want) {
+		t.Fatalf("read after reopen returned %d records, want %d", len(got), len(want))
+	}
+}
+
+func equalStrings(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
 
 func assertSegment(t *testing.T, sf *segmentFile, first, last int64, payload []byte) {
 	t.Helper()

@@ -120,9 +120,10 @@ type partition struct {
 	ageEntries   map[*streamState]*activeDeadline
 
 	// Materializer-owned: the last durably written checkpoint position.
-	ckptSeq   uint64
-	ckptOff   int64
-	ckptState []byte
+	ckptSeq       uint64
+	ckptOff       int64
+	ckptState     []byte
+	segmentWrites segmentWriteBuffer
 	// materializedEntries is the cumulative image including materialization
 	// rounds published since the checkpoint became durable. Materializer-owned.
 	materializedEntries map[string]streamCheckpointEntry
