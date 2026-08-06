@@ -2,6 +2,7 @@ package seglog
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -31,6 +32,7 @@ type Storage struct {
 
 	streams hashtriemap.HashTrieMap[string, *streamState]
 	parts   []*partition
+	fdCache *fdCache
 
 	// topologyMu serializes path publication, source pinning, and delete
 	// cascades. Lock order is topologyMu -> partition submit -> stream mu.
@@ -51,6 +53,7 @@ var (
 	_ durablestream.AtomicCloseStorage = (*Storage)(nil)
 	_ durablestream.ForkStorage        = (*Storage)(nil)
 	_ durablestream.TouchHeadStorage   = (*Storage)(nil)
+	_ durablestream.SpanReadStorage    = (*Storage)(nil)
 )
 
 // New opens (or initializes) a seglog storage rooted at opts.Dir, recovering
@@ -104,6 +107,7 @@ func New(opts Options) (_ *Storage, retErr error) {
 		ephemeral:   ephemeral,
 		releaseLock: release,
 		shutdownCh:  make(chan struct{}),
+		fdCache:     newFDCache(opts.FDCacheSize),
 	}
 	s.parts = make([]*partition, opts.Partitions)
 	for i := range s.parts {
@@ -132,7 +136,7 @@ func New(opts Options) (_ *Storage, retErr error) {
 }
 
 const (
-	formatVersionLine = "seglog-format-v1"
+	formatVersionLine = "seglog-format-v3"
 
 	// formatHashLine names the stream-routing hash. Both the partition count
 	// and the hash algorithm are persisted routing state (invariant I4): a
@@ -473,18 +477,30 @@ func (s *Storage) Close() error {
 		}()
 		select {
 		case <-workersDone:
-			s.closeErr = s.releaseResources()
+			finalErr := s.finalMaterializeAll()
+			s.closeErr = errors.Join(finalErr, s.releaseResources())
 		case <-time.After(s.opts.ShutdownTimeout):
 			// Leave files open rather than close them under a live worker;
 			// the deferred goroutine finishes teardown when workers exit.
 			s.closeErr = fmt.Errorf("seglog: shutdown timed out after %v", s.opts.ShutdownTimeout)
 			go func() {
 				<-workersDone
+				_ = s.finalMaterializeAll()
 				_ = s.releaseResources()
 			}()
 		}
 	})
 	return s.closeErr
+}
+
+func (s *Storage) finalMaterializeAll() error {
+	var errs []error
+	for _, p := range s.parts {
+		if err := s.finalMaterialize(p); err != nil {
+			errs = append(errs, fmt.Errorf("seglog: final materialize partition %d: %w", p.id, err))
+		}
+	}
+	return errors.Join(errs...)
 }
 
 func (s *Storage) releaseResources() error {
@@ -498,6 +514,9 @@ func (s *Storage) releaseResources() error {
 		st.closeSegments()
 		return true
 	})
+	if err := s.fdCache.close(); err != nil && firstErr == nil {
+		firstErr = err
+	}
 	if err := s.releaseLock(); err != nil && firstErr == nil {
 		firstErr = fmt.Errorf("seglog: release lock: %w", err)
 	}

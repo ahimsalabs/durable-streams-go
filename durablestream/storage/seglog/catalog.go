@@ -4,8 +4,6 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"fmt"
-	"os"
-	"slices"
 	"sync"
 	"sync/atomic"
 
@@ -74,7 +72,7 @@ type streamState struct {
 	// parent and fork are published under Storage.topologyMu before the state
 	// becomes reachable. refCount includes provisional CreateFork pins. A pin
 	// is acquired while holding physicalMu; physical trimming holds the same
-	// gate through its final pin check, manifest rewrite, and unlink. Thus a
+	// gate through its final pin check, checkpoint, and unlink. Thus a
 	// newly effective pin can never race an unlink, without requiring the
 	// materializer to acquire topologyMu.
 	parent         *streamState
@@ -100,35 +98,11 @@ type streamState struct {
 	activeView          segmentView
 	materializedThrough int64
 	activeSeg           *segmentFile
+	forceSeal           bool // materializer-owned age-seal request
 
 	// notifyCh releases WaitForData callers. It is closed and replaced on
 	// every wake, and closed permanently when the incarnation dies.
 	notifyCh chan struct{}
-}
-
-// segmentView is a read-only view of a segment prefix that is safe to read
-// concurrently with the materializer appending behind it: records below end
-// are never rewritten.
-type segmentView struct {
-	f          *os.File
-	name       string
-	firstIndex int64
-	lastIndex  int64
-	end        int64
-	sparse     []sparseEntry
-}
-
-// view publishes the segment's current committed prefix. The sparse slice is
-// cloned because the materializer keeps appending to its own copy.
-func (sf *segmentFile) view() segmentView {
-	return segmentView{
-		f:          sf.f,
-		name:       sf.name,
-		firstIndex: sf.firstIndex,
-		lastIndex:  sf.lastIndex,
-		end:        sf.bytes,
-		sparse:     slices.Clone(sf.sparse),
-	}
 }
 
 func newStreamState(id string, inc incarnation, partition uint32, cfg durablestream.StreamConfig) *streamState {

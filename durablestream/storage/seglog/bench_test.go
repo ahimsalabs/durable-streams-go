@@ -26,7 +26,7 @@ func benchmarkOptions(dir string) Options {
 		RetentionInterval:   -1,
 		StreamSegmentBytes:  8 << 20,
 		StreamSegmentAge:    -1,
-		SparseIndexBytes:    32 << 10,
+		FDCacheSize:         384,
 	}
 }
 

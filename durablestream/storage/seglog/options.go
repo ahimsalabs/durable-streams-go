@@ -22,10 +22,13 @@ const (
 	DefaultQueueDepth          = 256
 	DefaultShutdownTimeout     = 30 * time.Second
 	DefaultMaterializeInterval = 25 * time.Millisecond
+	DefaultCheckpointInterval  = 250 * time.Millisecond
 	DefaultRetentionInterval   = 30 * time.Second
 	DefaultStreamSegmentBytes  = 128 << 20
-	DefaultStreamSegmentAge    = 10 * time.Minute
-	DefaultSparseIndexBytes    = 32 << 10
+	// One hour avoids surprising segment churn for low-traffic streams while
+	// still giving age retention a bounded opportunity to seal an idle tail.
+	DefaultStreamSegmentAge = time.Hour
+	DefaultFDCacheSize      = 384
 )
 
 // Retention limits the history retained for one stream. Zero values mean
@@ -110,11 +113,17 @@ type Options struct {
 	ShutdownTimeout time.Duration
 
 	// MaterializeInterval is how often each partition's materializer copies
-	// committed WAL records into per-stream segments, flushes manifests,
+	// committed WAL records into per-stream segments, writes a checkpoint,
 	// advances the checkpoint, and reclaims fully-reflected WAL segments.
 	// -1 disables materialization: reads stay WAL-resident and the WAL is
 	// never reclaimed (useful for tests).
 	MaterializeInterval time.Duration
+
+	// CheckpointInterval is the minimum time between ordinary checkpoint
+	// writes. Materialized segment state is still published every
+	// MaterializeInterval. -1 checkpoints every materialization round, which
+	// is useful for tests that require tight coupling.
+	CheckpointInterval time.Duration
 
 	// DefaultRetention is copied to each stream when it is created.
 	DefaultRetention Retention
@@ -132,9 +141,9 @@ type Options struct {
 	// so age retention can eventually remove it. -1 disables age sealing.
 	StreamSegmentAge time.Duration
 
-	// SparseIndexBytes is the spacing of sparse index entries within stream
-	// segments: one entry per this many payload-file bytes.
-	SparseIndexBytes int
+	// FDCacheSize bounds cached stream segment and sidecar descriptors. In-use
+	// descriptors may temporarily exceed this bound until their pins release.
+	FDCacheSize int
 }
 
 func (o Options) withDefaults() Options {
@@ -162,6 +171,9 @@ func (o Options) withDefaults() Options {
 	if o.MaterializeInterval == 0 {
 		o.MaterializeInterval = DefaultMaterializeInterval
 	}
+	if o.CheckpointInterval == 0 {
+		o.CheckpointInterval = DefaultCheckpointInterval
+	}
 	if o.RetentionInterval == 0 {
 		o.RetentionInterval = DefaultRetentionInterval
 	}
@@ -171,8 +183,8 @@ func (o Options) withDefaults() Options {
 	if o.StreamSegmentAge == 0 {
 		o.StreamSegmentAge = DefaultStreamSegmentAge
 	}
-	if o.SparseIndexBytes == 0 {
-		o.SparseIndexBytes = DefaultSparseIndexBytes
+	if o.FDCacheSize == 0 {
+		o.FDCacheSize = DefaultFDCacheSize
 	}
 	return o
 }
@@ -208,6 +220,9 @@ func (o Options) validate() error {
 	if o.MaterializeInterval < 0 && o.MaterializeInterval != -1 {
 		errs = append(errs, fmt.Errorf("option MaterializeInterval must be positive or -1, got %v", o.MaterializeInterval))
 	}
+	if o.CheckpointInterval < 0 && o.CheckpointInterval != -1 {
+		errs = append(errs, fmt.Errorf("option CheckpointInterval must be positive or -1, got %v", o.CheckpointInterval))
+	}
 	if o.RetentionInterval < 0 && o.RetentionInterval != -1 {
 		errs = append(errs, fmt.Errorf("option RetentionInterval must be positive or -1, got %v", o.RetentionInterval))
 	}
@@ -217,15 +232,15 @@ func (o Options) validate() error {
 	if o.DefaultRetention.MaxAge < 0 {
 		errs = append(errs, fmt.Errorf("option DefaultRetention.MaxAge cannot be negative, got %v", o.DefaultRetention.MaxAge))
 	}
-	if o.StreamSegmentBytes < segmentHeaderSize+segmentRecordHeaderSize {
+	if o.StreamSegmentBytes < segmentHeaderSize+1 {
 		errs = append(errs, fmt.Errorf("option StreamSegmentBytes %d is below the minimum %d",
-			o.StreamSegmentBytes, segmentHeaderSize+segmentRecordHeaderSize))
+			o.StreamSegmentBytes, segmentHeaderSize+1))
 	}
 	if o.StreamSegmentAge < 0 && o.StreamSegmentAge != -1 {
 		errs = append(errs, fmt.Errorf("option StreamSegmentAge must be positive or -1, got %v", o.StreamSegmentAge))
 	}
-	if o.SparseIndexBytes < 512 {
-		errs = append(errs, fmt.Errorf("option SparseIndexBytes must be at least 512, got %d", o.SparseIndexBytes))
+	if o.FDCacheSize < 1 {
+		errs = append(errs, fmt.Errorf("option FDCacheSize must be positive, got %d", o.FDCacheSize))
 	}
 	if len(errs) > 0 {
 		return fmt.Errorf("seglog: invalid options: %w", errors.Join(errs...))

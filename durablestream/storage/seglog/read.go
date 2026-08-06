@@ -234,11 +234,11 @@ func (s *Storage) readSnapshotted(ctx context.Context, state *streamState, pos i
 		segThrough := min(snap.tail, snap.through)
 		views := make([]segmentView, 0, len(snap.sealed)+1)
 		for _, sf := range snap.sealed {
-			views = append(views, sf.view())
+			views = append(views, sf.view(s.fdCache))
 		}
 		views = append(views, snap.activeView)
 		for _, v := range views {
-			if v.f == nil || v.lastIndex < from || v.firstIndex > segThrough {
+			if v.path == "" || v.lastIndex < from || v.firstIndex > segThrough {
 				continue
 			}
 			err := v.readRecords(max(from, v.firstIndex), segThrough, func(rec segmentRecord, payloadOff int64) error {
@@ -306,7 +306,7 @@ func (s *Storage) messageBatch(state *streamState, index int64, depth int) (int6
 	}
 	views := make([]segmentView, 0, len(snap.sealed)+1)
 	for _, sf := range snap.sealed {
-		views = append(views, sf.view())
+		views = append(views, sf.view(s.fdCache))
 	}
 	views = append(views, snap.activeView)
 	for _, v := range views {

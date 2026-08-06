@@ -33,7 +33,6 @@ func BenchmarkAppendPartitionSweep(b *testing.B) {
 				if err != nil {
 					b.Fatal(err)
 				}
-				defer s.Close()
 				ctx := context.Background()
 				ids := make([]string, streams)
 				for i := range ids {
@@ -54,6 +53,10 @@ func BenchmarkAppendPartitionSweep(b *testing.B) {
 						}
 					}
 				})
+				b.StopTimer()
+				if err := s.Close(); err != nil {
+					b.Fatal(err)
+				}
 			})
 		}
 	}

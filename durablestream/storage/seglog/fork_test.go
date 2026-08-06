@@ -266,6 +266,17 @@ func TestFork_RetentionAdvancesLogicalFloorButPinsPhysicalSegments(t *testing.T)
 	if len(res.Messages) != 30 {
 		t.Fatalf("child inherited messages = %d, want 30", len(res.Messages))
 	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	s = openTest(t, opts)
+	res, err = s.Read(t.Context(), "child", durablestream.ZeroOffset, 0)
+	if err != nil {
+		t.Fatalf("child read through pinned source after reopen: %v", err)
+	}
+	if len(res.Messages) != 30 {
+		t.Fatalf("reopened child inherited messages = %d, want 30", len(res.Messages))
+	}
 	if err := s.Delete(t.Context(), "child"); err != nil {
 		t.Fatal(err)
 	}

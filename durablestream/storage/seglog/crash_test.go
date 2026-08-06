@@ -7,11 +7,29 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"sync"
 	"testing"
 
 	"github.com/ahimsalabs/durable-streams-go/durablestream"
 	"github.com/ahimsalabs/durable-streams-go/durablestream/storage"
 )
+
+// stopWithoutCheckpoint models process death while still closing descriptors
+// so the test can safely mutate and copy the fixture.
+func stopWithoutCheckpoint(t *testing.T, s *Storage) {
+	t.Helper()
+	for _, p := range s.parts {
+		p.closeAdmission()
+	}
+	close(s.shutdownCh)
+	s.workers.Wait()
+	if err := s.releaseResources(); err != nil {
+		t.Fatalf("release crash fixture: %v", err)
+	}
+	// Prevent a later cleanup from attempting the normal close path.
+	s.closeOnce = sync.Once{}
+	s.closeOnce.Do(func() {})
+}
 
 func crashOptions(dir string) Options {
 	opts := singlePartitionOptions(dir)
@@ -126,9 +144,7 @@ func TestCrashRecovery_TornTailAndFrameCorruptionPreservePrefix(t *testing.T) {
 	if _, err := s.CloseStream(t.Context(), "kept", [][]byte{[]byte("lost")}, "seq-3"); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.Close(); err != nil {
-		t.Fatal(err)
-	}
+	stopWithoutCheckpoint(t, s)
 	path := walSegments(t, fixture)[0]
 	frames := scanFrames(t, path)
 	if len(frames) != 6 {
@@ -186,7 +202,7 @@ func TestCrashRecovery_TornTailAndFrameCorruptionPreservePrefix(t *testing.T) {
 }
 
 func TestCrashOrdering_CommitMaterializeCheckpointThenReclaim(t *testing.T) {
-	steps := []string{"WAL commit", "materialize", "checkpoint", "reclaim"}
+	steps := []string{"WAL commit", "copy", "batch sync", "checkpoint", "publish", "reclaim"}
 	for prefix := 1; prefix <= len(steps); prefix++ {
 		t.Run("after "+steps[prefix-1], func(t *testing.T) {
 			dir := t.TempDir()
@@ -203,26 +219,39 @@ func TestCrashOrdering_CommitMaterializeCheckpointThenReclaim(t *testing.T) {
 				mustAppend(t, s, "s", fmt.Sprintf("%d-%s", i, string(make([]byte, 1200))))
 			}
 			p := s.parts[0]
-			barrier := p.submit(&request{op: opBarrier, done: make(chan result, 1)})
-			st, _ := s.streams.Load("s")
+			barrier := p.submit(&request{op: opBarrier, captureDirty: true, done: make(chan result, 1)})
+			prepared := make(map[*streamState]*preparedStream)
 			if prefix >= 2 {
-				if err := s.materializeStream(p, st); err != nil {
-					t.Fatal(err)
+				for st := range barrier.dirty {
+					draft, err := s.materializeStream(p, st)
+					if err != nil {
+						t.Fatal(err)
+					}
+					prepared[st] = draft
 				}
 			}
 			if prefix >= 3 {
-				if err := s.advanceCheckpoint(p, barrier); err != nil {
-					t.Fatal(err)
+				for _, draft := range prepared {
+					syncDraftTouched(t, s, draft)
 				}
 			}
 			if prefix >= 4 {
+				if err := s.advanceCheckpoint(p, barrier, s.checkpointEntries(p.materializedEntries, prepared, barrier.removals)); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if prefix >= 5 {
+				for _, draft := range prepared {
+					s.publishPrepared(draft)
+				}
+			}
+			if prefix >= 6 {
 				if err := p.wal.removeBefore(barrier.walSeq); err != nil {
 					t.Fatal(err)
 				}
 			}
-			if err := s.Close(); err != nil {
-				t.Fatal(err)
-			}
+			s.releasePrepared(prepared)
+			stopWithoutCheckpoint(t, s)
 			r, err := New(opts)
 			if err != nil {
 				t.Fatalf("reopen after step prefix: %v", err)
@@ -235,8 +264,8 @@ func TestCrashOrdering_CommitMaterializeCheckpointThenReclaim(t *testing.T) {
 	}
 }
 
-func TestCrashOrdering_SealThenManifest(t *testing.T) {
-	for prefix, name := range []string{"seal", "manifest"} {
+func TestCrashOrdering_SealThenCheckpoint(t *testing.T) {
+	for prefix, name := range []string{"batch sync", "checkpoint"} {
 		t.Run("after "+name, func(t *testing.T) {
 			dir := t.TempDir()
 			opts := crashOptions(dir)
@@ -251,26 +280,23 @@ func TestCrashOrdering_SealThenManifest(t *testing.T) {
 				mustAppend(t, s, "s", fmt.Sprintf("message-%d", i))
 			}
 			st, _ := s.streams.Load("s")
-			if err := s.materializeStream(s.parts[0], st); err != nil {
+			s.materializeRound(s.parts[0])
+			st.forceSeal = true
+			s.parts[0].markDirty(st)
+			barrier := s.parts[0].submit(&request{op: opBarrier, captureDirty: true, done: make(chan result, 1)})
+			draft, err := s.materializeStream(s.parts[0], st)
+			if err != nil {
 				t.Fatal(err)
 			}
-			active := st.activeSeg
-			if err := active.seal(); err != nil {
-				t.Fatal(err)
-			}
-			st.mu.Lock()
-			st.sealed = append(st.sealed[:len(st.sealed):len(st.sealed)], active)
-			st.activeSeg = nil
-			st.activeView = segmentView{}
-			st.mu.Unlock()
+			syncDraftTouched(t, s, draft)
 			if prefix >= 1 {
-				if err := s.materializeStream(s.parts[0], st); err != nil {
+				prepared := map[*streamState]*preparedStream{st: draft}
+				if err := s.advanceCheckpoint(s.parts[0], barrier, s.checkpointEntries(s.parts[0].materializedEntries, prepared, nil)); err != nil {
 					t.Fatal(err)
 				}
 			}
-			if err := s.Close(); err != nil {
-				t.Fatal(err)
-			}
+			s.releasePrepared(map[*streamState]*preparedStream{st: draft})
+			stopWithoutCheckpoint(t, s)
 			r, err := New(opts)
 			if err != nil {
 				t.Fatal(err)
@@ -283,8 +309,8 @@ func TestCrashOrdering_SealThenManifest(t *testing.T) {
 	}
 }
 
-func TestCrashOrdering_TrimFrameManifestRewriteThenUnlink(t *testing.T) {
-	steps := []string{"trim frame", "manifest rewrite", "unlink"}
+func TestCrashOrdering_TrimFrameCheckpointThenUnlink(t *testing.T) {
+	steps := []string{"trim frame", "checkpoint", "unlink"}
 	for prefix := 1; prefix <= len(steps); prefix++ {
 		t.Run("after "+steps[prefix-1], func(t *testing.T) {
 			dir := t.TempDir()
@@ -301,9 +327,7 @@ func TestCrashOrdering_TrimFrameManifestRewriteThenUnlink(t *testing.T) {
 				mustAppend(t, s, "s", fmt.Sprintf("%02d-%s", i, string(make([]byte, 180))))
 			}
 			st, _ := s.streams.Load("s")
-			if err := s.materializeStream(s.parts[0], st); err != nil {
-				t.Fatal(err)
-			}
+			s.materializeRound(s.parts[0])
 			snap := st.snapshot()
 			if len(snap.sealed) < 2 {
 				t.Fatalf("sealed segments = %d, want >= 2", len(snap.sealed))
@@ -318,7 +342,10 @@ func TestCrashOrdering_TrimFrameManifestRewriteThenUnlink(t *testing.T) {
 			trimmedSnap := st.snapshot()
 			if prefix >= 2 {
 				retained := append([]*segmentFile(nil), trimmedSnap.sealed[1:]...)
-				if err := writeManifest(streamPath, buildManifest(st, trimmedSnap, retained, st.activeSeg, trimmedSnap.through)); err != nil {
+				entries := s.checkpointEntries(s.parts[0].materializedEntries, nil, nil)
+				entries["s"] = buildCheckpointEntry(st, trimmedSnap, retained, st.activeSeg, trimmedSnap.through)
+				barrier := s.parts[0].submit(&request{op: opBarrier, done: make(chan result, 1)})
+				if err := s.advanceCheckpoint(s.parts[0], barrier, entries); err != nil {
 					t.Fatal(err)
 				}
 			}
@@ -330,9 +357,7 @@ func TestCrashOrdering_TrimFrameManifestRewriteThenUnlink(t *testing.T) {
 					t.Fatal(err)
 				}
 			}
-			if err := s.Close(); err != nil {
-				t.Fatal(err)
-			}
+			stopWithoutCheckpoint(t, s)
 			r, err := New(opts)
 			if err != nil {
 				t.Fatal(err)
@@ -346,10 +371,10 @@ func TestCrashOrdering_TrimFrameManifestRewriteThenUnlink(t *testing.T) {
 			}
 			if prefix >= 2 {
 				if _, err := os.Stat(victim); !os.IsNotExist(err) {
-					t.Fatalf("manifest-excluded segment survived recovery: %v", err)
+					t.Fatalf("checkpoint-excluded segment survived recovery: %v", err)
 				}
 			} else if _, err := os.Stat(victim); err != nil {
-				t.Fatalf("segment unlinked before manifest rewrite: %v", err)
+				t.Fatalf("segment unlinked before checkpoint: %v", err)
 			}
 		})
 	}

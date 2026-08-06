@@ -54,10 +54,11 @@ func FuzzDecodeFrame(f *testing.F) {
 	segmentSeed := encodeSegmentHeader(inc, 1, 12345)
 	footer := make([]byte, segmentFooterSize)
 	binary.LittleEndian.PutUint32(footer[0:4], segmentIndexMagic)
+	binary.LittleEndian.PutUint16(footer[4:6], segmentVersion)
 	binary.LittleEndian.PutUint64(footer[8:16], segmentHeaderSize)
-	binary.LittleEndian.PutUint64(footer[16:24], 1)
-	binary.LittleEndian.PutUint64(footer[24:32], 0)
-	binary.LittleEndian.PutUint32(footer[40:44], crc32.Checksum(footer[:40], crcTable))
+	binary.LittleEndian.PutUint64(footer[24:32], 1)
+	binary.LittleEndian.PutUint64(footer[32:40], 0)
+	binary.LittleEndian.PutUint32(footer[52:56], crc32.Checksum(footer[:52], crcTable))
 	f.Add(append(segmentSeed, footer...))
 
 	tempDir := f.TempDir()
@@ -65,9 +66,6 @@ func FuzzDecodeFrame(f *testing.F) {
 		// These decoders must reject short or malformed input rather than panic.
 		_, _ = decodeWALSegmentHeader(data)
 		_, _, _ = decodeSegmentHeader(data)
-		var recordHeader [segmentRecordHeaderSize]byte
-		copy(recordHeader[:], data)
-		_ = decodeSegmentRecordHeader(recordHeader[:])
 
 		scanner := newFrameScanner(bytes.NewReader(data), int64(len(data)))
 		maxFrames := 0
@@ -127,18 +125,7 @@ func FuzzDecodeFrame(f *testing.F) {
 		if err := probe.Close(); err != nil {
 			t.Fatal(err)
 		}
-		file, err := os.Open(path)
-		if err != nil {
-			t.Fatal(err)
-		}
-		segment, _ := loadSealedSegment(file, filepath.Base(path), inc)
-		if segment != nil {
-			if err := segment.f.Close(); err != nil {
-				t.Fatal(err)
-			}
-		} else if err := file.Close(); err != nil {
-			t.Fatal(err)
-		}
+		_, _ = openSealedSegment(path, filepath.Base(path), inc)
 		if err := os.Remove(path); err != nil {
 			t.Fatal(err)
 		}

@@ -24,29 +24,37 @@ type identityKey struct {
 	inc incarnation
 }
 
-// recoveredDir is one stream directory with a valid manifest.
+// recoveredDir is one stream directory referenced by a checkpoint.
 type recoveredDir struct {
-	key      identityKey
-	dir      string
-	st       *streamState
-	manifest manifest
+	key   identityKey
+	dir   string
+	st    *streamState
+	entry streamCheckpointEntry
 }
 
-// recoveryScan is the result of the manifest pass.
+// recoveryScan is the result of loading partition checkpoints.
 type recoveryScan struct {
-	dirs       []recoveredDir
-	byIdentity map[identityKey]*streamState
+	dirs        []recoveredDir
+	byIdentity  map[identityKey]*streamState
+	checkpoints map[uint32]checkpoint
 }
 
 // recoverAll rebuilds the in-memory catalog and every partition's writer
-// position: load manifests, replay each partition's WAL suffix past its
+// position: load checkpoints, replay each partition's WAL suffix past its
 // checkpoint, then sweep stream directories that are no longer live. It runs
 // before any worker starts, so state mutation needs no locks.
-func (s *Storage) recoverAll() error {
+func (s *Storage) recoverAll() (retErr error) {
 	scan, err := s.scanStreamDirs()
 	if err != nil {
 		return err
 	}
+	defer func() {
+		if retErr != nil {
+			for _, d := range scan.dirs {
+				d.st.closeSegments()
+			}
+		}
+	}()
 	// Seed the catalog. When a crash left two incarnation directories for
 	// one stream, either may seed; the surviving create frame (necessarily
 	// past the checkpoint in that situation) corrects the choice during
@@ -62,8 +70,10 @@ func (s *Storage) recoverAll() error {
 	if err := s.rebuildTopology(scan); err != nil {
 		return err
 	}
-	s.sweepStreamDirs(scan)
-	// Replay may have advanced logical state beyond its manifest. Mark every
+	if err := s.sweepStreamDirs(scan); err != nil {
+		return err
+	}
+	// Replay may have advanced logical state beyond its checkpoint entry. Mark every
 	// survivor dirty before workers start so the first checkpoint cannot move
 	// past replayed mutations until their derived state is durable.
 	s.streams.Range(func(_ string, st *streamState) bool {
@@ -73,64 +83,57 @@ func (s *Storage) recoverAll() error {
 	return nil
 }
 
-// scanStreamDirs loads every stream directory's manifest. A directory without
-// a manifest is a partial materializer artifact (the checkpoint never
-// advances past an incomplete manifest write) and is removed; an undecodable
-// manifest is corruption and fails open.
+// scanStreamDirs loads every stream from its owning partition's cumulative
+// checkpoint. Stream directories contain segment files only; checkpoint.json
+// is the sole authority for identity, metadata, and referenced prefixes.
 func (s *Storage) scanStreamDirs() (*recoveryScan, error) {
-	scan := &recoveryScan{byIdentity: make(map[identityKey]*streamState)}
-	root := filepath.Join(s.dir, "streams")
-	shards, err := os.ReadDir(root)
-	if os.IsNotExist(err) {
-		return scan, nil
-	}
-	if err != nil {
-		return nil, fmt.Errorf("seglog: read streams dir: %w", err)
-	}
-	for _, shard := range shards {
-		if !shard.IsDir() {
+	scan := &recoveryScan{byIdentity: make(map[identityKey]*streamState), checkpoints: make(map[uint32]checkpoint)}
+	succeeded := false
+	defer func() {
+		if !succeeded {
+			for _, d := range scan.dirs {
+				d.st.closeSegments()
+			}
+		}
+	}()
+	for _, p := range s.parts {
+		c, ok, err := loadCheckpoint(p.wal.dir)
+		if err != nil {
+			return nil, err
+		}
+		if !ok {
 			continue
 		}
-		shardPath := filepath.Join(root, shard.Name())
-		entries, err := os.ReadDir(shardPath)
-		if err != nil {
-			return nil, fmt.Errorf("seglog: read shard dir: %w", err)
+		scan.checkpoints[p.id] = c
+		if c.Partition != p.id || c.NextTxnID == 0 {
+			return nil, fmt.Errorf("%w: invalid checkpoint identity for partition %d", errCorrupt, p.id)
 		}
-		for _, e := range entries {
-			if !e.IsDir() {
-				continue
+		for streamID, entry := range c.Streams {
+			if uint32(streamHash(streamID)%uint64(len(s.parts))) != p.id {
+				return nil, fmt.Errorf("%w: checkpoint stream %q is in the wrong partition", errCorrupt, streamID)
 			}
-			dir := filepath.Join(shardPath, e.Name())
-			m, err := loadManifest(dir)
-			if os.IsNotExist(err) {
-				s.opts.SLogger.Warn("seglog: removing stream directory without manifest", "dir", dir)
-				if err := os.RemoveAll(dir); err != nil {
-					return nil, fmt.Errorf("seglog: remove partial stream dir: %w", err)
-				}
-				continue
-			}
+			inc, err := parseIncarnationID(entry.IncarnationID)
 			if err != nil {
-				return nil, fmt.Errorf("%w: %v", errCorrupt, err)
+				return nil, fmt.Errorf("%w: checkpoint stream %q: %v", errCorrupt, streamID, err)
 			}
-			if err := removeOrphanSegments(dir, m); err != nil {
-				return nil, err
-			}
-			st, err := s.stateFromManifest(dir, m)
+			dir := streamDir(s.dir, streamID, inc)
+			st, err := s.stateFromCheckpointEntry(streamID, dir, entry)
 			if err != nil {
 				return nil, err
 			}
 			key := identityKey{id: st.id, inc: st.inc}
-			scan.dirs = append(scan.dirs, recoveredDir{key: key, dir: dir, st: st, manifest: m})
+			scan.dirs = append(scan.dirs, recoveredDir{key: key, dir: dir, st: st, entry: entry})
 			scan.byIdentity[key] = st
 		}
 	}
+	succeeded = true
 	return scan, nil
 }
 
-// removeOrphanSegments finishes a trim interrupted after its manifest rewrite
-// but before unlink. The manifest is authoritative derived state, so an
+// removeUnreferencedSegments finishes a trim interrupted after its checkpoint
+// but before unlink. The checkpoint is authoritative derived state, so an
 // unreferenced segment cannot contain live records.
-func removeOrphanSegments(dir string, m manifest) error {
+func removeUnreferencedSegments(dir string, m streamCheckpointEntry) error {
 	referenced := make(map[string]struct{}, len(m.Sealed)+1)
 	for _, seg := range m.Sealed {
 		referenced[seg.File] = struct{}{}
@@ -139,13 +142,19 @@ func removeOrphanSegments(dir string, m manifest) error {
 		referenced[m.Active.File] = struct{}{}
 	}
 	entries, err := os.ReadDir(dir)
+	if os.IsNotExist(err) && len(referenced) == 0 {
+		return nil
+	}
 	if err != nil {
 		return fmt.Errorf("seglog: read stream dir for orphan cleanup: %w", err)
 	}
 	removed := false
 	for _, entry := range entries {
 		name := entry.Name()
-		if entry.IsDir() || !strings.HasPrefix(name, "seg-") || !strings.HasSuffix(name, ".seg") {
+		if entry.IsDir() || !strings.HasPrefix(name, "seg-") || (!strings.HasSuffix(name, ".seg") && !strings.HasSuffix(name, ".idx")) {
+			continue
+		}
+		if strings.HasSuffix(name, ".idx") && m.Active != nil && name == strings.TrimSuffix(m.Active.File, ".seg")+".idx" {
 			continue
 		}
 		if _, ok := referenced[name]; ok {
@@ -162,15 +171,21 @@ func removeOrphanSegments(dir string, m manifest) error {
 	return nil
 }
 
-// stateFromManifest opens a manifest's segments and rebuilds the stream's
+// stateFromCheckpointEntry opens an entry's segments and rebuilds the stream's
 // materialized state.
-func (s *Storage) stateFromManifest(dir string, m manifest) (*streamState, error) {
+func (s *Storage) stateFromCheckpointEntry(streamID, dir string, m streamCheckpointEntry) (*streamState, error) {
 	inc, err := parseIncarnationID(m.IncarnationID)
 	if err != nil {
-		return nil, fmt.Errorf("%w: manifest in %s: %v", errCorrupt, dir, err)
+		return nil, fmt.Errorf("%w: checkpoint entry for %s: %v", errCorrupt, streamID, err)
 	}
-	part := uint32(streamHash(m.StreamID) % uint64(len(s.parts)))
-	st := newStreamState(m.StreamID, inc, part, m.config())
+	part := uint32(streamHash(streamID) % uint64(len(s.parts)))
+	st := newStreamState(streamID, inc, part, m.config())
+	succeeded := false
+	defer func() {
+		if !succeeded {
+			st.closeSegments()
+		}
+	}()
 	st.closed = m.Closed
 	st.lastSeq = m.LastSeq
 	st.retention = m.Retention.retention()
@@ -181,7 +196,7 @@ func (s *Storage) stateFromManifest(dir string, m manifest) (*streamState, error
 		if m.Parent.StreamID == "" || m.Parent.IncarnationID == "" ||
 			m.Parent.StreamID != fork.SourceID || m.Parent.IncarnationID != fork.SourceIncarnationID ||
 			fork.Request.SourceStreamID != fork.SourceID || fork.Boundary < 0 || fork.PrefixCount < 0 {
-			return nil, fmt.Errorf("%w: manifest in %s has inconsistent fork parent identity", errCorrupt, dir)
+			return nil, fmt.Errorf("%w: checkpoint entry for %s has inconsistent fork parent identity", errCorrupt, streamID)
 		}
 		st.fork = &fork
 		st.parentBoundary = fork.Boundary
@@ -192,40 +207,44 @@ func (s *Storage) stateFromManifest(dir string, m manifest) (*streamState, error
 
 	if st.retention.MaxBytes < 0 || st.retention.MaxAge < 0 || st.floor < 0 || st.floor > m.MaterializedThrough ||
 		(st.fork != nil && m.MaterializedThrough < st.parentBoundary) {
-		return nil, fmt.Errorf("%w: manifest in %s has invalid retention state", errCorrupt, dir)
+		return nil, fmt.Errorf("%w: checkpoint entry for %s has invalid retention state", errCorrupt, streamID)
 	}
 	prevLast := int64(0)
-	for _, ms := range m.Sealed {
+	requiredStart := max(m.FloorIndex, st.parentBoundary) + 1
+	for i, ms := range m.Sealed {
 		sf, err := openSealedSegment(filepath.Join(dir, ms.File), ms.File, inc)
 		if err != nil {
 			return nil, fmt.Errorf("%w: %v", errCorrupt, err)
 		}
-		if sf.firstIndex != ms.FirstIndex || sf.lastIndex != ms.LastIndex || sf.bytes != ms.Bytes ||
-			(len(st.sealed) > 0 && sf.firstIndex != prevLast+1) {
-			return nil, fmt.Errorf("%w: sealed segment %s disagrees with manifest in %s", errCorrupt, ms.File, dir)
+		badStart := i == 0 && (sf.firstIndex > requiredStart || sf.firstIndex < st.parentBoundary+1)
+		if sf.firstIndex != ms.FirstIndex || sf.lastIndex != ms.LastIndex || sf.payloadEnd != ms.PayloadEnd || sf.count != ms.Count ||
+			badStart || (i > 0 && sf.firstIndex != prevLast+1) {
+			return nil, fmt.Errorf("%w: sealed segment %s disagrees with checkpoint entry for %s", errCorrupt, ms.File, streamID)
 		}
 		prevLast = sf.lastIndex
 		st.sealed = append(st.sealed, sf)
 	}
 	if m.Active != nil {
-		sf, err := openActiveSegment(filepath.Join(dir, m.Active.File), m.Active.File, inc, m.Active.Bytes, s.opts.SparseIndexBytes)
+		sf, err := openActiveSegment(filepath.Join(dir, m.Active.File), m.Active.File, inc, m.Active.PayloadEnd, m.Active.Count, m.Active.MaxTS)
 		if err != nil {
 			return nil, fmt.Errorf("%w: %v", errCorrupt, err)
 		}
-		if sf.firstIndex != m.Active.FirstIndex || (len(st.sealed) > 0 && sf.firstIndex != prevLast+1) ||
+		badStart := len(m.Sealed) == 0 && (sf.firstIndex > requiredStart || sf.firstIndex < st.parentBoundary+1)
+		if sf.firstIndex != m.Active.FirstIndex || badStart || (len(m.Sealed) > 0 && sf.firstIndex != prevLast+1) ||
 			sf.lastIndex != m.MaterializedThrough {
-			return nil, fmt.Errorf("%w: active segment %s disagrees with manifest in %s", errCorrupt, m.Active.File, dir)
+			return nil, fmt.Errorf("%w: active segment %s disagrees with checkpoint entry for %s", errCorrupt, m.Active.File, streamID)
 		}
 		st.activeSeg = sf
-		st.activeView = sf.view()
+		st.activeView = sf.view(s.fdCache)
 	} else if len(m.Sealed) > 0 && prevLast != m.MaterializedThrough {
-		return nil, fmt.Errorf("%w: manifest in %s: segments end at %d, materializedThrough %d",
-			errCorrupt, dir, prevLast, m.MaterializedThrough)
+		return nil, fmt.Errorf("%w: checkpoint entry for %s: segments end at %d, materializedThrough %d",
+			errCorrupt, streamID, prevLast, m.MaterializedThrough)
 	} else if len(m.Sealed) == 0 && st.floor != m.MaterializedThrough &&
 		(st.fork == nil || m.MaterializedThrough != st.parentBoundary) {
-		return nil, fmt.Errorf("%w: manifest in %s: no segments at floor %d, materializedThrough %d",
-			errCorrupt, dir, st.floor, m.MaterializedThrough)
+		return nil, fmt.Errorf("%w: checkpoint entry for %s: no segments at floor %d, materializedThrough %d",
+			errCorrupt, streamID, st.floor, m.MaterializedThrough)
 	}
+	succeeded = true
 	return st, nil
 }
 
@@ -306,20 +325,58 @@ func (s *Storage) rebuildTopology(scan *recoveryScan) error {
 // sweepStreamDirs removes every scanned directory whose incarnation did not
 // survive replay: displaced incarnations, reflected deletions, and the losing
 // candidate of a crash that left two directories for one stream.
-func (s *Storage) sweepStreamDirs(scan *recoveryScan) {
+func (s *Storage) sweepStreamDirs(scan *recoveryScan) error {
+	checkpointEntries := make(map[identityKey]streamCheckpointEntry, len(scan.dirs))
 	for _, d := range scan.dirs {
 		if live, ok := s.streams.Load(d.key.id); ok && live == d.st {
+			checkpointEntries[d.key] = d.entry
 			continue
 		}
 		d.st.closeSegments()
-		if err := os.RemoveAll(d.dir); err != nil {
-			s.opts.SLogger.Warn("seglog: sweeping dead stream directory failed", "dir", d.dir, "error", err)
+	}
+	livePaths := make(map[string]streamCheckpointEntry)
+	s.streams.Range(func(id string, st *streamState) bool {
+		livePaths[streamDir(s.dir, id, st.inc)] = checkpointEntries[identityKey{id: id, inc: st.inc}]
+		return true
+	})
+	streamsRoot := filepath.Join(s.dir, "streams")
+	shards, err := os.ReadDir(streamsRoot)
+	if os.IsNotExist(err) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("seglog: scan stream shards: %w", err)
+	}
+	for _, shard := range shards {
+		if !shard.IsDir() {
 			continue
 		}
-		if err := syncDir(filepath.Dir(d.dir)); err != nil {
-			s.opts.SLogger.Warn("seglog: syncing shard directory failed", "dir", d.dir, "error", err)
+		shardDir := filepath.Join(streamsRoot, shard.Name())
+		dirs, err := os.ReadDir(shardDir)
+		if err != nil {
+			return fmt.Errorf("seglog: scan stream shard %s: %w", shardDir, err)
+		}
+		for _, entry := range dirs {
+			if !entry.IsDir() {
+				continue
+			}
+			path := filepath.Join(shardDir, entry.Name())
+			checkpointEntry, live := livePaths[path]
+			if live {
+				if err := removeUnreferencedSegments(path, checkpointEntry); err != nil {
+					return err
+				}
+				continue
+			}
+			if err := os.RemoveAll(path); err != nil {
+				return fmt.Errorf("seglog: remove dead stream directory %s: %w", path, err)
+			}
+			if err := syncDir(shardDir); err != nil {
+				return err
+			}
 		}
 	}
+	return nil
 }
 
 // recoverPartition replays one partition's WAL suffix past its checkpoint,
@@ -329,14 +386,13 @@ func (s *Storage) sweepStreamDirs(scan *recoveryScan) {
 // segment's torn tail is truncated and re-zeroed; damage anywhere else fails
 // open (I2).
 func (s *Storage) recoverPartition(p *partition, scan *recoveryScan) error {
-	ckpt, hasCkpt, err := loadCheckpoint(p.wal.dir)
-	if err != nil {
-		return err
-	}
+	ckpt, hasCkpt := scan.checkpoints[p.id]
 	if hasCkpt && ckpt.Replay.SegmentSeq > 0 {
 		p.ckptSeq = ckpt.Replay.SegmentSeq
 		p.ckptOff = ckpt.Replay.Offset
 		p.nextTxnID = ckpt.NextTxnID
+		p.ckptState, _ = json.Marshal(ckpt.Streams)
+		p.materializedEntries = cloneCheckpointEntries(ckpt.Streams)
 	}
 
 	seqs, err := listWALSegments(p.wal.dir)
@@ -522,7 +578,7 @@ func rezeroTail(f *os.File, validEnd, segmentBytes int64) error {
 // applyRecovered replays one durable frame into the in-memory catalog,
 // mirroring partition.publish without locks or wakeups.
 //
-// Manifests may be ahead of the checkpoint, so replay tolerates frames whose
+// Replay tolerates frames whose
 // effects are already reflected: frames for unknown streams or superseded
 // incarnations are skipped, appends at or below materializedThrough add no
 // entries, and metadata applies idempotently by value.
@@ -608,7 +664,7 @@ func (s *Storage) applyRecovered(p *partition, scan *recoveryScan, segSeq uint64
 		if count := int64(len(frame.payloads)); count > 0 {
 			switch {
 			case frame.firstIndex+count-1 <= st.materializedThrough:
-				// Already in segments; the manifest ran ahead.
+				// Already in checkpointed segments.
 			case frame.firstIndex != st.nextIndex:
 				return fmt.Errorf("%w: stream %q expected index %d, frame assigns %d",
 					errCorrupt, frame.streamID, st.nextIndex, frame.firstIndex)
@@ -700,7 +756,7 @@ func validateRecoveredFork(frame walFrame, m forkFrameMeta) error {
 }
 
 // recoveredState resolves a frame's stream. A missing stream or another
-// incarnation means the frame's effects were already reflected (the manifest
+// incarnation means the frame's effects were already reflected (the checkpoint
 // or a later frame superseded it) and the frame is skipped.
 func (s *Storage) recoveredState(frame walFrame) (*streamState, bool) {
 	st, ok := s.streams.Load(frame.streamID)

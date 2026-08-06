@@ -182,7 +182,7 @@ func (w *walWriter) readPayload(loc walLoc) ([]byte, error) {
 
 // removeBefore closes and unlinks every segment with a sequence below keep.
 // The caller guarantees every frame in those segments is reflected in durable
-// manifests and the checkpoint; concurrent readers with stale snapshots get
+// the checkpoint; concurrent readers with stale snapshots get
 // errWALSegmentGone and retry against stream segments.
 func (w *walWriter) removeBefore(keep uint64) error {
 	w.mu.Lock()

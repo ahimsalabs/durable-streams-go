@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -171,9 +172,7 @@ func TestRecoveryTruncatesTornFinalFrame(t *testing.T) {
 	}
 	mustAppend(t, s, "s", "kept")
 	mustAppend(t, s, "s", "lost")
-	if err := s.Close(); err != nil {
-		t.Fatal(err)
-	}
+	stopWithoutCheckpoint(t, s)
 
 	paths := walSegments(t, dir)
 	if len(paths) != 1 {
@@ -225,9 +224,7 @@ func TestRecoveryFailsOnEarlierSegmentCorruption(t *testing.T) {
 			t.Fatalf("append %d: %v", i, err)
 		}
 	}
-	if err := s.Close(); err != nil {
-		t.Fatal(err)
-	}
+	stopWithoutCheckpoint(t, s)
 
 	paths := walSegments(t, dir)
 	if len(paths) < 2 {
@@ -297,6 +294,39 @@ func TestPartitionCountIsPersisted(t *testing.T) {
 	opts.Partitions = 3
 	if _, err := New(opts); err == nil {
 		t.Fatal("New with a different partition count should fail")
+	}
+}
+
+func TestFormatV1IsRefused(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "FORMAT"), []byte("seglog-format-v1\npartitions=1\nhash=xxh64\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := New(singlePartitionOptions(dir)); err == nil || !strings.Contains(err.Error(), "unsupported format") || !strings.Contains(err.Error(), "seglog-format-v1") {
+		t.Fatalf("New v1 error = %v, want clear unsupported-format error", err)
+	}
+}
+
+func TestRecoveryWithoutCheckpointReplaysCreateAndAppend(t *testing.T) {
+	dir := t.TempDir()
+	opts := singlePartitionOptions(dir)
+	opts.MaterializeInterval = -1
+	opts.RetentionInterval = -1
+	s := openTest(t, opts)
+	if _, err := s.Create(t.Context(), "before-checkpoint", durablestream.StreamConfig{ContentType: "text/plain"}); err != nil {
+		t.Fatal(err)
+	}
+	mustAppend(t, s, "before-checkpoint", "durable-in-wal")
+	if _, err := os.Stat(filepath.Join(dir, "wal", "p0000", checkpointFileName)); !os.IsNotExist(err) {
+		t.Fatalf("checkpoint exists before materialization: %v", err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	r := openTest(t, opts)
+	if got := readAll(t, r, "before-checkpoint"); len(got) != 1 || got[0] != "durable-in-wal" {
+		t.Fatalf("whole-WAL recovery = %q, want [durable-in-wal]", got)
 	}
 }
 

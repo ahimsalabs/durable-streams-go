@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -33,6 +34,27 @@ func materializedThrough(s *Storage, id string) int64 {
 	return st.materializedThrough
 }
 
+func syncDraftTouched(t *testing.T, s *Storage, draft *preparedStream) {
+	t.Helper()
+	s.releaseDraftPins(draft)
+	for path := range draft.touched {
+		pin, err := s.fdCache.pin(path, true)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := pin.file().Sync(); err != nil {
+			_ = pin.release()
+			t.Fatal(err)
+		}
+		if err := pin.release(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := syncDirectoryBatch(draft.touchedDirs); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestMaterializationServesReadsFromSegments(t *testing.T) {
 	dir := t.TempDir()
 	ctx := context.Background()
@@ -50,6 +72,9 @@ func TestMaterializationServesReadsFromSegments(t *testing.T) {
 		mustAppend(t, s, "s", msg)
 	}
 	waitFor(t, "materialization", func() bool { return materializedThrough(s, "s") == 20 })
+	if paths, err := filepath.Glob(filepath.Join(dir, "streams", "*", "*", "manifest.json")); err != nil || len(paths) != 0 {
+		t.Fatalf("unexpected per-stream metadata file: paths=%v err=%v", paths, err)
+	}
 
 	// The WAL tail must be pruned; reads now come from segments.
 	st, _ := s.streams.Load("s")
@@ -85,7 +110,6 @@ func TestSealingRollsSegmentsAndSurvivesReopen(t *testing.T) {
 	opts := singlePartitionOptions(dir)
 	opts.MaterializeInterval = 5 * time.Millisecond
 	opts.StreamSegmentBytes = 1024 // a few records per segment
-	opts.SparseIndexBytes = 512
 
 	s := openTest(t, opts)
 	if _, err := s.Create(ctx, "s", durablestream.StreamConfig{}); err != nil {
@@ -174,10 +198,9 @@ func TestWALReclaim(t *testing.T) {
 	}
 }
 
-// TestManifestAheadOfCheckpointReplay simulates a crash after manifests were
-// flushed but before the checkpoint advanced: replay must apply frames
-// idempotently over the manifest state without duplicating messages.
-func TestManifestAheadOfCheckpointReplay(t *testing.T) {
+// TestCrashAfterBatchSyncBeforeCheckpoint verifies that uncheckpointed segment
+// bytes are ignored and the complete WAL is replayed without duplicates.
+func TestCrashAfterBatchSyncBeforeCheckpoint(t *testing.T) {
 	dir := t.TempDir()
 	ctx := context.Background()
 	opts := singlePartitionOptions(dir)
@@ -193,23 +216,24 @@ func TestManifestAheadOfCheckpointReplay(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Whitebox: flush segments and the manifest but never the checkpoint.
+	// Prepare and sync segment bytes, but do not checkpoint or publish.
 	st, _ := s.streams.Load("s")
-	if err := s.materializeStream(s.parts[0], st); err != nil {
+	draft, err := s.materializeStream(s.parts[0], st)
+	if err != nil {
 		t.Fatal(err)
 	}
-	if err := s.Close(); err != nil {
-		t.Fatal(err)
-	}
+	syncDraftTouched(t, s, draft)
+	s.releasePrepared(map[*streamState]*preparedStream{st: draft})
+	stopWithoutCheckpoint(t, s)
 
 	r := openTest(t, opts)
 	got := readAll(t, r, "s")
 	if len(got) != 3 || got[0] != "one" || got[2] != "three" {
-		t.Fatalf("after replay over manifest: %q", got)
+		t.Fatalf("after WAL replay: %q", got)
 	}
 	// Metadata replay stayed idempotent too: seq floor intact.
 	if _, err := r.Append(ctx, "s", []byte("x"), "seq-2"); err == nil {
-		t.Fatal("stale seq accepted after manifest-ahead replay")
+		t.Fatal("stale seq accepted after WAL replay")
 	}
 	head, err := r.Head(ctx, "s")
 	if err != nil {
@@ -217,6 +241,36 @@ func TestManifestAheadOfCheckpointReplay(t *testing.T) {
 	}
 	if head.ContentType != "text/plain" {
 		t.Fatalf("content type lost: %+v", head)
+	}
+}
+
+func TestCrashAfterPublishedRoundWithoutCheckpoint(t *testing.T) {
+	dir := t.TempDir()
+	opts := singlePartitionOptions(dir)
+	opts.MaterializeInterval = -1
+	opts.CheckpointInterval = time.Hour
+
+	s := openTest(t, opts)
+	if _, err := s.Create(t.Context(), "s", durablestream.StreamConfig{}); err != nil {
+		t.Fatal(err)
+	}
+	mustAppend(t, s, "s", "checkpointed")
+	s.materializeRound(s.parts[0])
+	checkpointSeq, checkpointOff := s.parts[0].ckptSeq, s.parts[0].ckptOff
+
+	mustAppend(t, s, "s", "wal-covered")
+	s.materializeRound(s.parts[0])
+	if got := materializedThrough(s, "s"); got != 2 {
+		t.Fatalf("materialized through = %d, want 2", got)
+	}
+	if s.parts[0].ckptSeq != checkpointSeq || s.parts[0].ckptOff != checkpointOff {
+		t.Fatal("ordinary round advanced checkpoint before checkpoint interval")
+	}
+
+	stopWithoutCheckpoint(t, s)
+	r := openTest(t, opts)
+	if got := readAll(t, r, "s"); len(got) != 2 || got[0] != "checkpointed" || got[1] != "wal-covered" {
+		t.Fatalf("recovered messages = %q", got)
 	}
 }
 

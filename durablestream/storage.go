@@ -2,6 +2,7 @@ package durablestream
 
 import (
 	"context"
+	"io"
 	"time"
 )
 
@@ -398,6 +399,40 @@ type TouchHeadStorage interface {
 	// the TTL window may or may not have been restarted, exactly as when the
 	// separate Touch call fails.
 	TouchHead(ctx context.Context, streamID string) (*StreamInfo, error)
+}
+
+// SpanReadStorage is an optional Storage capability for reading message
+// payloads as sequential binary ranges without requiring each payload to be
+// copied into a StoredMessage. Callers discover it with a type assertion and
+// fall back to [Storage.Read] when absent.
+//
+// ReadSpans has exactly the offset, limit, metadata, and error semantics of
+// [Storage.Read]. Its ranges, in order, contain exactly the concatenation of
+// the Data fields Read would return. A range may own copied memory or retain a
+// backend resource. Every range must be closed; Close is idempotent. WriteTo
+// honors the context passed to ReadSpans, including cancellation after the
+// method returns.
+type SpanReadStorage interface {
+	Storage
+
+	ReadSpans(ctx context.Context, streamID string, offset Offset, limit int) (*SpanReadResult, error)
+}
+
+// ReadSpan is one sequential payload range returned by SpanReadStorage.
+// WriteTo may be called at most once and must not be called after Close.
+type ReadSpan interface {
+	io.WriterTo
+	Close() error
+}
+
+// SpanReadResult is the span form of ReadResult. NextOffset, TailOffset,
+// IncarnationID, and Closed have the same meaning as on [ReadResult].
+type SpanReadResult struct {
+	Spans         []ReadSpan
+	NextOffset    Offset
+	TailOffset    Offset
+	IncarnationID string
+	Closed        bool
 }
 
 // ForkRequest describes an atomic fork creation. It deliberately records

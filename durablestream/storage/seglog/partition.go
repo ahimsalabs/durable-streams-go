@@ -31,6 +31,7 @@ type request struct {
 	forkMetaRaw  []byte
 	forkBoundary int64
 	prefixCount  int64
+	captureDirty bool // opBarrier: atomically hand the materializer its frontier
 	done         chan result
 }
 
@@ -45,9 +46,11 @@ type result struct {
 
 	// Barrier results: the WAL position and txnID with every prior frame
 	// committed and published.
-	walSeq  uint64
-	walOff  int64
-	nextTxn uint64
+	walSeq   uint64
+	walOff   int64
+	nextTxn  uint64
+	dirty    map[*streamState]struct{}
+	removals []*streamState
 }
 
 // opBarrier is a queue-only operation (never a WAL frame): its result carries
@@ -88,20 +91,43 @@ type partition struct {
 	removals []*streamState // dead incarnations awaiting directory removal
 
 	// Materializer-owned: the last durably written checkpoint position.
-	ckptSeq uint64
-	ckptOff int64
+	ckptSeq   uint64
+	ckptOff   int64
+	ckptState []byte
+	// materializedEntries is the cumulative image including materialization
+	// rounds published since the checkpoint became durable. Materializer-owned.
+	materializedEntries map[string]streamCheckpointEntry
+	lastCheckpoint      time.Time
+	pending             *materializationBatch
+	// unsyncedFiles are segment payloads and sidecars published since the last
+	// checkpoint. The WAL covers them until checkpoint-time batch sync makes
+	// their current prefixes durable.
+	unsyncedFiles map[string]struct{}
+	unsyncedDirs  map[string]struct{}
+	// sealedSidecars become removable only after a checkpoint durably names
+	// their payload files as sealed. Delayed-checkpoint rounds accumulate them
+	// here until that checkpoint commits.
+	sealedSidecars map[string]struct{}
+	cleanupPaths   map[string]struct{}
+	cleanupDirs    map[string]struct{}
 }
 
 func newPartition(id uint32, st *Storage, wal *walWriter) *partition {
 	return &partition{
-		id:        id,
-		st:        st,
-		wal:       wal,
-		queue:     make(chan *request, st.opts.QueueDepth),
-		accepting: true,
-		stop:      make(chan struct{}),
-		nextTxnID: 1,
-		dirty:     make(map[*streamState]struct{}),
+		id:                  id,
+		st:                  st,
+		wal:                 wal,
+		queue:               make(chan *request, st.opts.QueueDepth),
+		accepting:           true,
+		stop:                make(chan struct{}),
+		nextTxnID:           1,
+		dirty:               make(map[*streamState]struct{}),
+		materializedEntries: make(map[string]streamCheckpointEntry),
+		unsyncedFiles:       make(map[string]struct{}),
+		unsyncedDirs:        make(map[string]struct{}),
+		sealedSidecars:      make(map[string]struct{}),
+		cleanupPaths:        make(map[string]struct{}),
+		cleanupDirs:         make(map[string]struct{}),
 	}
 }
 
@@ -433,6 +459,15 @@ func (p *partition) processGroup(group []*request) {
 	// still unpublished, or a checkpoint could advance past them.
 	for _, op := range staged {
 		p.publish(op, segSeq, base)
+	}
+	// Capture the exact dirty/removal frontier only after the whole group is
+	// published. Doing this in the materializer after receiving the barrier
+	// would race the next group and could checkpoint a post-barrier create.
+	for _, op := range staged {
+		if op.barrier && op.req.captureDirty {
+			op.res.dirty, op.res.removals = p.swapDirty()
+			break
+		}
 	}
 	for _, op := range staged {
 		op.req.done <- op.res

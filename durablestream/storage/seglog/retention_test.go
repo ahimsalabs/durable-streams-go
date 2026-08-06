@@ -20,7 +20,6 @@ func retentionOptions(dir string) Options {
 	opts.RetentionInterval = 5 * time.Millisecond
 	opts.StreamSegmentBytes = 400
 	opts.StreamSegmentAge = -1
-	opts.SparseIndexBytes = 512
 	return opts
 }
 
@@ -172,14 +171,13 @@ func TestRetentionFloor_SurvivesReopenAndAppendContinues(t *testing.T) {
 	if _, err := r.Read(context.Background(), "s", storage.FormatSimpleOffset(floor-1), 0); !errors.Is(err, durablestream.ErrGone) {
 		t.Fatalf("Read below reopened floor: %v, want ErrGone", err)
 	}
-	st, _ := r.streams.Load("s")
-	dir = streamDir(dir, "s", st.inc)
-	m, err := loadManifest(dir)
+	c, _, err := loadCheckpoint(r.parts[0].wal.dir)
 	if err != nil {
 		t.Fatal(err)
 	}
+	m := c.Streams["s"]
 	if got := len(streamSegmentPaths(t, r, "s")); got != len(m.Sealed)+btoi(m.Active != nil) {
-		t.Fatalf("segment files = %d, manifest references %d", got, len(m.Sealed)+btoi(m.Active != nil))
+		t.Fatalf("segment files = %d, checkpoint references %d", got, len(m.Sealed)+btoi(m.Active != nil))
 	}
 	off := mustAppend(t, r, "s", "after-reopen")
 	if off != storage.FormatSimpleOffset(31) {
@@ -223,7 +221,7 @@ func TestSetRetention_ValidatesLimitsAndStream(t *testing.T) {
 	}
 }
 
-func TestRecovery_RemovesManifestOrphanSegment(t *testing.T) {
+func TestRecovery_RemovesCheckpointOrphanSegment(t *testing.T) {
 	dir := t.TempDir()
 	opts := retentionOptions(dir)
 	s := openTest(t, opts)
@@ -253,7 +251,7 @@ func TestRecovery_RemovesManifestOrphanSegment(t *testing.T) {
 	}
 }
 
-func TestTrimReplay_IsIdempotentWhenManifestRunsAhead(t *testing.T) {
+func TestTrimReplay_IsIdempotentWhenCheckpointIncludesTrim(t *testing.T) {
 	dir := t.TempDir()
 	opts := retentionOptions(dir)
 	opts.MaterializeInterval = -1
@@ -263,10 +261,7 @@ func TestTrimReplay_IsIdempotentWhenManifestRunsAhead(t *testing.T) {
 		t.Fatal(err)
 	}
 	appendRetentionMessages(t, s, "s", 20)
-	st, _ := s.streams.Load("s")
-	if err := s.materializeStream(s.parts[0], st); err != nil {
-		t.Fatal(err)
-	}
+	s.materializeRound(s.parts[0])
 	if err := s.SetRetention(context.Background(), "s", Retention{MaxBytes: 300}); err != nil {
 		t.Fatal(err)
 	}
@@ -302,9 +297,7 @@ func TestMaterialization_CompletesReplayedTrimWhenSweepsDisabled(t *testing.T) {
 		mustAppend(t, s, "s", strings.Repeat("x", 1000))
 	}
 	st, _ := s.streams.Load("s")
-	if err := s.materializeStream(s.parts[0], st); err != nil {
-		t.Fatal(err)
-	}
+	s.materializeRound(s.parts[0])
 	snap := st.snapshot()
 	if len(snap.sealed) < 2 {
 		t.Fatalf("sealed segments = %d, want at least 2", len(snap.sealed))
@@ -314,7 +307,7 @@ func TestMaterialization_CompletesReplayedTrimWhenSweepsDisabled(t *testing.T) {
 	if res.err != nil {
 		t.Fatal(res.err)
 	}
-	// Deliberately skip the manifest rewrite and physical deletion, matching
+	// Deliberately skip the checkpoint and physical deletion, matching
 	// a crash immediately after the trim frame commits.
 	if err := s.Close(); err != nil {
 		t.Fatal(err)
@@ -324,16 +317,20 @@ func TestMaterialization_CompletesReplayedTrimWhenSweepsDisabled(t *testing.T) {
 	r := openTest(t, opts)
 	mustAppend(t, r, "s", "after-reopen")
 	waitFor(t, "checkpoint advancement with retention sweeps disabled", func() bool {
-		return len(walSegments(t, dir)) == 1
+		c, ok, err := loadCheckpoint(r.parts[0].wal.dir)
+		entry := c.Streams["s"]
+		return err == nil && ok && entry.FloorIndex == floor && len(entry.Sealed) > 0 &&
+			entry.Sealed[0].FirstIndex == floor+1 && len(walSegments(t, dir)) == 1
 	})
 	if _, err := r.Read(context.Background(), "s", storage.FormatSimpleOffset(floor-1), 0); !errors.Is(err, durablestream.ErrGone) {
 		t.Fatalf("Read below replayed floor: %v, want ErrGone", err)
 	}
-	m, err := loadManifest(streamDir(dir, "s", st.inc))
+	c, _, err := loadCheckpoint(r.parts[0].wal.dir)
 	if err != nil {
 		t.Fatal(err)
 	}
+	m := c.Streams["s"]
 	if m.FloorIndex != floor || len(m.Sealed) == 0 || m.Sealed[0].FirstIndex != floor+1 {
-		t.Fatalf("completed trim manifest = %+v", m)
+		t.Fatalf("completed trim checkpoint entry = %+v", m)
 	}
 }
