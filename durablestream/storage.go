@@ -52,14 +52,16 @@ type StoredMessage struct {
 
 // ReadResult contains messages from a storage read.
 type ReadResult struct {
-	// Messages holds the messages in ascending offset order. It is empty (not
-	// an error) when the read starts at or past the tail.
+	// Messages holds the messages in ascending offset order. It may be empty
+	// when the read starts at or past the tail, or when bounded filtering or
+	// scanning found no visible message but advanced NextOffset.
 	Messages []StoredMessage
 
 	// NextOffset is the offset to pass to the next Read. It is the Offset of
-	// the last returned message, or — when no messages were returned — the
-	// requested offset, normalized away from the "" and "-1" start sentinels.
-	// NextOffset never moves backward relative to the requested offset.
+	// the last returned message, or a later scanned position when no messages
+	// were returned. At the tail it may equal the requested offset, normalized
+	// away from the "" and "-1" start sentinels. NextOffset never moves backward
+	// relative to the requested offset.
 	NextOffset Offset
 
 	// TailOffset is the offset after the last message currently in the stream,
@@ -213,11 +215,15 @@ type Storage interface {
 	// as the only message.
 	//
 	// Reading at or past the tail is not an error: Read returns an empty
-	// Messages slice with NextOffset equal to the requested offset, so a poller
-	// can call Read again with the same offset. ErrGone is returned only when
-	// the offset predates the earliest retained position because of retention
-	// or compaction (seglog and bboltstore enforce retention floors; backends
-	// without retention never return it).
+	// Messages slice and may keep NextOffset at the requested offset, so a poller
+	// can call Read again with the same offset. A bounded filtering or scanning
+	// implementation may instead return no messages before the tail, provided
+	// NextOffset advances strictly past the requested offset. Every successful
+	// Read must make progress by advancing NextOffset or report that NextOffset
+	// has reached TailOffset, so a client cannot loop forever before the tail.
+	// ErrGone is returned only when the offset predates the earliest retained
+	// position because of retention or compaction (seglog and bboltstore enforce
+	// retention floors; backends without retention never return it).
 	//
 	// Returned message data belongs to the caller and never aliases stored
 	// state: mutating it cannot change what a later Read returns.
@@ -438,6 +444,32 @@ type SpanReadResult struct {
 	TailOffset    Offset
 	IncarnationID string
 	Closed        bool
+}
+
+// SnapshotBootstrapper is an optional Storage capability for state-enabled
+// virtual views that provide a dynamic snapshot bootstrap response when a
+// client explicitly requests one. Callers discover it with a type assertion;
+// all positional reads, including reads from the start sentinel, remain
+// ordinary reads.
+//
+// The capability applies only to application/json streams. Messages must be a
+// complete State Protocol snapshot: one snapshot-start control, zero or more
+// insert changes, and one snapshot-end control. The snapshot-end offset must
+// equal NextOffset, which is the source tail captured for the snapshot. These
+// messages are response-only and do not occupy positions in the stream.
+type SnapshotBootstrapper interface {
+	Storage
+
+	// BootstrapRead builds a snapshot for streamID. limit has the same byte-limit
+	// meaning as Storage.Read, except a bootstrap must never be truncated: an
+	// implementation that cannot return a complete snapshot within its limits
+	// returns an error. The returned ReadResult has Storage.Read metadata
+	// semantics, but its Messages are dynamic and non-positional.
+	//
+	// handled is false when this stream does not offer snapshot bootstrap. A
+	// handled result must be non-nil. Errors are reported with the same sentinels
+	// as Storage.Read.
+	BootstrapRead(ctx context.Context, streamID string, limit int) (result *ReadResult, handled bool, err error)
 }
 
 // ForkRequest describes an atomic fork creation. It deliberately records

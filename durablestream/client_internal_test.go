@@ -884,6 +884,226 @@ func (f *fakeTransport) Head(ctx context.Context, req transport.HeadRequest) (*t
 	return &transport.HeadResponse{ContentType: "text/plain"}, nil
 }
 
+func TestReader_Read_WithSnapshotBootstrapThenContinuesLive(t *testing.T) {
+	const snapshot = `[{"headers":{"control":"snapshot-start"}},{"type":"member","key":"one","value":{"online":true},"headers":{"operation":"insert"}},{"headers":{"control":"snapshot-end","offset":"0_5"}}]`
+	const live = `[{"type":"member","key":"two","value":{"online":true},"headers":{"operation":"insert"}}]`
+
+	var catchupOffsets []string
+	var liveOffsets []string
+	ft := &fakeTransport{
+		readFunc: func(_ context.Context, req transport.ReadRequest) (*transport.ReadResponse, error) {
+			if !req.Snapshot {
+				t.Error("catch-up request Snapshot = false, want true")
+			}
+			catchupOffsets = append(catchupOffsets, req.Offset)
+			return &transport.ReadResponse{
+				Data:       []byte(snapshot),
+				NextOffset: "0_5",
+				UpToDate:   true,
+			}, nil
+		},
+		longPollFunc: func(_ context.Context, req transport.LongPollRequest) (*transport.ReadResponse, error) {
+			liveOffsets = append(liveOffsets, req.Offset)
+			return &transport.ReadResponse{
+				Data:       []byte(live),
+				NextOffset: "0_6",
+				UpToDate:   true,
+			}, nil
+		},
+	}
+	reader := NewClientWithTransport(ft, &TransportClientConfig{ReadMode: ReadModeLongPoll}).Reader(
+		"/view",
+		Offset("now"),
+		WithSnapshotBootstrap(),
+	)
+	reader.contentType = "application/json"
+	defer reader.Close()
+
+	bootstrap, err := reader.Read(t.Context())
+	if err != nil {
+		t.Fatalf("bootstrap Read() error = %v", err)
+	}
+	if got := string(bootstrap.Data); got != snapshot {
+		t.Errorf("bootstrap data = %q, want %q", got, snapshot)
+	}
+	if got := reader.Offset(); got != Offset("0_5") {
+		t.Errorf("offset after bootstrap = %q, want 0_5", got)
+	}
+
+	next, err := reader.Read(t.Context())
+	if err != nil {
+		t.Fatalf("live Read() error = %v", err)
+	}
+	if got := string(next.Data); got != live {
+		t.Errorf("live data = %q, want %q", got, live)
+	}
+	if len(catchupOffsets) != 1 || catchupOffsets[0] != "now" {
+		t.Errorf("catch-up offsets = %q, want one offset=now request", catchupOffsets)
+	}
+	if got, want := fmt.Sprint(liveOffsets), "[0_5]"; got != want {
+		t.Errorf("live offsets = %s, want %s", got, want)
+	}
+	if got := reader.Offset(); got != Offset("0_6") {
+		t.Errorf("offset after live read = %q, want 0_6", got)
+	}
+}
+
+func TestReader_Read_WithSnapshotBootstrapSSEUsesSingleConnection(t *testing.T) {
+	const snapshot = `[{"headers":{"control":"snapshot-start"}},{"headers":{"control":"snapshot-end","offset":"0_5"}}]`
+	const live = `[{"type":"member","key":"two","headers":{"operation":"insert"}}]`
+
+	var requests []transport.SSERequest
+	stream := &scriptedEventStream{
+		requestCtx: t.Context(),
+		events: []*transport.Event{
+			{Type: "data", Data: []byte(snapshot)},
+			{Type: "control", NextOffset: "0_5", UpToDate: true, Cursor: "snapshot-cursor"},
+			{Type: "data", Data: []byte(live)},
+			{Type: "control", NextOffset: "0_6", UpToDate: true, Cursor: "live-cursor"},
+		},
+	}
+	ft := &fakeTransport{
+		readFunc: func(context.Context, transport.ReadRequest) (*transport.ReadResponse, error) {
+			t.Fatal("snapshot bootstrap used a separate catch-up request")
+			return nil, nil
+		},
+		sseFunc: func(_ context.Context, req transport.SSERequest) (transport.EventStream, error) {
+			requests = append(requests, req)
+			return stream, nil
+		},
+	}
+	reader := NewClientWithTransport(ft, &TransportClientConfig{ReadMode: ReadModeSSE}).Reader(
+		"/view",
+		Offset("now"),
+		WithSnapshotBootstrap(),
+	)
+	reader.contentType = "application/json"
+	defer reader.Close()
+
+	bootstrap, err := reader.Read(t.Context())
+	if err != nil {
+		t.Fatalf("bootstrap Read() error = %v", err)
+	}
+	if got := string(bootstrap.Data); got != snapshot {
+		t.Errorf("bootstrap data = %q, want %q", got, snapshot)
+	}
+	next, err := reader.Read(t.Context())
+	if err != nil {
+		t.Fatalf("live Read() error = %v", err)
+	}
+	if got := string(next.Data); got != live {
+		t.Errorf("live data = %q, want %q", got, live)
+	}
+	if len(requests) != 1 {
+		t.Fatalf("SSE connection count = %d, want 1", len(requests))
+	}
+	if got := requests[0]; got.Offset != "now" || !got.Snapshot {
+		t.Errorf("SSE request = %+v, want offset=now and snapshot=true", got)
+	}
+	if got := reader.Offset(); got != Offset("0_6") {
+		t.Errorf("offset after live event = %q, want 0_6", got)
+	}
+}
+
+func TestReader_Read_SparseProgressReturnsEventualData(t *testing.T) {
+	t.Run("catch-up", func(t *testing.T) {
+		var offsets []string
+		ft := &fakeTransport{
+			readFunc: func(_ context.Context, req transport.ReadRequest) (*transport.ReadResponse, error) {
+				offsets = append(offsets, req.Offset)
+				switch req.Offset {
+				case "0_0":
+					return &transport.ReadResponse{NextOffset: "0_1"}, nil
+				case "0_1":
+					return &transport.ReadResponse{Data: []byte("match"), NextOffset: "0_2"}, nil
+				default:
+					return nil, fmt.Errorf("unexpected offset %q", req.Offset)
+				}
+			},
+		}
+		reader := NewClientWithTransport(ft, nil).Reader("/view", Offset("0_0"))
+		defer reader.Close()
+
+		result, err := reader.Read(t.Context())
+		if err != nil {
+			t.Fatalf("Read() error = %v", err)
+		}
+		if string(result.Data) != "match" {
+			t.Errorf("data = %q, want match", result.Data)
+		}
+		if got, want := fmt.Sprint(offsets), "[0_0 0_1]"; got != want {
+			t.Errorf("request offsets = %s, want %s", got, want)
+		}
+		if got := reader.Offset(); got != Offset("0_2") {
+			t.Errorf("persisted offset = %q, want 0_2", got)
+		}
+	})
+
+	t.Run("long-poll", func(t *testing.T) {
+		var offsets []string
+		ft := &fakeTransport{
+			longPollFunc: func(_ context.Context, req transport.LongPollRequest) (*transport.ReadResponse, error) {
+				offsets = append(offsets, req.Offset)
+				switch req.Offset {
+				case "now":
+					return &transport.ReadResponse{NextOffset: "0_1", Cursor: "cursor-1"}, nil
+				case "0_1":
+					return &transport.ReadResponse{Data: []byte("match"), NextOffset: "0_2", Cursor: "cursor-2"}, nil
+				default:
+					return nil, fmt.Errorf("unexpected offset %q", req.Offset)
+				}
+			},
+		}
+		reader := NewClientWithTransport(ft, &TransportClientConfig{ReadMode: ReadModeLongPoll}).Reader("/view", Offset("now"))
+		defer reader.Close()
+
+		result, err := reader.Read(t.Context())
+		if err != nil {
+			t.Fatalf("Read() error = %v", err)
+		}
+		if string(result.Data) != "match" {
+			t.Errorf("data = %q, want match", result.Data)
+		}
+		if got, want := fmt.Sprint(offsets), "[now 0_1]"; got != want {
+			t.Errorf("request offsets = %s, want %s", got, want)
+		}
+		if got := reader.Offset(); got != Offset("0_2") {
+			t.Errorf("persisted offset = %q, want 0_2", got)
+		}
+	})
+
+	t.Run("SSE", func(t *testing.T) {
+		var stream *scriptedEventStream
+		ft := &fakeTransport{
+			sseFunc: func(ctx context.Context, _ transport.SSERequest) (transport.EventStream, error) {
+				stream = &scriptedEventStream{
+					requestCtx: ctx,
+					events: []*transport.Event{
+						{Type: "control", NextOffset: "0_1", Cursor: "cursor-1"},
+						{Type: "control", NextOffset: "0_2", Cursor: "cursor-2"},
+						{Type: "data", Data: []byte("match")},
+						{Type: "control", NextOffset: "0_3", Cursor: "cursor-3"},
+					},
+				}
+				return stream, nil
+			},
+		}
+		reader := NewClientWithTransport(ft, &TransportClientConfig{ReadMode: ReadModeSSE}).Reader("/view", Offset("0_0"))
+		defer reader.Close()
+
+		result, err := reader.Read(t.Context())
+		if err != nil {
+			t.Fatalf("Read() error = %v", err)
+		}
+		if string(result.Data) != "match" {
+			t.Errorf("data = %q, want match", result.Data)
+		}
+		if got := reader.Offset(); got != Offset("0_3") {
+			t.Errorf("persisted offset = %q, want 0_3", got)
+		}
+	})
+}
+
 func TestReader_Messages_StopsOnTerminalError(t *testing.T) {
 	tests := []struct {
 		name string

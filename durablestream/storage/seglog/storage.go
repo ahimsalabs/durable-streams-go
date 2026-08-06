@@ -70,6 +70,128 @@ type DiskUsage struct {
 	PerStreamBytes map[string]int64
 }
 
+// RetentionStatus is a point-in-time view of one stream's retention state.
+// New fields may be added in later releases; callers should use named fields.
+type RetentionStatus struct {
+	// FloorOffset is the highest offset removed by retention. Its zero value
+	// means that retention has not advanced the stream floor.
+	FloorOffset durablestream.Offset
+
+	// FloorTime is the commit time of the oldest retained record. It is zero
+	// for an empty stream or when an older on-disk checkpoint did not record
+	// the required timestamp.
+	FloorTime time.Time
+
+	// ReclaimedBytes is the cumulative logical size of segment files physically
+	// unlinked by retention since this Storage was opened. It resets on reopen.
+	ReclaimedBytes int64
+
+	// LastSweep is the completion time of the last successful retention
+	// evaluation of this stream in this process. It is zero before the first
+	// background or synchronous sweep and resets on reopen.
+	LastSweep time.Time
+}
+
+// RetentionStatus returns retention observability for streamID. FloorTime is
+// derived from record commit timestamps in the materialized manifest or WAL,
+// never from filesystem modification times.
+func (s *Storage) RetentionStatus(ctx context.Context, streamID string) (RetentionStatus, error) {
+	if err := s.checkClosed(); err != nil {
+		return RetentionStatus{}, err
+	}
+	if err := ctx.Err(); err != nil {
+		return RetentionStatus{}, err
+	}
+	if err := validateStreamID(streamID); err != nil {
+		return RetentionStatus{}, err
+	}
+	st, ok := s.streams.Load(streamID)
+	if !ok {
+		return RetentionStatus{}, notFoundErr(streamID)
+	}
+	snap := st.snapshot()
+	if snap.softDeleted || (snap.cfg.IsExpired() && st.refCount.Load() != 0) {
+		return RetentionStatus{}, softDeletedErr(streamID)
+	}
+	if snap.deleted || snap.cfg.IsExpired() {
+		return RetentionStatus{}, notFoundErr(streamID)
+	}
+	status := RetentionStatus{
+		FloorTime:      oldestRetainedTime(snap, snap.floor, 0),
+		ReclaimedBytes: st.reclaimedBytes.Load(),
+		LastSweep:      snap.lastSweep,
+	}
+	if snap.floor > 0 {
+		status.FloorOffset = storage.FormatSimpleOffset(snap.floor)
+	}
+	return status, nil
+}
+
+func oldestRetainedTime(snap readSnapshot, floor int64, depth int) time.Time {
+	if snap.tail == 0 || depth > maxLineageDepth {
+		return time.Time{}
+	}
+	if snap.parent != nil && floor < snap.parentBoundary {
+		// A child can still read its pinned inherited prefix after the parent's
+		// logical floor advances, so inspect the parent's physical prefix from
+		// its beginning rather than applying the parent's public floor.
+		return oldestRetainedTime(snap.parent.snapshot(), 0, depth+1)
+	}
+	for _, sf := range snap.sealed {
+		if sf.lastIndex <= floor {
+			continue
+		}
+		if sf.minTS == 0 {
+			return time.Time{}
+		}
+		return time.Unix(0, sf.minTS)
+	}
+	if snap.activeView.path != "" && snap.activeView.lastIndex > floor {
+		if snap.activeMinTS == 0 {
+			return time.Time{}
+		}
+		return time.Unix(0, snap.activeMinTS)
+	}
+	for i, loc := range snap.walTail {
+		if snap.firstLive+int64(i) <= floor {
+			continue
+		}
+		if loc.ts == 0 {
+			return time.Time{}
+		}
+		return time.Unix(0, loc.ts)
+	}
+	return time.Time{}
+}
+
+// SweepRetention synchronously evaluates retention for every partition and
+// returns after resulting floors are durable and segment unlink requests have
+// been applied. An active read pin can defer a physical unlink, and its bytes
+// are not counted as reclaimed until that pin is released. SweepRetention
+// serializes with each partition's background materializer. A background sweep
+// that is already running completes first; the next scheduled background sweep
+// is not delayed or canceled.
+func (s *Storage) SweepRetention(ctx context.Context) error {
+	if err := s.checkClosed(); err != nil {
+		return err
+	}
+	for _, p := range s.parts {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		p.materializerMu.Lock()
+		err := s.materializeRoundLocked(p)
+		if err == nil {
+			err = s.retentionSweepLocked(ctx, p)
+		}
+		p.materializerMu.Unlock()
+		if err != nil {
+			return fmt.Errorf("seglog: sweep retention partition %d: %w", p.id, err)
+		}
+	}
+	return nil
+}
+
 // DiskUsage walks the complete storage directory and returns allocated bytes,
 // so its cost is O(number of directory entries) and it can race normal file
 // growth or reclamation. On platforms that do not expose allocated block

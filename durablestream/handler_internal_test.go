@@ -20,6 +20,150 @@ import (
 	"github.com/ahimsalabs/durable-streams-go/durablestream/internal/protocol"
 )
 
+const (
+	sparseStartOffset = Offset("0_0")
+	sparseScanOffset  = Offset("0_1")
+	sparseDataOffset  = Offset("0_2")
+	sparseTailOffset  = Offset("0_3")
+)
+
+// sparseViewStorage models a read-only filtered view that scans at most one
+// source range per Read. It returns empty progress before and after one visible
+// message, and blocks only after the view cursor reaches the source tail.
+type sparseViewStorage struct {
+	*testStorage
+	contentType string
+}
+
+func newSparseViewStorage(t *testing.T, contentType string) *sparseViewStorage {
+	t.Helper()
+	base := newTestStorage()
+	if _, err := base.Create(t.Context(), "/view", StreamConfig{ContentType: contentType}); err != nil {
+		t.Fatalf("Create() error = %v", err)
+	}
+	return &sparseViewStorage{testStorage: base, contentType: contentType}
+}
+
+func (s *sparseViewStorage) Head(context.Context, string) (*StreamInfo, error) {
+	return &StreamInfo{
+		ContentType:   s.contentType,
+		NextOffset:    sparseTailOffset,
+		IncarnationID: "sparse-view",
+	}, nil
+}
+
+func (s *sparseViewStorage) Read(ctx context.Context, _ string, offset Offset, _ int) (*ReadResult, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	result := &ReadResult{TailOffset: sparseTailOffset, IncarnationID: "sparse-view"}
+	switch offset {
+	case sparseStartOffset:
+		result.NextOffset = sparseScanOffset
+	case sparseScanOffset:
+		data := []byte("match")
+		if protocol.IsJSONContentType(s.contentType) {
+			data = []byte(`{"match":true}`)
+		}
+		result.Messages = []StoredMessage{{Data: data, Offset: sparseDataOffset}}
+		result.NextOffset = sparseDataOffset
+	case sparseDataOffset:
+		result.NextOffset = sparseTailOffset
+	default:
+		result.NextOffset = offset
+	}
+	return result, nil
+}
+
+func (s *sparseViewStorage) WaitForData(ctx context.Context, _ string, _ Offset, _ int) (*ReadResult, error) {
+	<-ctx.Done()
+	return nil, ctx.Err()
+}
+
+func serveSparseSSE(t *testing.T, handler http.Handler, url string) *httptest.ResponseRecorder {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(t.Context(), time.Second)
+	defer cancel()
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, url, nil).WithContext(ctx))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("SSE status = %d, want 200; body = %q", rec.Code, rec.Body.String())
+	}
+	return rec
+}
+
+func TestHandler_SparseViewProgressWithoutData(t *testing.T) {
+	tests := []struct {
+		name        string
+		contentType string
+		wantEmpty   string
+		wantData    string
+	}{
+		{name: "raw stream", contentType: "text/plain", wantData: "match"},
+		{name: "JSON stream", contentType: "application/json", wantEmpty: "[]", wantData: `[{"match":true}]`},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			storage := newSparseViewStorage(t, tt.contentType)
+			handler := NewHandler(storage, &HandlerConfig{
+				LongPollTimeout: 20 * time.Millisecond,
+				SSECloseAfter:   20 * time.Millisecond,
+			})
+
+			for _, mode := range []struct {
+				name  string
+				query string
+			}{
+				{name: "catch-up", query: ""},
+				{name: "long-poll", query: "&live=long-poll"},
+			} {
+				t.Run(mode.name, func(t *testing.T) {
+					progress := httptest.NewRecorder()
+					handler.ServeHTTP(progress, httptest.NewRequest(http.MethodGet, "/view?offset=0_0"+mode.query, nil))
+					if progress.Code != http.StatusOK {
+						t.Fatalf("progress status = %d, want 200; body = %q", progress.Code, progress.Body.String())
+					}
+					if got := progress.Header().Get(protocol.HeaderStreamNextOffset); got != sparseScanOffset.String() {
+						t.Errorf("progress offset = %q, want %q", got, sparseScanOffset)
+					}
+					if got := progress.Header().Get(protocol.HeaderStreamUpToDate); got != "" {
+						t.Errorf("progress Stream-Up-To-Date = %q, want absent", got)
+					}
+					if got := progress.Body.String(); got != tt.wantEmpty {
+						t.Errorf("progress body = %q, want %q", got, tt.wantEmpty)
+					}
+
+					data := httptest.NewRecorder()
+					handler.ServeHTTP(data, httptest.NewRequest(http.MethodGet, "/view?offset=0_1"+mode.query, nil))
+					if data.Code != http.StatusOK {
+						t.Fatalf("data status = %d, want 200; body = %q", data.Code, data.Body.String())
+					}
+					if got := data.Body.String(); got != tt.wantData {
+						t.Errorf("data body = %q, want %q", got, tt.wantData)
+					}
+				})
+			}
+
+			t.Run("SSE", func(t *testing.T) {
+				rec := serveSparseSSE(t, handler, "/view?offset=0_0&live=sse")
+				body := rec.Body.String()
+				progressAt := strings.Index(body, `"streamNextOffset":"0_1"`)
+				dataAt := strings.Index(body, "event: data")
+				if progressAt < 0 {
+					t.Fatalf("SSE body lacks progress control event:\n%s", body)
+				}
+				if dataAt < 0 || progressAt > dataAt {
+					t.Errorf("SSE progress control must precede eventual data:\n%s", body)
+				}
+				if !strings.Contains(body, `"streamNextOffset":"0_3"`) {
+					t.Errorf("SSE body lacks final empty progress cursor:\n%s", body)
+				}
+			})
+		})
+	}
+}
+
 // TestValidateOffset tests offset validation per PROTOCOL.md Section 8.
 func TestValidateOffset(t *testing.T) {
 	tests := []struct {

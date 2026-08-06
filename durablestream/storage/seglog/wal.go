@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -26,8 +27,11 @@ type walWriter struct {
 
 	// mu guards segments. Segment files are append-only and their descriptors
 	// stay open while any walLoc references them (never removed in phase 1).
-	mu       sync.RWMutex
-	segments map[uint64]*os.File
+	mu            sync.RWMutex
+	segments      map[uint64]*os.File
+	logicalBytes  map[uint64]int64
+	retainedBytes atomic.Int64
+	activeBytes   atomic.Int64
 
 	active    *os.File // nil until the first append; also present in segments
 	activeSeq uint64
@@ -49,6 +53,7 @@ func newWALWriter(dir string, partition uint32, segmentBytes int64, syncWrites b
 		segmentBytes: segmentBytes,
 		sync:         syncWrites,
 		segments:     make(map[uint64]*os.File),
+		logicalBytes: make(map[uint64]int64),
 	}
 }
 
@@ -59,13 +64,25 @@ func walSegmentPath(dir string, seq uint64) string {
 // adopt installs a recovered segment as part of the writer's set; the last
 // adopted segment becomes the active one at writePos.
 func (w *walWriter) adopt(seq uint64, f *os.File, writePos int64) {
-	w.segments[seq] = f
+	w.installRecoveredSegment(seq, f, writePos)
 	w.active = f
 	w.activeSeq = seq
 	w.writePos = writePos
+	w.activeBytes.Store(writePos)
 	if info, err := f.Stat(); err == nil {
 		w.extentEnd = info.Size()
 	}
+}
+
+// installRecoveredSegment records one recovered segment's valid logical end.
+// Recovery calls it before workers start, but the lock keeps Stats snapshots
+// consistent with later reclamation.
+func (w *walWriter) installRecoveredSegment(seq uint64, f *os.File, writePos int64) {
+	w.mu.Lock()
+	w.segments[seq] = f
+	w.logicalBytes[seq] = writePos
+	w.mu.Unlock()
+	w.retainedBytes.Add(writePos)
 }
 
 // capacity reports the payload capacity of one segment.
@@ -154,7 +171,13 @@ func (w *walWriter) writeGroup(buf []byte) (seq uint64, base int64, file *os.Fil
 	if _, err := w.active.WriteAt(buf, base); err != nil {
 		return 0, 0, nil, fmt.Errorf("seglog: write WAL group: %w", err)
 	}
-	w.writePos = base + int64(len(buf))
+	written := int64(len(buf))
+	w.writePos = base + written
+	w.mu.Lock()
+	w.logicalBytes[w.activeSeq] += written
+	w.mu.Unlock()
+	w.retainedBytes.Add(written)
+	w.activeBytes.Add(written)
 	return w.activeSeq, base, w.active, nil
 }
 
@@ -193,10 +216,13 @@ func (w *walWriter) roll() error {
 	}
 	w.mu.Lock()
 	w.segments[seq] = f
+	w.logicalBytes[seq] = walSegmentHeaderSize
 	w.mu.Unlock()
+	w.retainedBytes.Add(walSegmentHeaderSize)
 	w.active = f
 	w.activeSeq = seq
 	w.writePos = walSegmentHeaderSize
+	w.activeBytes.Store(walSegmentHeaderSize)
 	w.extentEnd = walExtentEnd(w.writePos, w.segmentBytes)
 	return nil
 }
@@ -281,20 +307,52 @@ func (w *walWriter) removeBefore(keep uint64) error {
 	}
 	for _, seq := range victims {
 		_ = w.segments[seq].Close()
-		delete(w.segments, seq)
 	}
 	w.mu.Unlock()
 
 	var firstErr error
+	removed := 0
 	for _, seq := range victims {
-		if err := os.Remove(walSegmentPath(w.dir, seq)); err != nil && firstErr == nil {
-			firstErr = fmt.Errorf("seglog: unlink WAL segment %d: %w", seq, err)
+		err := os.Remove(walSegmentPath(w.dir, seq))
+		if err != nil && !os.IsNotExist(err) {
+			if firstErr == nil {
+				firstErr = fmt.Errorf("seglog: unlink WAL segment %d: %w", seq, err)
+			}
+			continue
+		}
+		w.mu.Lock()
+		removedBytes := w.logicalBytes[seq]
+		delete(w.segments, seq)
+		delete(w.logicalBytes, seq)
+		w.mu.Unlock()
+		w.retainedBytes.Add(-removedBytes)
+		removed++
+	}
+	if removed > 0 {
+		if err := syncDir(w.dir); err != nil && firstErr == nil {
+			firstErr = err
 		}
 	}
-	if len(victims) > 0 && firstErr == nil {
-		firstErr = syncDir(w.dir)
-	}
 	return firstErr
+}
+
+type walUsage struct {
+	retainedBytes        int64
+	activeBytes          int64
+	segmentCapacityBytes int64
+}
+
+func (w *walWriter) usageSnapshot() walUsage {
+	active := w.activeBytes.Load()
+	capacity := int64(0)
+	if active > 0 {
+		capacity = w.segmentBytes
+	}
+	return walUsage{
+		retainedBytes:        w.retainedBytes.Load(),
+		activeBytes:          active,
+		segmentCapacityBytes: capacity,
+	}
 }
 
 // close closes every segment descriptor.

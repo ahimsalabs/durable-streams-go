@@ -34,6 +34,7 @@ type Reader struct {
 	readMode    ReadMode
 	contentType string // cached content type for JSON validation
 	catching    bool   // true while in catch-up phase
+	bootstrap   bool   // request snapshot bootstrap on the initial offset=now read
 
 	// mu guards closed, eof, the active Read cancellation, and the SSE connection
 	// state so Close can abort a blocked Read in every mode.
@@ -211,44 +212,50 @@ func (r *Reader) readCatchUp(ctx context.Context) (*StreamData, error) {
 	readCtx, cancel := r.client.withTimeout(ctx)
 	defer cancel()
 
-	resp, err := r.client.transport.Read(readCtx, transport.ReadRequest{
-		Path:   r.path,
-		Offset: r.offset.String(),
-	})
-	if err != nil {
-		return nil, convertTransportErrorWithPath(err, r.path)
-	}
+	for {
+		requestedOffset := r.offset
+		requestBootstrap := r.bootstrap && requestedOffset == Offset("now")
+		resp, err := r.client.transport.Read(readCtx, transport.ReadRequest{
+			Path:     r.path,
+			Offset:   requestedOffset.String(),
+			Snapshot: requestBootstrap,
+		})
+		if err != nil {
+			return nil, convertTransportErrorWithPath(err, r.path)
+		}
 
-	// Validate JSON response BEFORE updating state.
-	// If validation fails, we don't advance the offset, allowing the caller
-	// to retry from the same position after the fault is cleared.
-	if (len(resp.Data) > 0 || !resp.Closed) && isJSONContentType(r.contentType) {
-		if err := validateJSONArray(resp.Data); err != nil {
+		// Validate JSON response BEFORE updating state. If validation fails, we
+		// don't advance the offset, allowing retry from the same position.
+		hasMessages, err := readResponseHasMessages(resp.Data, r.contentType, resp.Closed)
+		if err != nil {
 			return nil, fmt.Errorf("%w: %v", ErrParseError, err)
 		}
-	}
+		if requestBootstrap {
+			r.bootstrap = false
+		}
 
-	// Update state after successful validation
-	r.offset = Offset(resp.NextOffset)
-	if resp.Cursor != "" {
-		r.cursor = resp.Cursor
-	}
+		r.offset = Offset(resp.NextOffset)
+		if resp.Cursor != "" {
+			r.cursor = resp.Cursor
+		}
+		if resp.UpToDate || resp.Closed {
+			r.catching = false
+		}
+		if resp.Closed {
+			r.markEOF()
+		}
 
-	// Check if we should transition to live mode
-	if resp.UpToDate || resp.Closed {
-		r.catching = false
+		result := &StreamData{
+			Data:       resp.Data,
+			NextOffset: Offset(resp.NextOffset),
+			Cursor:     resp.Cursor,
+			UpToDate:   resp.UpToDate || resp.Closed,
+			Closed:     resp.Closed,
+		}
+		if hasMessages || resp.UpToDate || resp.Closed || r.offset == requestedOffset {
+			return result, nil
+		}
 	}
-	if resp.Closed {
-		r.markEOF()
-	}
-
-	return &StreamData{
-		Data:       resp.Data,
-		NextOffset: Offset(resp.NextOffset),
-		Cursor:     resp.Cursor,
-		UpToDate:   resp.UpToDate || resp.Closed,
-		Closed:     resp.Closed,
-	}, nil
 }
 
 // readLongPoll performs a long-poll read (Section 5.7: Read Stream - Live Long-poll).
@@ -262,40 +269,41 @@ func (r *Reader) readLongPoll(ctx context.Context) (*StreamData, error) {
 		r.contentType = info.ContentType
 	}
 
-	resp, err := r.client.transport.LongPoll(ctx, transport.LongPollRequest{
-		Path:   r.path,
-		Offset: r.offset.String(),
-		Cursor: r.cursor,
-	})
-	if err != nil {
-		return nil, convertTransportErrorWithPath(err, r.path)
-	}
+	for {
+		requestedOffset := r.offset
+		resp, err := r.client.transport.LongPoll(ctx, transport.LongPollRequest{
+			Path:   r.path,
+			Offset: requestedOffset.String(),
+			Cursor: r.cursor,
+		})
+		if err != nil {
+			return nil, convertTransportErrorWithPath(err, r.path)
+		}
 
-	// Validate JSON response BEFORE updating state.
-	// If validation fails, we don't advance the offset, allowing the caller
-	// to retry from the same position after the fault is cleared.
-	if len(resp.Data) > 0 && isJSONContentType(r.contentType) {
-		if err := validateJSONArray(resp.Data); err != nil {
+		hasMessages, err := readResponseHasMessages(resp.Data, r.contentType, resp.UpToDate || resp.Closed)
+		if err != nil {
 			return nil, fmt.Errorf("%w: %v", ErrParseError, err)
 		}
-	}
 
-	// Update state after successful validation
-	r.offset = Offset(resp.NextOffset)
-	if resp.Cursor != "" {
-		r.cursor = resp.Cursor
-	}
-	if resp.Closed {
-		r.markEOF()
-	}
+		r.offset = Offset(resp.NextOffset)
+		if resp.Cursor != "" {
+			r.cursor = resp.Cursor
+		}
+		if resp.Closed {
+			r.markEOF()
+		}
 
-	return &StreamData{
-		Data:       resp.Data,
-		NextOffset: Offset(resp.NextOffset),
-		Cursor:     r.cursor,
-		UpToDate:   resp.UpToDate || resp.Closed,
-		Closed:     resp.Closed,
-	}, nil
+		result := &StreamData{
+			Data:       resp.Data,
+			NextOffset: Offset(resp.NextOffset),
+			Cursor:     r.cursor,
+			UpToDate:   resp.UpToDate || resp.Closed,
+			Closed:     resp.Closed,
+		}
+		if hasMessages || resp.UpToDate || resp.Closed || r.offset == requestedOffset {
+			return result, nil
+		}
+	}
 }
 
 // readSSE performs a read using Server-Sent Events (Section 5.8: Read Stream - Live SSE).
@@ -422,9 +430,10 @@ func (r *Reader) ensureSSEStream(ctx context.Context) (transport.EventStream, er
 	}
 	stopOpeningCancel := context.AfterFunc(ctx, streamCancel)
 	stream, err := r.client.transport.SSE(streamCtx, transport.SSERequest{
-		Path:   r.path,
-		Offset: offset,
-		Cursor: r.cursor,
+		Path:     r.path,
+		Offset:   offset,
+		Cursor:   r.cursor,
+		Snapshot: r.bootstrap,
 	})
 	stopped := stopOpeningCancel()
 	if err != nil {
@@ -461,6 +470,10 @@ func (r *Reader) ensureSSEStream(ctx context.Context) (transport.EventStream, er
 
 // applyControlEvent updates reader position from a control event (Section 5.8).
 func (r *Reader) applyControlEvent(event *transport.Event) {
+	// The first control event confirms delivery of an inline SSE bootstrap. If
+	// the connection fails before this point, reconnect with snapshot=true so
+	// the caller never advances past an unconfirmed snapshot.
+	r.bootstrap = false
 	if event.NextOffset != "" {
 		r.offset = Offset(event.NextOffset)
 	}
@@ -565,6 +578,9 @@ func (r *Reader) Close() error {
 // Messages returns an iterator for reading messages from the stream.
 // For JSON streams, it parses the JSON array and yields individual messages.
 // Each Message can be decoded via msg.Decode(&v) or accessed as raw bytes via msg.Bytes().
+// State Protocol snapshot bootstrap controls and changes are yielded as ordinary
+// messages in response order; consumers using that vocabulary should decode and
+// apply the snapshot-start, insert, and snapshot-end messages themselves.
 //
 // This enables use with Go 1.22+ range-over-func:
 //
@@ -783,4 +799,24 @@ func validateJSONArray(data []byte) error {
 		return fmt.Errorf("expected valid JSON array")
 	}
 	return nil
+}
+
+// readResponseHasMessages validates an HTTP read body and reports whether it
+// contains at least one message. JSON represents an empty 200 response as [];
+// terminal 204 responses have no body.
+func readResponseHasMessages(data []byte, contentType string, allowEmptyBody bool) (bool, error) {
+	if !isJSONContentType(contentType) {
+		return len(data) > 0, nil
+	}
+	if len(data) == 0 && allowEmptyBody {
+		return false, nil
+	}
+	if err := validateJSONArray(data); err != nil {
+		return false, err
+	}
+	var messages []json.RawMessage
+	if err := json.Unmarshal(data, &messages); err != nil {
+		return false, err
+	}
+	return len(messages) > 0, nil
 }

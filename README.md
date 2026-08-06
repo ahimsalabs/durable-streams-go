@@ -163,6 +163,14 @@ func ExampleReader() {
 ```
 <!-- [/snippet:reader] -->
 
+For a state-enabled view that supports snapshot bootstrap, request a snapshot
+before live updates by starting at `now` with
+`durablestream.WithSnapshotBootstrap()`:
+
+```go
+reader := client.Reader("members", durablestream.Offset("now"), durablestream.WithSnapshotBootstrap())
+```
+
 ### Bulk import
 
 For a bulk import into an embedded Storage, use `AppendBatch`. One call

@@ -52,6 +52,7 @@ type result struct {
 	nextTxn  uint64
 	dirty    map[*streamState]struct{}
 	removals []*streamState
+	frontier statsFrontier
 }
 
 // opBarrier is a queue-only operation (never a WAL frame): its result carries
@@ -102,9 +103,10 @@ type partition struct {
 
 	// Materializer coordination. The worker adds under dirtyMu at publish
 	// time; the materializer swaps the containers each round.
-	dirtyMu  sync.Mutex
-	dirty    map[*streamState]struct{}
-	removals []*streamState // dead incarnations awaiting directory removal
+	dirtyMu        sync.Mutex
+	materializerMu sync.Mutex
+	dirty          map[*streamState]struct{}
+	removals       []*streamState // dead incarnations awaiting directory removal
 
 	// Materializer-owned: the last durably written checkpoint position.
 	ckptSeq   uint64
@@ -329,6 +331,9 @@ func (p *partition) run() {
 // bound; concurrent submitters can otherwise refill the admission queue while
 // the stager drains it.
 func (p *partition) appendPending(record *stagedRecord) {
+	if record.segment != nil && record.writeErr == nil {
+		p.stats.addPendingWALBytes(record.endOff - record.base)
+	}
 	p.walPendingMu.Lock()
 	p.walPending = append(p.walPending, record)
 	p.walPendingMu.Unlock()
@@ -709,19 +714,28 @@ func (p *partition) syncPending(batches []*stagedRecord) error {
 }
 
 func (p *partition) commitRecord(record *stagedRecord, syncErr error) bool {
+	frameBytes := int64(0)
+	if record.segment != nil && record.writeErr == nil {
+		frameBytes = record.endOff - record.base
+	}
 	err := record.writeErr
 	if err == nil {
 		err = syncErr
 	}
 	if err != nil {
+		p.stats.discardPendingWALBytes(frameBytes)
 		broken := p.latchBroken(err)
 		record.op.req.done <- result{err: broken, ambiguous: record.writeAttempted && record.op.hasFrame()}
 		return false
 	}
 	p.publish(record.op, record.segSeq, record.base)
+	if frameBytes > 0 {
+		p.stats.publishWALFrame(frameBytes, record.op.ts)
+	}
 	// A barrier is a queue marker. Swap the exact dirty/removal frontier only
 	// after every preceding FIFO record has published.
 	if record.op.barrier && record.op.req.captureDirty {
+		record.op.res.frontier = p.stats.captureMaterializationFrontier()
 		record.op.res.dirty, record.op.res.removals = p.swapDirty()
 	}
 	p.publishedSeq = record.endSeq

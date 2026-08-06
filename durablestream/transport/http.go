@@ -104,9 +104,10 @@ var defaultHTTPClient = sync.OnceValue(func() *http.Client {
 
 // Query parameter names used in stream operations.
 const (
-	queryOffset = "offset"
-	queryLive   = "live"
-	queryCursor = "cursor"
+	queryOffset   = "offset"
+	queryLive     = "live"
+	queryCursor   = "cursor"
+	querySnapshot = "snapshot"
 )
 
 // Valid values for the "live" query parameter.
@@ -309,6 +310,9 @@ func (t *HTTPTransport) Read(ctx context.Context, req ReadRequest) (*ReadRespons
 	if req.Offset != "" {
 		q.Set(queryOffset, req.Offset)
 	}
+	if req.Snapshot {
+		q.Set(querySnapshot, "true")
+	}
 	u.RawQuery = q.Encode()
 
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
@@ -357,8 +361,13 @@ func (t *HTTPTransport) LongPoll(ctx context.Context, req LongPollRequest) (*Rea
 	}
 
 	q := u.Query()
-	q.Set(queryOffset, req.Offset)
+	if req.Offset != "" {
+		q.Set(queryOffset, req.Offset)
+	}
 	q.Set(queryLive, liveModeLongPoll)
+	if req.Snapshot {
+		q.Set(querySnapshot, "true")
+	}
 	if req.Cursor != "" {
 		// Echo cursor for CDN collapsing (Section 10.1)
 		q.Set(queryCursor, req.Cursor)
@@ -434,8 +443,13 @@ func (t *HTTPTransport) SSE(ctx context.Context, req SSERequest) (EventStream, e
 	}
 
 	q := u.Query()
-	q.Set(queryOffset, req.Offset)
+	if req.Offset != "" {
+		q.Set(queryOffset, req.Offset)
+	}
 	q.Set(queryLive, liveModeSSE)
+	if req.Snapshot {
+		q.Set(querySnapshot, "true")
+	}
 	if req.Cursor != "" {
 		// Echo the last cursor when reconnecting for CDN collapsing (Section 10.1).
 		q.Set(queryCursor, req.Cursor)

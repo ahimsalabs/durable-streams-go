@@ -28,6 +28,17 @@ type storageWithoutIncarnation struct {
 	durablestream.Storage
 }
 
+type snapshotBootstrapStorage struct {
+	durablestream.Storage
+	result *durablestream.ReadResult
+	calls  int
+}
+
+func (s *snapshotBootstrapStorage) BootstrapRead(context.Context, string, int) (*durablestream.ReadResult, bool, error) {
+	s.calls++
+	return s.result, true, nil
+}
+
 func (s storageWithoutIncarnation) Head(ctx context.Context, streamID string) (*durablestream.StreamInfo, error) {
 	info, err := s.Storage.Head(ctx, streamID)
 	if info != nil {
@@ -441,6 +452,265 @@ func TestHandler_GET_CatchupRead(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestHandler_GET_SnapshotBootstrapRequiresExplicitRequest(t *testing.T) {
+	base := memorystorage.New()
+	if _, err := base.Create(t.Context(), "/view", durablestream.StreamConfig{ContentType: "application/json"}); err != nil {
+		t.Fatalf("Create() error = %v", err)
+	}
+	tail, err := base.Append(t.Context(), "/view", []byte(`{"historical":true}`), "")
+	if err != nil {
+		t.Fatalf("Append() historical error = %v", err)
+	}
+	info, err := base.Head(t.Context(), "/view")
+	if err != nil {
+		t.Fatalf("Head() error = %v", err)
+	}
+
+	storage := &snapshotBootstrapStorage{
+		Storage: base,
+		result: &durablestream.ReadResult{
+			Messages: []durablestream.StoredMessage{
+				{Data: []byte(`{"headers":{"control":"snapshot-start"}}`)},
+				{Data: []byte(`{"type":"member","key":"one","value":{"online":true},"headers":{"operation":"insert"}}`)},
+				{Data: []byte(fmt.Sprintf(`{"headers":{"control":"snapshot-end","offset":%q}}`, tail.String()))},
+			},
+			NextOffset:    tail,
+			TailOffset:    tail,
+			IncarnationID: info.IncarnationID,
+		},
+	}
+	handler := durablestream.NewHandler(storage, nil)
+
+	for _, target := range []string{"/view", "/view?offset=-1"} {
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, target, nil))
+		if rec.Code != http.StatusOK {
+			t.Fatalf("GET %s status = %d, want 200; body = %q", target, rec.Code, rec.Body.String())
+		}
+		if got, want := rec.Body.String(), `[{"historical":true}]`; got != want {
+			t.Errorf("GET %s body = %q, want positional replay %q", target, got, want)
+		}
+	}
+	if storage.calls != 0 {
+		t.Fatalf("BootstrapRead calls after ordinary start reads = %d, want 0", storage.calls)
+	}
+
+	for _, target := range []string{"/view?snapshot=true", "/view?offset=now&snapshot=true"} {
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, target, nil))
+		if rec.Code != http.StatusOK {
+			t.Fatalf("GET %s status = %d, want 200; body = %q", target, rec.Code, rec.Body.String())
+		}
+		if got := rec.Header().Get(protocol.HeaderStreamNextOffset); got != tail.String() {
+			t.Errorf("GET %s Stream-Next-Offset = %q, want %q", target, got, tail)
+		}
+		if got := rec.Header().Get("Cache-Control"); got != "no-store" {
+			t.Errorf("GET %s Cache-Control = %q, want no-store", target, got)
+		}
+		if got := rec.Header().Get("ETag"); got != "" {
+			t.Errorf("GET %s ETag = %q, want absent", target, got)
+		}
+		if got := rec.Header().Get(protocol.HeaderStreamUpToDate); got != "true" {
+			t.Errorf("GET %s Stream-Up-To-Date = %q, want true", target, got)
+		}
+
+		var messages []struct {
+			Headers struct {
+				Control string `json:"control"`
+				Offset  string `json:"offset"`
+			} `json:"headers"`
+		}
+		if err := json.Unmarshal(rec.Body.Bytes(), &messages); err != nil {
+			t.Fatalf("GET %s decode response: %v", target, err)
+		}
+		if len(messages) != 3 {
+			t.Fatalf("GET %s message count = %d, want 3", target, len(messages))
+		}
+		if got := messages[len(messages)-1].Headers.Offset; got != rec.Header().Get(protocol.HeaderStreamNextOffset) {
+			t.Errorf("GET %s snapshot-end offset = %q, want Stream-Next-Offset %q", target, got, rec.Header().Get(protocol.HeaderStreamNextOffset))
+		}
+	}
+
+	liveOffset, err := base.Append(t.Context(), "/view", []byte(`{"live":true}`), "")
+	if err != nil {
+		t.Fatalf("Append() live error = %v", err)
+	}
+	positional := httptest.NewRecorder()
+	handler.ServeHTTP(positional, httptest.NewRequest(http.MethodGet, "/view?offset="+tail.String(), nil))
+	if positional.Code != http.StatusOK {
+		t.Fatalf("positional status = %d, want 200; body = %q", positional.Code, positional.Body.String())
+	}
+	if got, want := positional.Body.String(), `[{"live":true}]`; got != want {
+		t.Errorf("positional body = %q, want %q", got, want)
+	}
+	if got := positional.Header().Get(protocol.HeaderStreamNextOffset); got != liveOffset.String() {
+		t.Errorf("positional Stream-Next-Offset = %q, want %q", got, liveOffset)
+	}
+
+	for _, target := range []string{
+		"/view?offset=" + tail.String() + "&snapshot=true",
+		"/view?offset=-1&snapshot=true",
+		"/view?offset=" + tail.String() + "&snapshot=true&live=sse",
+		"/view?offset=-1&snapshot=true&live=long-poll",
+	} {
+		invalid := httptest.NewRecorder()
+		handler.ServeHTTP(invalid, httptest.NewRequest(http.MethodGet, target, nil))
+		if invalid.Code != http.StatusBadRequest {
+			t.Errorf("GET %s status = %d, want 400; body = %q", target, invalid.Code, invalid.Body.String())
+		}
+	}
+	if storage.calls != 2 {
+		t.Errorf("BootstrapRead calls = %d, want 2 explicit valid requests only", storage.calls)
+	}
+}
+
+func TestHandler_GET_SnapshotBootstrapUnsupportedStreamReturnsBadRequest(t *testing.T) {
+	storage := memorystorage.New()
+	if _, err := storage.Create(t.Context(), "/stream", durablestream.StreamConfig{ContentType: "application/json"}); err != nil {
+		t.Fatalf("Create() error = %v", err)
+	}
+	handler := durablestream.NewHandler(storage, nil)
+
+	for _, target := range []string{
+		"/stream?snapshot=true",
+		"/stream?snapshot=true&live=long-poll",
+		"/stream?snapshot=true&live=sse",
+	} {
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, target, nil))
+		if rec.Code != http.StatusBadRequest {
+			t.Errorf("GET %s status = %d, want 400; body = %q", target, rec.Code, rec.Body.String())
+		}
+	}
+}
+
+func TestHandler_GET_SnapshotBootstrapLongPollReturnsBootstrapResponse(t *testing.T) {
+	base := memorystorage.New()
+	if _, err := base.Create(t.Context(), "/view", durablestream.StreamConfig{ContentType: "application/json"}); err != nil {
+		t.Fatalf("Create() error = %v", err)
+	}
+	tail, err := base.Append(t.Context(), "/view", []byte(`{"historical":true}`), "")
+	if err != nil {
+		t.Fatalf("Append() error = %v", err)
+	}
+	info, err := base.Head(t.Context(), "/view")
+	if err != nil {
+		t.Fatalf("Head() error = %v", err)
+	}
+	storage := &snapshotBootstrapStorage{
+		Storage: base,
+		result: &durablestream.ReadResult{
+			Messages: []durablestream.StoredMessage{
+				{Data: []byte(`{"headers":{"control":"snapshot-start"}}`)},
+				{Data: []byte(fmt.Sprintf(`{"headers":{"control":"snapshot-end","offset":%q}}`, tail.String()))},
+			},
+			NextOffset:    tail,
+			TailOffset:    tail,
+			IncarnationID: info.IncarnationID,
+		},
+	}
+	handler := durablestream.NewHandler(storage, &durablestream.HandlerConfig{LongPollTimeout: time.Second})
+
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/view?snapshot=true&live=long-poll", nil))
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body = %q", rec.Code, rec.Body.String())
+	}
+	if got := rec.Header().Get(protocol.HeaderStreamNextOffset); got != tail.String() {
+		t.Errorf("Stream-Next-Offset = %q, want %q", got, tail)
+	}
+	if got := rec.Header().Get("Cache-Control"); got != "no-store" {
+		t.Errorf("Cache-Control = %q, want no-store", got)
+	}
+	if got := rec.Header().Get("ETag"); got != "" {
+		t.Errorf("ETag = %q, want absent", got)
+	}
+	if storage.calls != 1 {
+		t.Errorf("BootstrapRead calls = %d, want 1", storage.calls)
+	}
+	if !strings.Contains(rec.Body.String(), "snapshot-start") || !strings.Contains(rec.Body.String(), "snapshot-end") {
+		t.Errorf("body does not contain complete bootstrap: %s", rec.Body.String())
+	}
+
+	liveTail, err := base.Append(t.Context(), "/view", []byte(`{"live":true}`), "")
+	if err != nil {
+		t.Fatalf("Append() live error = %v", err)
+	}
+	next := httptest.NewRecorder()
+	handler.ServeHTTP(next, httptest.NewRequest(
+		http.MethodGet,
+		"/view?offset="+rec.Header().Get(protocol.HeaderStreamNextOffset)+"&live=long-poll",
+		nil,
+	))
+	if next.Code != http.StatusOK {
+		t.Fatalf("continuation status = %d, want 200; body = %q", next.Code, next.Body.String())
+	}
+	if got, want := next.Body.String(), `[{"live":true}]`; got != want {
+		t.Errorf("continuation body = %q, want %q", got, want)
+	}
+	if got := next.Header().Get(protocol.HeaderStreamNextOffset); got != liveTail.String() {
+		t.Errorf("continuation Stream-Next-Offset = %q, want %q", got, liveTail)
+	}
+}
+
+func TestHandler_GET_SnapshotBootstrapSSEContinuesLiveOnSameConnection(t *testing.T) {
+	base := memorystorage.New()
+	if _, err := base.Create(t.Context(), "/view", durablestream.StreamConfig{ContentType: "application/json"}); err != nil {
+		t.Fatalf("Create() error = %v", err)
+	}
+	tail, err := base.Append(t.Context(), "/view", []byte(`{"historical":true}`), "")
+	if err != nil {
+		t.Fatalf("Append() historical error = %v", err)
+	}
+	info, err := base.Head(t.Context(), "/view")
+	if err != nil {
+		t.Fatalf("Head() error = %v", err)
+	}
+	storage := &snapshotBootstrapStorage{
+		Storage: base,
+		result: &durablestream.ReadResult{
+			Messages: []durablestream.StoredMessage{
+				{Data: []byte(`{"headers":{"control":"snapshot-start"}}`)},
+				{Data: []byte(fmt.Sprintf(`{"headers":{"control":"snapshot-end","offset":%q}}`, tail.String()))},
+			},
+			NextOffset:    tail,
+			TailOffset:    tail,
+			IncarnationID: info.IncarnationID,
+		},
+	}
+	handler := durablestream.NewHandler(storage, &durablestream.HandlerConfig{SSECloseAfter: 200 * time.Millisecond})
+
+	appendDone := make(chan error, 1)
+	go func() {
+		time.Sleep(20 * time.Millisecond)
+		_, err := base.Append(t.Context(), "/view", []byte(`{"live":true}`), "")
+		appendDone <- err
+	}()
+	rec := serveSSE(t, handler, "/view?offset=now&snapshot=true&live=sse")
+	if err := <-appendDone; err != nil {
+		t.Fatalf("Append() live error = %v", err)
+	}
+
+	body := rec.Body.String()
+	snapshotAt := strings.Index(body, "snapshot-start")
+	liveAt := strings.Index(body, `{"live":true}`)
+	if snapshotAt < 0 || liveAt < 0 || snapshotAt >= liveAt {
+		t.Fatalf("SSE events are not snapshot then live data:\n%s", body)
+	}
+	controlAt := strings.Index(body[snapshotAt:], "event: control")
+	if controlAt < 0 || snapshotAt+controlAt >= liveAt {
+		t.Fatalf("snapshot control event does not precede live data:\n%s", body)
+	}
+	firstControl := sseControlPayload(t, body)
+	if got := firstControl["streamNextOffset"]; got != tail.String() {
+		t.Errorf("bootstrap control streamNextOffset = %v, want %q", got, tail)
+	}
+	if storage.calls != 1 {
+		t.Errorf("BootstrapRead calls = %d, want 1", storage.calls)
 	}
 }
 

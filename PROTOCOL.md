@@ -597,6 +597,12 @@ Where `{stream-url}` is the URL of the stream. Returns bytes starting from the s
 
 For non-live reads without data beyond the requested offset, servers **SHOULD** return `200 OK` with an empty body and `Stream-Next-Offset` equal to the requested offset. If the stream is closed, this response **MUST** also include `Stream-Closed: true` to signal EOF.
 
+#### Progress Without Data
+
+A catch-up response **MAY** contain zero messages while advancing `Stream-Next-Offset` strictly past the requested offset. This "progress without data" can occur when a server-side view filters source records or when a server bounds the amount of filtering or scanning performed by one request. For `application/json` streams, zero messages are represented by `[]`; for all other content types, they are represented by a zero-byte body.
+
+Clients **MUST** treat every response that lacks `Stream-Up-To-Date` as an instruction to continue reading from `Stream-Next-Offset`, regardless of whether the response body contains any messages. Within each response body, messages remain in source order, but their offsets **MAY** be sparse relative to the stream's offset space (Section 8).
+
 #### Response Headers (on 200)
 
 - `Cache-Control`: Derived from TTL/expiry (see Section 9)
@@ -648,7 +654,7 @@ Where `{stream-url}` is the URL of the stream. If no data is available at the sp
 
 #### Response Codes
 
-- `200 OK`: Data became available within the timeout
+- `200 OK`: Data became available, or the read made progress without data as described in Section 5.6
 - `204 No Content`: Timeout expired with no new data
 - `400 Bad Request`: Invalid parameters
 - `404 Not Found`: Stream does not exist
@@ -687,7 +693,9 @@ This ensures clients observing a closed stream do not have hanging connections w
 
 #### Response Body (on 200)
 
-- New bytes that arrived during the long-poll period.
+- New bytes that arrived during the long-poll period, or an empty body appropriate to the stream's content type when `Stream-Next-Offset` advanced without data.
+
+A long-poll **MAY** complete before its poll window ends with zero messages and a `Stream-Next-Offset` strictly greater than the requested offset. Clients apply the same rule as catch-up reads: if `Stream-Up-To-Date` is absent, they **MUST** continue from the returned offset even when the body is empty.
 
 #### Timeout Behavior
 
@@ -747,6 +755,7 @@ Data is emitted in [Server-Sent Events format](https://developer.mozilla.org/en-
   - Base64 encoding affects only `event: data` payloads. `event: control` events remain JSON as specified and are not encoded.
   - When the stream content type is `application/json`, implementations **MAY** batch multiple logical messages into a single SSE `data` event by streaming a JSON array across multiple `data:` lines, as in the example below.
 - `control`: Emitted after every data event
+  - **MAY** also be emitted without a preceding data event to report progress without data (Section 5.6). Clients **MUST** persist `streamNextOffset` from every control event, including these standalone control events.
   - **MUST** include `streamNextOffset`. See Section 10.1.
   - **MUST** include `streamCursor` when the stream is open. Servers **MAY** omit `streamCursor` when `streamClosed` is true (cursor is unnecessary when no reconnection is expected).
   - **MUST** include `upToDate: true` when the client is caught up with all available data. Note: `streamClosed: true` implies `upToDate: true` (a closed stream at the final offset is by definition up-to-date), so `upToDate` **MAY** be omitted when `streamClosed` is true.
@@ -1192,6 +1201,8 @@ Offsets are opaque tokens that identify positions within a stream. They are also
 4. **Unique**: Each offset identifies exactly one position in the stream. No two positions **MAY** share the same offset.
 5. **Strictly Increasing**: Offsets assigned to appended data **MUST** be lexicographically greater than all previously assigned offsets. Server implementations **MUST NOT** use schemes (such as raw UTC timestamps) that can produce duplicate or non-monotonic offsets. Time-based identifiers like ULIDs, which combine timestamps with random components to guarantee uniqueness and monotonicity, are acceptable.
 
+Read responses preserve source order, but the messages they contain **MAY** be sparse in this offset space. A server-side view can omit source messages and advance the returned cursor across their offsets as described in Section 5.6.
+
 **Format**: Offset tokens are opaque, case-sensitive strings. Their internal structure is implementation-defined. Offsets are single tokens and **MUST NOT** contain `,`, `&`, `=`, `?`, or `/` (to avoid conflict with URL query parameter syntax). Servers **SHOULD** use URL-safe characters to avoid encoding issues, but clients **MUST** properly URL-encode offset values when including them in query parameters. Servers **SHOULD** keep offsets reasonably short (under 256 characters) since they appear in every request URL.
 
 **Sentinel Values**: The protocol defines two special offset sentinel values:
@@ -1424,6 +1435,30 @@ Extensions **SHOULD** follow these principles:
 
 See Section 12.1 for authentication and authorization details. Implementations **MAY** extend the protocol with authentication-related query parameters or headers (e.g., API keys, OAuth tokens, custom authentication headers).
 
+### 11.3. Snapshot Bootstrap Read
+
+A server **MAY** designate a state-enabled virtual view as offering snapshot bootstrap. A client requests bootstrap with the `snapshot=true` query parameter on a catch-up or live read. This parameter is valid only when `offset` is omitted or is `now`, and **MAY** be combined with `live=sse` or `live=long-poll`. A server **MUST** reject `snapshot=true` with HTTP 400 when `offset` is a positional offset or the stream-start sentinel (`offset=-1`; Section 8), or when the stream does not offer snapshot bootstrap.
+
+Without `snapshot=true`, all reads retain the ordinary semantics defined in Sections 5.6 and 8. In particular, a read from the stream-start sentinel on a bootstrap-capable stream is an ordinary positional read that replays the full stream.
+
+The response **MUST** use `Content-Type: application/json` and contain a JSON array of messages from the Durable Streams State Protocol [STATE-PROTOCOL], in this exact order:
+
+1. One `snapshot-start` control message
+2. Zero or more change messages whose operation is `insert`
+3. One `snapshot-end` control message
+
+The server captures a source tail offset `T` while producing the snapshot. The `snapshot-end` message's `headers.offset` **MUST** equal `T`, and the response's `Stream-Next-Offset` **MUST** also equal `T`. The response **MUST** set `Cache-Control: no-store` and **MUST NOT** include an `ETag`. This response is dynamic bootstrap data, not immutable content at any stream position: the positional immutability and ordering rules apply to ordinary stream content from `T` onward, and the bootstrap messages **MUST NOT** reappear in a read from `T` or from any other positional offset.
+
+Clients **MUST** process the returned messages in response order and resume from `Stream-Next-Offset` as required by Section 8. A bootstrap is delivered at most once for each request containing `snapshot=true`. Repeating such a request can produce a new snapshot, but continuing from the returned `T` does not produce that bootstrap again.
+
+With `live=long-poll`, the first response **MUST** be the bootstrap response described above; it does not wait for later data. The client continues with a subsequent long-poll from the returned `Stream-Next-Offset` without `snapshot=true`.
+
+With `live=sse`, the server **MUST** deliver the bootstrap messages in one or more `data` events, followed by a `control` event whose `streamNextOffset` equals `T`. It then continues delivering live stream content from `T` on the same SSE connection. The bootstrap messages **MUST** precede any positional data from `T` onward.
+
+Snapshot bootstrap uses the Progress Without Data rules in Section 5.6 after the bootstrap response. In particular, a subsequent positional read from `T` can return zero messages while advancing `Stream-Next-Offset`, and a client **MUST** continue from that returned offset when `Stream-Up-To-Date` is absent.
+
+The bootstrap response **MUST** include `Stream-Up-To-Date: true` if and only if `T` equals the stream tail in the atomic read snapshot used to generate the response and no positional data remains to be read after `T` in that snapshot. It **MUST NOT** include `Stream-Up-To-Date` when the observed tail is later than `T` or any positional data after `T` remains unread. As with an ordinary catch-up response, `Stream-Up-To-Date: true` does not prevent later appends and does not indicate EOF; `Stream-Closed: true` is the only permanent EOF signal.
+
 ## 12. Security Considerations
 
 ### 12.1. Authentication and Authorization
@@ -1560,6 +1595,8 @@ This document requests registration of the following HTTP headers in the "Perman
 ### 14.2. Informative References
 
 [SSE] Hickson, I., "Server-Sent Events", W3C Recommendation, February 2015, <https://www.w3.org/TR/eventsource/>.
+
+[STATE-PROTOCOL] ElectricSQL, "The Durable Streams State Protocol", Version 1.0, 2025, <https://github.com/durable-streams/durable-streams/blob/main/packages/state/STATE-PROTOCOL.md>.
 
 ---
 

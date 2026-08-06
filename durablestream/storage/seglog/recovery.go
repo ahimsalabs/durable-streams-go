@@ -223,11 +223,12 @@ func (s *Storage) stateFromCheckpointEntry(streamID, dir string, m streamCheckpo
 			badStart || (i > 0 && sf.firstIndex != prevLast+1) {
 			return nil, fmt.Errorf("%w: sealed segment %s disagrees with checkpoint entry for %s", errCorrupt, ms.File, streamID)
 		}
+		sf.minTS = ms.MinTS
 		prevLast = sf.lastIndex
 		st.sealed = append(st.sealed, sf)
 	}
 	if m.Active != nil {
-		sf, err := openActiveSegment(filepath.Join(dir, m.Active.File), m.Active.File, inc, m.Active.PayloadEnd, m.Active.Count, m.Active.MaxTS)
+		sf, err := openActiveSegment(filepath.Join(dir, m.Active.File), m.Active.File, inc, m.Active.PayloadEnd, m.Active.Count, m.Active.MinTS, m.Active.MaxTS)
 		if err != nil {
 			return nil, fmt.Errorf("%w: %v", errCorrupt, err)
 		}
@@ -395,6 +396,10 @@ func (s *Storage) recoverPartition(p *partition, scan *recoveryScan) error {
 		p.nextTxnID = ckpt.NextTxnID
 		p.ckptState, _ = json.Marshal(ckpt.Streams)
 		p.materializedEntries = cloneCheckpointEntries(ckpt.Streams)
+		p.stats.initializeCheckpoint(WALPosition{
+			SegmentSeq: ckpt.Replay.SegmentSeq,
+			Offset:     ckpt.Replay.Offset,
+		})
 	}
 
 	seqs, err := listWALSegments(p.wal.dir)
@@ -533,6 +538,7 @@ func (s *Storage) recoverSegment(p *partition, scan *recoveryScan, seq uint64, l
 			if err := s.applyRecovered(p, scan, seq, frame); err != nil {
 				return err
 			}
+			p.stats.recoverWALFrame(frame.end-frame.start, frame.ts)
 			continue
 		}
 		switch {
@@ -560,7 +566,7 @@ func (s *Storage) recoverSegment(p *partition, scan *recoveryScan, seq uint64, l
 		}
 		p.wal.adopt(seq, f, scanner.off)
 	} else {
-		p.wal.segments[seq] = f
+		p.wal.installRecoveredSegment(seq, f, scanner.off)
 	}
 	keepOpen = true
 	return nil

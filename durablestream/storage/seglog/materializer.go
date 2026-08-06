@@ -2,6 +2,7 @@ package seglog
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -87,7 +88,9 @@ func (s *Storage) runMaterializer(p *partition) {
 		case <-ticker.C:
 			s.materializeRound(p)
 			if s.opts.RetentionInterval != -1 && time.Since(lastSweep) >= s.opts.RetentionInterval {
-				s.retentionSweep(p)
+				if err := s.retentionSweep(p); err != nil {
+					s.opts.SLogger.Error("seglog: retention sweep failed", "partition", p.id, "error", err)
+				}
 				lastSweep = time.Now()
 			}
 		}
@@ -95,22 +98,30 @@ func (s *Storage) runMaterializer(p *partition) {
 }
 
 func (s *Storage) materializeRound(p *partition) {
+	p.materializerMu.Lock()
+	defer p.materializerMu.Unlock()
+	if err := s.materializeRoundLocked(p); err != nil {
+		s.opts.SLogger.Error("seglog: materialization failed", "partition", p.id, "error", err)
+	}
+}
+
+func (s *Storage) materializeRoundLocked(p *partition) error {
 	if err := s.retryCleanup(p); err != nil {
-		s.opts.SLogger.Error("seglog: deferred segment cleanup failed", "partition", p.id, "error", err)
-		return
+		return fmt.Errorf("deferred segment cleanup: %w", err)
 	}
 	if p.pending != nil {
 		if err := s.finishMaterialization(p, p.pending, true); err != nil {
-			s.opts.SLogger.Error("seglog: pending materialization failed", "partition", p.id, "error", err)
+			return fmt.Errorf("pending materialization: %w", err)
 		}
-		return
+		return nil
 	}
 	barrier := p.submit(&request{op: opBarrier, captureDirty: true, done: make(chan result, 1)})
 	if barrier.err != nil {
-		return
+		return barrier.err
 	}
 	dirty, removals := barrier.dirty, barrier.removals
 	fail := func() {
+		p.stats.cancelMaterializationFrontier(barrier.frontier)
 		for st := range dirty {
 			p.markDirty(st)
 		}
@@ -124,24 +135,25 @@ func (s *Storage) materializeRound(p *partition) {
 		draft, err := s.materializeStream(p, st)
 		s.releaseDraftPins(draft)
 		if err != nil {
-			s.opts.SLogger.Error("seglog: materialization prepare failed", "stream", st.id, "error", err)
 			if draft != nil {
 				prepared[st] = draft
 			}
 			s.abortPrepared(p, prepared)
 			fail()
-			return
+			return fmt.Errorf("prepare stream %q: %w", st.id, err)
 		}
 		prepared[st] = draft
 	}
 	if barrier.walSeq == 0 {
 		s.abortPrepared(p, prepared)
-		return
+		p.stats.cancelMaterializationFrontier(barrier.frontier)
+		return nil
 	}
 	forceCheckpoint := s.opts.CheckpointInterval == -1 || time.Since(p.lastCheckpoint) >= s.opts.CheckpointInterval ||
 		barrier.walSeq > p.ckptSeq || len(removals) > 0 || batchHasVictims(prepared)
 	if len(prepared) == 0 && len(removals) == 0 && !forceCheckpoint {
-		return
+		p.stats.cancelMaterializationFrontier(barrier.frontier)
+		return nil
 	}
 	batch := &materializationBatch{barrier: barrier, prepared: prepared, removals: removals}
 	if len(prepared) == 0 && len(removals) == 0 {
@@ -151,8 +163,9 @@ func (s *Storage) materializeRound(p *partition) {
 	}
 	p.pending = batch
 	if err := s.finishMaterialization(p, batch, forceCheckpoint); err != nil {
-		s.opts.SLogger.Error("seglog: materialization commit failed", "partition", p.id, "error", err)
+		return fmt.Errorf("commit materialization: %w", err)
 	}
+	return nil
 }
 
 // finalMaterialize runs after admission is closed and the partition worker has
@@ -173,6 +186,7 @@ func (s *Storage) finalMaterialize(p *partition) error {
 		}
 	}
 	dirty, removals := p.swapDirty()
+	frontier := p.stats.captureMaterializationFrontier()
 	prepared := make(map[*streamState]*preparedStream, len(dirty))
 	for st := range dirty {
 		draft, err := s.materializeStream(p, st)
@@ -182,11 +196,12 @@ func (s *Storage) finalMaterialize(p *partition) error {
 				prepared[st] = draft
 			}
 			s.abortPrepared(p, prepared)
+			p.stats.cancelMaterializationFrontier(frontier)
 			return fmt.Errorf("prepare final stream %q: %w", st.id, err)
 		}
 		prepared[st] = draft
 	}
-	barrier := result{walSeq: p.publishedSeq, walOff: p.publishedOff, nextTxn: p.publishedNextTx}
+	barrier := result{walSeq: p.publishedSeq, walOff: p.publishedOff, nextTxn: p.publishedNextTx, frontier: frontier}
 	batch := &materializationBatch{
 		barrier:  barrier,
 		prepared: prepared,
@@ -226,6 +241,8 @@ func (s *Storage) finishMaterialization(p *partition, batch *materializationBatc
 		s.publishPrepared(draft)
 	}
 	p.materializedEntries = batch.entries
+	frontier := WALPosition{SegmentSeq: batch.barrier.walSeq, Offset: batch.barrier.walOff}
+	p.stats.advanceMaterializationFrontier(batch.barrier.frontier, frontier, checkpoint)
 	if !checkpoint {
 		for _, draft := range batch.prepared {
 			for path := range draft.touched {
@@ -723,7 +740,9 @@ func (s *Storage) unlinkPrepared(p *partition, draft *preparedStream) error {
 	dir := streamDir(s.dir, draft.st.id, draft.st.inc)
 	var first error
 	for _, sf := range draft.victims {
-		if err := s.fdCache.unlink(filepath.Join(dir, sf.name)); err != nil {
+		if err := s.fdCache.unlinkNotify(filepath.Join(dir, sf.name), func(bytes int64) {
+			draft.st.reclaimedBytes.Add(bytes)
+		}); err != nil {
 			path := filepath.Join(dir, sf.name)
 			p.cleanupPaths[path] = struct{}{}
 			if first == nil {
@@ -748,25 +767,41 @@ func buildCheckpointEntry(st *streamState, snap readSnapshot, sealed []*segmentF
 		e.Parent = &checkpointParent{StreamID: snap.parent.id, IncarnationID: snap.parent.inc.String(), Fork: *st.fork}
 	}
 	for _, sf := range sealed {
-		e.Sealed = append(e.Sealed, checkpointSegment{File: sf.name, FirstIndex: sf.firstIndex, LastIndex: sf.lastIndex, PayloadEnd: sf.payloadEnd, Count: sf.count, MaxTS: sf.maxTS})
+		e.Sealed = append(e.Sealed, checkpointSegment{File: sf.name, FirstIndex: sf.firstIndex, LastIndex: sf.lastIndex, PayloadEnd: sf.payloadEnd, Count: sf.count, MinTS: sf.minTS, MaxTS: sf.maxTS})
 	}
 	if active != nil {
-		e.Active = &checkpointActive{File: active.name, FirstIndex: active.firstIndex, PayloadEnd: active.payloadEnd, Count: active.count, MaxTS: active.maxTS}
+		e.Active = &checkpointActive{File: active.name, FirstIndex: active.firstIndex, PayloadEnd: active.payloadEnd, Count: active.count, MinTS: active.minTS, MaxTS: active.maxTS}
 	}
 	return e
 }
 
-func (s *Storage) retentionSweep(p *partition) {
+func (s *Storage) retentionSweep(p *partition) error {
+	p.materializerMu.Lock()
+	defer p.materializerMu.Unlock()
+	return s.retentionSweepLocked(context.Background(), p)
+}
+
+func (s *Storage) retentionSweepLocked(ctx context.Context, p *partition) error {
 	now := time.Now()
+	var errs []error
 	s.streams.Range(func(_ string, st *streamState) bool {
+		if err := ctx.Err(); err != nil {
+			errs = append(errs, err)
+			return false
+		}
 		if st.partition != p.id {
 			return true
 		}
 		if err := s.sweepStreamRetention(p, st, now); err != nil {
-			s.opts.SLogger.Error("seglog: retention sweep failed", "stream", st.id, "error", err)
+			errs = append(errs, fmt.Errorf("stream %q: %w", st.id, err))
+			return true
 		}
+		st.mu.Lock()
+		st.lastSweep = now
+		st.mu.Unlock()
 		return true
 	})
+	return errors.Join(errs...)
 }
 
 func (s *Storage) sweepStreamRetention(p *partition, st *streamState, now time.Time) error {
@@ -777,7 +812,9 @@ func (s *Storage) sweepStreamRetention(p *partition, st *streamState, now time.T
 	if s.opts.StreamSegmentAge != -1 && st.activeSeg != nil && st.activeSeg.lastIndex == snap.through && st.activeSeg.maxTS > 0 && now.Sub(time.Unix(0, st.activeSeg.maxTS)) > s.opts.StreamSegmentAge {
 		st.forceSeal = true
 		p.markDirty(st)
-		s.materializeRound(p)
+		if err := s.materializeRoundLocked(p); err != nil {
+			return err
+		}
 		snap = st.snapshot()
 	}
 	sealed, maxDrop := snap.sealed, len(snap.sealed)
@@ -820,8 +857,7 @@ func (s *Storage) sweepStreamRetention(p *partition, st *streamState, now time.T
 		return res.err
 	}
 	p.markDirty(st)
-	s.materializeRound(p)
-	return nil
+	return s.materializeRoundLocked(p)
 }
 
 func segmentPayloadBytes(sf *segmentFile) int64 {

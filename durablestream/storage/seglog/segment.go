@@ -62,6 +62,7 @@ type segmentFile struct {
 	lastIndex  int64
 	payloadEnd int64
 	count      int64
+	minTS      int64
 	maxTS      int64
 	sealed     bool
 }
@@ -95,7 +96,7 @@ func createActiveSegment(dir string, inc incarnation, firstIndex, createdUnixNan
 	return &segmentFile{name: name, path: path, indexPath: idxPath, firstIndex: firstIndex, lastIndex: firstIndex - 1, payloadEnd: segmentHeaderSize}, nil
 }
 
-func openActiveSegment(path, name string, inc incarnation, payloadEnd, count, maxTS int64) (*segmentFile, error) {
+func openActiveSegment(path, name string, inc incarnation, payloadEnd, count, minTS, maxTS int64) (*segmentFile, error) {
 	f, err := os.OpenFile(path, os.O_RDWR, 0)
 	if err != nil {
 		return nil, fmt.Errorf("seglog: open active segment: %w", err)
@@ -140,7 +141,7 @@ func openActiveSegment(path, name string, inc incarnation, payloadEnd, count, ma
 			return nil, err
 		}
 	}
-	return &segmentFile{name: name, path: path, indexPath: idxPath, firstIndex: first, lastIndex: first + count - 1, payloadEnd: payloadEnd, count: count, maxTS: maxTS}, nil
+	return &segmentFile{name: name, path: path, indexPath: idxPath, firstIndex: first, lastIndex: first + count - 1, payloadEnd: payloadEnd, count: count, minTS: minTS, maxTS: maxTS}, nil
 }
 
 func (sf *segmentFile) appendRecord(payloadFile, indexFile *os.File, rec segmentRecord, payload []byte) error {
@@ -159,6 +160,9 @@ func (sf *segmentFile) appendRecord(payloadFile, indexFile *os.File, rec segment
 		return err
 	}
 	sf.payloadEnd, sf.count, sf.lastIndex = end, sf.count+1, rec.index
+	if sf.count == 1 && sf.minTS == 0 {
+		sf.minTS = rec.ts
+	}
 	sf.maxTS = max(sf.maxTS, rec.ts)
 	return nil
 }

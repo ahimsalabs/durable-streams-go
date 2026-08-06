@@ -450,34 +450,62 @@ func (w *StreamWriter) Offset() Offset {
 	return w.offset
 }
 
+// ReaderOption configures a Reader.
+type ReaderOption func(*readerOptions)
+
+type readerOptions struct {
+	snapshotBootstrap bool
+}
+
+// WithSnapshotBootstrap requests a state snapshot before live reading when the
+// reader starts at offset "now". SSE mode receives the snapshot and subsequent
+// live data on one connection. Other modes receive one bootstrap response, then
+// continue in their configured live mode. The server must support snapshot
+// bootstrap for the stream. The option has no effect for other starting offsets.
+func WithSnapshotBootstrap() ReaderOption {
+	return func(opts *readerOptions) {
+		opts.snapshotBootstrap = true
+	}
+}
+
 // Reader creates a new Reader for continuous reading from a stream.
 // The Reader inherits the client's ReadMode for live tailing behavior.
 //
 // When offset is "now" and the read mode is LongPoll or Auto, the reader
 // skips catch-up and goes directly to long-poll mode. Per PROTOCOL.md Section 8:
 // "Servers MUST immediately begin waiting for new data (no initial empty response)"
+// [WithSnapshotBootstrap] overrides this transition with one snapshot response
+// before the reader enters its configured live mode.
 //
 // For SSE mode, the reader always uses SSE directly (no catch-up phase) because
-// SSE streams deliver both historical and live data via SSE events.
-func (c *Client) Reader(path string, offset Offset) *Reader {
+// SSE streams deliver both historical and live data, including a requested
+// snapshot bootstrap, on one connection.
+func (c *Client) Reader(path string, offset Offset, options ...ReaderOption) *Reader {
+	var opts readerOptions
+	for _, option := range options {
+		option(&opts)
+	}
+	bootstrap := opts.snapshotBootstrap && offset == Offset("now")
+
 	// Per protocol spec Section 8, for offset=now with long-poll:
 	// "Servers MUST immediately begin waiting for new data (no initial empty response)"
 	// Skip catch-up phase for long-poll compatible modes with offset=now
 	catching := true
-	if offset == Offset("now") && (c.readMode == ReadModeAuto || c.readMode == ReadModeLongPoll) {
+	if !bootstrap && offset == Offset("now") && (c.readMode == ReadModeAuto || c.readMode == ReadModeLongPoll) {
 		catching = false
 	}
-	// SSE mode delivers all data (historical and live) via SSE events
+	// SSE mode delivers all data (historical, bootstrap, and live) via SSE events.
 	if c.readMode == ReadModeSSE {
 		catching = false
 	}
 
 	return &Reader{
-		client:   c,
-		path:     path,
-		offset:   offset,
-		readMode: c.readMode,
-		catching: catching,
+		client:    c,
+		path:      path,
+		offset:    offset,
+		readMode:  c.readMode,
+		catching:  catching,
+		bootstrap: bootstrap,
 	}
 }
 

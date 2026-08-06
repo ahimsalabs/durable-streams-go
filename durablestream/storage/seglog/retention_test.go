@@ -89,6 +89,117 @@ func TestBytesRetention_TrimsWholeSegmentsAndPreservesTail(t *testing.T) {
 	}
 }
 
+func TestRetentionStatus_ProgressesFloorTimeAndReclaimedBytes(t *testing.T) {
+	opts := retentionOptions(t.TempDir())
+	opts.MaterializeInterval = -1
+	opts.RetentionInterval = -1
+	opts.CheckpointInterval = -1
+	s := openTest(t, opts)
+	if _, err := s.Create(t.Context(), "s", durablestream.StreamConfig{}); err != nil {
+		t.Fatal(err)
+	}
+	appendRetentionMessages(t, s, "s", 30)
+
+	initial, err := s.RetentionStatus(t.Context(), "s")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if initial.FloorOffset != "" || initial.FloorTime.IsZero() || initial.ReclaimedBytes != 0 || !initial.LastSweep.IsZero() {
+		t.Fatalf("initial status = %+v", initial)
+	}
+
+	if err := s.SetRetention(t.Context(), "s", Retention{MaxBytes: 1400}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SweepRetention(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	first, err := s.RetentionStatus(t.Context(), "s")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.FloorOffset == "" || !first.FloorTime.After(initial.FloorTime) || first.ReclaimedBytes <= 0 || first.LastSweep.IsZero() {
+		t.Fatalf("first retained status = %+v, initial = %+v", first, initial)
+	}
+
+	if err := s.SetRetention(t.Context(), "s", Retention{MaxBytes: 400}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SweepRetention(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	second, err := s.RetentionStatus(t.Context(), "s")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, firstFloor, _ := storage.ParseOffset(first.FloorOffset)
+	_, secondFloor, _ := storage.ParseOffset(second.FloorOffset)
+	if secondFloor <= firstFloor || !second.FloorTime.After(first.FloorTime) || second.ReclaimedBytes <= first.ReclaimedBytes || second.LastSweep.Before(first.LastSweep) {
+		t.Fatalf("second retained status = %+v, first = %+v", second, first)
+	}
+}
+
+func TestRetentionStatus_EmptyStream(t *testing.T) {
+	opts := retentionOptions(t.TempDir())
+	opts.MaterializeInterval = -1
+	opts.RetentionInterval = -1
+	s := openTest(t, opts)
+	if _, err := s.Create(t.Context(), "empty", durablestream.StreamConfig{}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SweepRetention(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	status, err := s.RetentionStatus(t.Context(), "empty")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if status.FloorOffset != "" || !status.FloorTime.IsZero() || status.ReclaimedBytes != 0 || status.LastSweep.IsZero() {
+		t.Fatalf("empty stream status = %+v", status)
+	}
+}
+
+func TestRetentionStatus_ReopenResetsProcessCounters(t *testing.T) {
+	dir := t.TempDir()
+	opts := retentionOptions(dir)
+	opts.MaterializeInterval = -1
+	opts.RetentionInterval = -1
+	opts.CheckpointInterval = -1
+	s := openTest(t, opts)
+	if _, err := s.Create(t.Context(), "s", durablestream.StreamConfig{}); err != nil {
+		t.Fatal(err)
+	}
+	appendRetentionMessages(t, s, "s", 30)
+	if err := s.SetRetention(t.Context(), "s", Retention{MaxBytes: 400}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SweepRetention(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	before, err := s.RetentionStatus(t.Context(), "s")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if before.FloorOffset == "" || before.FloorTime.IsZero() || before.ReclaimedBytes == 0 || before.LastSweep.IsZero() {
+		t.Fatalf("status before reopen = %+v", before)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	r := openTest(t, opts)
+	after, err := r.RetentionStatus(t.Context(), "s")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after.FloorOffset != before.FloorOffset || !after.FloorTime.Equal(before.FloorTime) {
+		t.Fatalf("durable status after reopen = %+v, before = %+v", after, before)
+	}
+	if after.ReclaimedBytes != 0 || !after.LastSweep.IsZero() {
+		t.Fatalf("process-lifetime status after reopen = %+v", after)
+	}
+}
+
 func TestAgeRetention_SealsIdleActiveAndTrimsOldPrefix(t *testing.T) {
 	dir := t.TempDir()
 	opts := retentionOptions(dir)

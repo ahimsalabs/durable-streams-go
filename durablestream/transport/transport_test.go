@@ -202,6 +202,30 @@ func TestHTTPTransport_Read(t *testing.T) {
 		}
 	})
 
+	t.Run("snapshot bootstrap", func(t *testing.T) {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if got := r.URL.Query().Get("offset"); got != "now" {
+				t.Errorf("offset = %q, want now", got)
+			}
+			if got := r.URL.Query().Get("snapshot"); got != "true" {
+				t.Errorf("snapshot = %q, want true", got)
+			}
+			w.Header().Set("Stream-Next-Offset", "0_0")
+			_, _ = w.Write([]byte(`[]`))
+		}))
+		defer server.Close()
+
+		tr := NewHTTPTransport(server.URL, nil)
+		_, err := tr.Read(t.Context(), ReadRequest{
+			Path:     "/test",
+			Offset:   "now",
+			Snapshot: true,
+		})
+		if err != nil {
+			t.Fatalf("Read() error = %v", err)
+		}
+	})
+
 	t.Run("not found error", func(t *testing.T) {
 		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			w.WriteHeader(http.StatusNotFound)

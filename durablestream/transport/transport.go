@@ -80,23 +80,26 @@ const (
 
 // ReadRequest is the request for a catch-up read (Section 5.6).
 type ReadRequest struct {
-	Path   string // Stream path (relative to base URL)
-	Offset string // Starting offset; empty means stream start (Section 8)
+	Path     string // Stream path (relative to base URL)
+	Offset   string // Starting offset; empty means stream start (Section 8)
+	Snapshot bool   // Request snapshot bootstrap; valid only with an empty or "now" offset
 }
 
 // LongPollRequest is the request for a long-poll read (Section 5.7).
 type LongPollRequest struct {
-	Path    string        // Stream path
-	Offset  string        // Starting offset (required for long-poll)
-	Cursor  string        // Echo of Stream-Cursor for CDN collapsing (Section 10.1)
-	Timeout time.Duration // Hint for server wait time
+	Path     string        // Stream path
+	Offset   string        // Starting offset; may be empty only with Snapshot
+	Cursor   string        // Echo of Stream-Cursor for CDN collapsing (Section 10.1)
+	Timeout  time.Duration // Hint for server wait time
+	Snapshot bool          // Return snapshot bootstrap as the first response
 }
 
 // SSERequest is the request to open an SSE stream (Section 5.8).
 type SSERequest struct {
-	Path   string // Stream path
-	Offset string // Starting offset (required for SSE)
-	Cursor string // Echo of Stream-Cursor when reconnecting (Section 10.1)
+	Path     string // Stream path
+	Offset   string // Starting offset; may be empty only with Snapshot
+	Cursor   string // Echo of Stream-Cursor when reconnecting (Section 10.1)
+	Snapshot bool   // Deliver snapshot bootstrap before live data
 }
 
 // ReadResponse is the response from Read or LongPoll operations.

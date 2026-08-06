@@ -64,6 +64,16 @@
 //	    dropped segments, and only then publishes, closes, unlinks, and syncs
 //	    the stream directory. Pin acquisition shares the physical trim gate.
 //
+// # Retention observability
+//
+// RetentionStatus reports the durable floor and the oldest retained record's
+// commit time. Its reclaimed-byte counter and last-sweep time are
+// process-lifetime values and reset when Storage is reopened. SweepRetention
+// runs materialization and retention synchronously for every partition. It
+// serializes with background materialization; it does not reset the background
+// sweep schedule. Active read pins can defer physical unlink and byte counting
+// until the pins are released.
+//
 // # On-disk layout
 //
 //	<dir>/seglog.lock                lock file (single-process fencing)

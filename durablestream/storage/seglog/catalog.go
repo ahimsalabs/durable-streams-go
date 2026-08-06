@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/cespare/xxhash/v2"
 
@@ -64,9 +65,15 @@ type streamState struct {
 	cfg         durablestream.StreamConfig
 	retention   Retention
 	floor       int64 // highest trimmed index; messages at or below it are gone
-	closed      bool  // permanent EOF (protocol closure, not Storage.Close)
-	deleted     bool  // this incarnation was deleted or displaced
+	lastSweep   time.Time
+	closed      bool // permanent EOF (protocol closure, not Storage.Close)
+	deleted     bool // this incarnation was deleted or displaced
 	softDeleted bool
+
+	// reclaimedBytes is process-lifetime observability. It is updated when a
+	// retention victim is physically unlinked, including after a read pin that
+	// deferred the unlink is released.
+	reclaimedBytes atomic.Int64
 
 	// Fork topology is immutable except for the bounded direct-child count.
 	// parent and fork are published under Storage.topologyMu before the state
@@ -157,19 +164,21 @@ type readSnapshot struct {
 	lastSeqOffset  durablestream.Offset
 	retention      Retention
 	floor          int64
+	lastSweep      time.Time
 	tail           int64
 	firstLive      int64
 	walTail        []walLoc // shared read-only prefix; never mutated in place
 
-	sealed     []*segmentFile // immutable once sealed
-	activeView segmentView
-	through    int64 // materializedThrough
+	sealed      []*segmentFile // immutable once sealed
+	activeView  segmentView
+	activeMinTS int64
+	through     int64 // materializedThrough
 }
 
 func (st *streamState) snapshot() readSnapshot {
 	st.mu.RLock()
 	defer st.mu.RUnlock()
-	return readSnapshot{
+	snap := readSnapshot{
 		inc:            st.inc,
 		cfg:            st.cfg,
 		closed:         st.closed,
@@ -181,6 +190,7 @@ func (st *streamState) snapshot() readSnapshot {
 		lastSeqOffset:  st.lastSeqOffset,
 		retention:      st.retention,
 		floor:          st.floor,
+		lastSweep:      st.lastSweep,
 		tail:           st.nextIndex - 1,
 		firstLive:      st.firstLive,
 		walTail:        st.walTail,
@@ -188,4 +198,8 @@ func (st *streamState) snapshot() readSnapshot {
 		activeView:     st.activeView,
 		through:        st.materializedThrough,
 	}
+	if st.activeSeg != nil {
+		snap.activeMinTS = st.activeSeg.minTS
+	}
+	return snap
 }

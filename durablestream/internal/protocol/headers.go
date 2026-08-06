@@ -67,9 +67,10 @@ const (
 
 // Query parameter names used in stream operations.
 const (
-	QueryOffset = "offset"
-	QueryLive   = "live"
-	QueryCursor = "cursor"
+	QueryOffset   = "offset"
+	QueryLive     = "live"
+	QueryCursor   = "cursor"
+	QuerySnapshot = "snapshot"
 )
 
 // Valid values for the "live" query parameter.
