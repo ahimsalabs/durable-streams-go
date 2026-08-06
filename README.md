@@ -163,7 +163,20 @@ func ExampleReader() {
 ```
 <!-- [/snippet:reader] -->
 
-## Development
+### Bulk import
+
+For a bulk import into an embedded Storage, use `AppendBatch`. One call
+writes many messages as one atomic batch, and group commit amortizes the
+flush cost across the batch.
+
+To make an import resumable, give each batch a `Stream-Seq` value that sorts
+upward (for example, a zero-padded record counter). After an interruption,
+read `Head(stream).LastSeq` and continue from the position after it. A batch
+whose seq does not sort after `LastSeq` is rejected with
+`SequenceConflictError`, so a retry of an already-applied batch cannot
+duplicate data. This also covers the case where the process died after the
+batch became durable but before it saw the confirmation. Without seq values,
+resume by comparing your source position against `Head(stream).NextOffset`.
 
 Run the complete Go validation suite with:
 
