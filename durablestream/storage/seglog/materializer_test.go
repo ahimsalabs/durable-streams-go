@@ -109,7 +109,7 @@ func TestSealingRollsSegmentsAndSurvivesReopen(t *testing.T) {
 	ctx := context.Background()
 	opts := singlePartitionOptions(dir)
 	opts.MaterializeInterval = 5 * time.Millisecond
-	opts.StreamSegmentBytes = 1024 // a few records per segment
+	opts.DefaultSegmentPolicy = SegmentPolicy{TargetBytes: 1024} // a few records per segment
 
 	s := openTest(t, opts)
 	if _, err := s.Create(ctx, "s", durablestream.StreamConfig{}); err != nil {
@@ -128,7 +128,7 @@ func TestSealingRollsSegmentsAndSurvivesReopen(t *testing.T) {
 	sealedCount := len(st.sealed)
 	st.mu.RUnlock()
 	if sealedCount == 0 {
-		t.Fatal("expected sealed segments after exceeding StreamSegmentBytes")
+		t.Fatal("expected sealed segments after exceeding segment target")
 	}
 
 	got := readAll(t, s, "s")

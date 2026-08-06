@@ -321,15 +321,13 @@ func New(opts Options) (_ *Storage, retErr error) {
 	}
 	for _, p := range s.parts {
 		s.workers.Go(p.run)
-		if opts.MaterializeMaxAge != -1 {
-			s.workers.Go(func() { s.runMaterializer(p) })
-		}
+		s.workers.Go(func() { s.runMaterializer(p) })
 	}
 	return s, nil
 }
 
 const (
-	formatVersionLine = "seglog-format-v3"
+	formatVersionLine = "seglog-format-v4"
 
 	// formatHashLine names the stream-routing hash. Both the partition count
 	// and the hash algorithm are persisted routing state (invariant I4): a
@@ -453,6 +451,10 @@ func (s *Storage) CreateWithMessages(ctx context.Context, streamID string, cfg d
 	if err := validateStreamID(streamID); err != nil {
 		return false, "", err
 	}
+	policy, err := s.resolveSegmentPolicy(streamID, cfg)
+	if err != nil {
+		return false, "", err
+	}
 	if err := s.validateBatch(streamID, messages, true, metaBoundForCreate(cfg.ContentType)); err != nil {
 		return false, "", err
 	}
@@ -468,10 +470,24 @@ func (s *Storage) CreateWithMessages(ctx context.Context, streamID string, cfg d
 		op:       opCreate,
 		streamID: streamID,
 		cfg:      cfg,
+		policy:   policy,
 		messages: messages,
 		done:     make(chan result, 1),
 	})
 	return res.created, res.offset, res.err
+}
+
+func (s *Storage) resolveSegmentPolicy(streamID string, cfg durablestream.StreamConfig) (SegmentPolicy, error) {
+	policy := s.opts.DefaultSegmentPolicy
+	if s.opts.SelectSegmentPolicy != nil {
+		if selected := s.opts.SelectSegmentPolicy(streamID, cfg); selected != nil {
+			policy = *selected
+		}
+	}
+	if policy.TargetBytes < 1 || policy.MaxOpenAge < 0 {
+		return SegmentPolicy{}, fmt.Errorf("seglog: invalid segment policy for stream %q: target bytes must be positive and maximum open age cannot be negative: %w", streamID, durablestream.ErrBadRequest)
+	}
+	return policy, nil
 }
 
 // Append implements durablestream.Storage.

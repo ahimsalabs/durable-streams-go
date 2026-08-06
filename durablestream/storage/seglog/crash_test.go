@@ -315,7 +315,7 @@ func TestCrashOrdering_TrimFrameCheckpointThenUnlink(t *testing.T) {
 		t.Run("after "+steps[prefix-1], func(t *testing.T) {
 			dir := t.TempDir()
 			opts := crashOptions(dir)
-			opts.StreamSegmentBytes = 300
+			opts.DefaultSegmentPolicy = SegmentPolicy{TargetBytes: 300}
 			s, err := New(opts)
 			if err != nil {
 				t.Fatal(err)

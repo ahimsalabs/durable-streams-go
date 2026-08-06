@@ -142,10 +142,16 @@ func sealSpanTestStream(t interface {
 ) {
 	t.Helper()
 	state, _ := s.streams.Load(id)
+	if err := s.materializeRoundResult(s.parts[0]); err != nil {
+		t.Fatal(err)
+	}
 	state.mu.Lock()
 	state.forceSeal = true
 	state.mu.Unlock()
-	s.materializeRound(s.parts[0])
+	s.parts[0].markDirty(state)
+	if err := s.materializeRoundResult(s.parts[0]); err != nil {
+		t.Fatal(err)
+	}
 	if len(state.snapshot().sealed) == 0 {
 		t.Fatal("stream did not seal")
 	}

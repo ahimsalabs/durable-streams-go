@@ -84,9 +84,9 @@ func resolveForkConfig(req durablestream.ForkRequest, source durablestream.Strea
 	return cfg, nil
 }
 
-func forkMatches(st *streamState, req durablestream.ForkRequest) bool {
+func forkMatches(st *streamState, req durablestream.ForkRequest, policy SegmentPolicy) bool {
 	m := st.fork
-	return m != nil && m.Request == requestForkMeta(req)
+	return m != nil && m.Request == requestForkMeta(req) && st.policy == policy
 }
 
 func requestForkMeta(req durablestream.ForkRequest) forkRequestMeta {
@@ -122,19 +122,32 @@ func (s *Storage) CreateFork(ctx context.Context, targetID string, req durablest
 	}
 
 	s.topologyMu.Lock()
-	defer s.topologyMu.Unlock()
 	if existing, ok := s.streams.Load(targetID); ok {
 		snap := existing.snapshot()
+		s.topologyMu.Unlock()
+		policy, err := s.resolveSegmentPolicy(targetID, snap.cfg)
+		if err != nil {
+			return false, nil, err
+		}
+		s.topologyMu.Lock()
+		current, currentOK := s.streams.Load(targetID)
+		if !currentOK || current != existing {
+			s.topologyMu.Unlock()
+			return false, nil, fmt.Errorf("seglog: fork target changed during policy selection: %w", durablestream.ErrConflict)
+		}
+		snap = existing.snapshot()
+		s.topologyMu.Unlock()
 		if snap.softDeleted {
 			return false, nil, fmt.Errorf("seglog: fork target is soft-deleted: %w", durablestream.ErrConflict)
 		}
-		if !snap.deleted && !snap.cfg.IsExpired() && forkMatches(existing, req) {
+		if !snap.deleted && !snap.cfg.IsExpired() && forkMatches(existing, req, policy) {
 			return false, infoFromSnapshot(snap), nil
 		}
 		return false, nil, fmt.Errorf("seglog: fork target exists: %w", durablestream.ErrConflict)
 	}
 	source, ok := s.streams.Load(req.SourceStreamID)
 	if !ok {
+		s.topologyMu.Unlock()
 		return false, nil, notFoundErr(req.SourceStreamID)
 	}
 	// Pin before taking the source snapshot or validating it. physicalMu is
@@ -142,10 +155,13 @@ func (s *Storage) CreateFork(ctx context.Context, targetID string, req durablest
 	source.physicalMu.Lock()
 	source.refCount.Add(1)
 	source.physicalMu.Unlock()
+	s.topologyMu.Unlock()
 	keepPin := false
 	defer func() {
 		if !keepPin {
+			s.topologyMu.Lock()
 			s.rollbackSourcePin(source)
+			s.topologyMu.Unlock()
 		}
 	}()
 	ss := source.snapshot()
@@ -159,6 +175,10 @@ func (s *Storage) CreateFork(ctx context.Context, targetID string, req durablest
 		return false, nil, fmt.Errorf("seglog: source incarnation changed: %w", durablestream.ErrConflict)
 	}
 	cfg, err := resolveForkConfig(req, ss.cfg, time.Now())
+	if err != nil {
+		return false, nil, err
+	}
+	policy, err := s.resolveSegmentPolicy(targetID, cfg)
 	if err != nil {
 		return false, nil, err
 	}
@@ -179,14 +199,44 @@ func (s *Storage) CreateFork(ctx context.Context, targetID string, req durablest
 	}
 	owned := append(prefixes[:len(prefixes):len(prefixes)], messages...)
 	meta := &forkMeta{Request: requestForkMeta(req), SourceID: req.SourceStreamID, SourceIncarnationID: ss.inc.String(), Boundary: boundary, PrefixCount: int64(len(prefixes))}
-	metaRaw, err := json.Marshal(forkFrameMeta{Create: createMeta{ContentType: cfg.ContentType, TTLNanos: int64(cfg.TTL), ExpiresAt: cfg.ExpiresAt, IsPrivate: cfg.IsPrivate, Closed: cfg.Closed, Retention: &retentionMeta{MaxBytes: s.opts.DefaultRetention.MaxBytes, MaxAgeNanos: int64(s.opts.DefaultRetention.MaxAge)}}, Fork: *meta})
+	metaRaw, err := json.Marshal(forkFrameMeta{Create: createMeta{ContentType: cfg.ContentType, TTLNanos: int64(cfg.TTL), ExpiresAt: cfg.ExpiresAt, IsPrivate: cfg.IsPrivate, Closed: cfg.Closed, Retention: &retentionMeta{MaxBytes: s.opts.DefaultRetention.MaxBytes, MaxAgeNanos: int64(s.opts.DefaultRetention.MaxAge)}, Policy: policyMeta(policy)}, Fork: *meta})
 	if err != nil {
 		return false, nil, fmt.Errorf("seglog: encode fork meta: %w", err)
 	}
 	if err := s.validateBatch(targetID, owned, true, len(metaRaw)); err != nil {
 		return false, nil, err
 	}
-	res := s.partitionFor(targetID).submit(&request{op: opFork, streamID: targetID, cfg: cfg, messages: owned, forkSource: source, forkMeta: meta, forkMetaRaw: metaRaw, forkBoundary: boundary, prefixCount: int64(len(prefixes)), done: make(chan result, 1)})
+	// Revalidate the topology after the callback and source reads. The pin keeps
+	// this exact source incarnation physically readable while the lock was free.
+	s.topologyMu.Lock()
+	currentSource, sourceOK := s.streams.Load(req.SourceStreamID)
+	currentTarget, targetExists := s.streams.Load(targetID)
+	if !sourceOK || currentSource != source || source.snapshot().inc != ss.inc {
+		s.topologyMu.Unlock()
+		return false, nil, fmt.Errorf("seglog: fork topology changed during policy selection: %w", durablestream.ErrConflict)
+	}
+	if targetExists {
+		targetSnap := currentTarget.snapshot()
+		s.topologyMu.Unlock()
+		retryPolicy, retryErr := s.resolveSegmentPolicy(targetID, targetSnap.cfg)
+		if retryErr != nil {
+			return false, nil, retryErr
+		}
+		s.topologyMu.Lock()
+		revalidated, ok := s.streams.Load(targetID)
+		if !ok || revalidated != currentTarget {
+			s.topologyMu.Unlock()
+			return false, nil, fmt.Errorf("seglog: fork target changed during retry policy selection: %w", durablestream.ErrConflict)
+		}
+		targetSnap = currentTarget.snapshot()
+		s.topologyMu.Unlock()
+		if !targetSnap.deleted && !targetSnap.softDeleted && !targetSnap.cfg.IsExpired() && forkMatches(currentTarget, req, retryPolicy) {
+			return false, infoFromSnapshot(targetSnap), nil
+		}
+		return false, nil, fmt.Errorf("seglog: fork target exists: %w", durablestream.ErrConflict)
+	}
+	res := s.partitionFor(targetID).submit(&request{op: opFork, streamID: targetID, cfg: cfg, policy: policy, messages: owned, forkSource: source, forkMeta: meta, forkMetaRaw: metaRaw, forkBoundary: boundary, prefixCount: int64(len(prefixes)), done: make(chan result, 1)})
+	s.topologyMu.Unlock()
 	if res.err != nil {
 		keepPin = res.ambiguous
 		return false, nil, res.err
@@ -249,6 +299,7 @@ func (p *partition) stageFork(op *stagedOp, req *request, ps *pendingStream, now
 		return frameSpec{}
 	}
 	st := newStreamState(req.streamID, inc, p.id, req.cfg)
+	st.policy = req.policy
 	st.closed, st.retention, st.parent, st.parentBoundary, st.fork = req.cfg.Closed, p.st.opts.DefaultRetention, req.forkSource, req.forkBoundary, req.forkMeta
 	st.floor, st.materializedThrough, st.firstLive = 0, req.forkBoundary, req.forkBoundary+1
 	st.nextIndex = req.forkBoundary + 1 + int64(len(req.messages))

@@ -14,19 +14,18 @@ import (
 
 func benchmarkOptions(dir string) Options {
 	return Options{
-		Dir:                 dir,
-		Partitions:          8,
-		MaxMessageSize:      1 << 20,
-		WALSegmentBytes:     64 << 20,
-		GroupLinger:         time.Microsecond,
-		GroupMaxBytes:       1 << 20,
-		QueueDepth:          4096,
-		SyncWrites:          SyncWritesEnabled,
-		MaterializeInterval: -1,
-		RetentionInterval:   -1,
-		StreamSegmentBytes:  8 << 20,
-		StreamSegmentAge:    -1,
-		FDCacheSize:         384,
+		Dir:                  dir,
+		Partitions:           8,
+		MaxMessageSize:       1 << 20,
+		WALSegmentBytes:      64 << 20,
+		GroupLinger:          time.Microsecond,
+		GroupMaxBytes:        1 << 20,
+		QueueDepth:           4096,
+		SyncWrites:           SyncWritesEnabled,
+		MaterializeInterval:  -1,
+		RetentionInterval:    -1,
+		DefaultSegmentPolicy: SegmentPolicy{TargetBytes: 8 << 20},
+		FDCacheSize:          384,
 	}
 }
 
@@ -240,7 +239,7 @@ func BenchmarkRetentionDuringWrites(b *testing.B) {
 	opts := benchmarkOptions(b.TempDir())
 	opts.MaterializeInterval = time.Millisecond
 	opts.RetentionInterval = time.Millisecond
-	opts.StreamSegmentBytes = 16 << 10
+	opts.DefaultSegmentPolicy.TargetBytes = 16 << 10
 	opts.DefaultRetention = Retention{MaxBytes: 64 << 10}
 	opts.GroupMaxBytes = 1
 	s := benchmarkOpen(b, opts)

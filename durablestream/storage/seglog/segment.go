@@ -37,13 +37,13 @@ func encodeSegmentHeader(inc incarnation, firstIndex, createdUnixNano int64) []b
 	return h
 }
 
-func decodeSegmentHeader(b []byte) (inc incarnation, firstIndex int64, err error) {
+func decodeSegmentHeader(b []byte) (inc incarnation, firstIndex, createdUnixNano int64, err error) {
 	if len(b) < segmentHeaderSize || binary.LittleEndian.Uint32(b[:4]) != segmentMagic ||
 		binary.LittleEndian.Uint16(b[4:6]) != segmentVersion || binary.LittleEndian.Uint32(b[40:44]) != crc32.Checksum(b[:40], crcTable) {
-		return inc, 0, errBadSegment
+		return inc, 0, 0, errBadSegment
 	}
 	copy(inc[:], b[8:24])
-	return inc, int64(binary.LittleEndian.Uint64(b[24:32])), nil
+	return inc, int64(binary.LittleEndian.Uint64(b[24:32])), int64(binary.LittleEndian.Uint64(b[32:40])), nil
 }
 
 type segmentRecord struct {
@@ -55,16 +55,17 @@ type segmentRecord struct {
 }
 
 type segmentFile struct {
-	name       string
-	path       string
-	indexPath  string
-	firstIndex int64
-	lastIndex  int64
-	payloadEnd int64
-	count      int64
-	minTS      int64
-	maxTS      int64
-	sealed     bool
+	name            string
+	path            string
+	indexPath       string
+	firstIndex      int64
+	lastIndex       int64
+	payloadEnd      int64
+	count           int64
+	minTS           int64
+	maxTS           int64
+	createdUnixNano int64
+	sealed          bool
 }
 
 func segmentFileName(firstIndex int64) string  { return fmt.Sprintf("seg-%016x.seg", firstIndex) }
@@ -93,7 +94,7 @@ func createActiveSegment(dir string, inc incarnation, firstIndex, createdUnixNan
 	}
 	_ = f.Close()
 	_ = idx.Close()
-	return &segmentFile{name: name, path: path, indexPath: idxPath, firstIndex: firstIndex, lastIndex: firstIndex - 1, payloadEnd: segmentHeaderSize}, nil
+	return &segmentFile{name: name, path: path, indexPath: idxPath, firstIndex: firstIndex, lastIndex: firstIndex - 1, payloadEnd: segmentHeaderSize, createdUnixNano: createdUnixNano}, nil
 }
 
 func openActiveSegment(path, name string, inc incarnation, payloadEnd, count, minTS, maxTS int64) (*segmentFile, error) {
@@ -106,8 +107,8 @@ func openActiveSegment(path, name string, inc incarnation, payloadEnd, count, mi
 	if _, err = f.ReadAt(h, 0); err != nil {
 		return nil, err
 	}
-	gotInc, first, err := decodeSegmentHeader(h)
-	if err != nil || gotInc != inc || payloadEnd < segmentHeaderSize || count < 0 {
+	gotInc, first, created, err := decodeSegmentHeader(h)
+	if err != nil || gotInc != inc || created <= 0 || payloadEnd < segmentHeaderSize || count < 0 {
 		return nil, fmt.Errorf("%w: active segment %s header", errBadSegment, name)
 	}
 	idxPath := filepath.Join(filepath.Dir(path), segmentIndexName(first))
@@ -141,7 +142,7 @@ func openActiveSegment(path, name string, inc incarnation, payloadEnd, count, mi
 			return nil, err
 		}
 	}
-	return &segmentFile{name: name, path: path, indexPath: idxPath, firstIndex: first, lastIndex: first + count - 1, payloadEnd: payloadEnd, count: count, minTS: minTS, maxTS: maxTS}, nil
+	return &segmentFile{name: name, path: path, indexPath: idxPath, firstIndex: first, lastIndex: first + count - 1, payloadEnd: payloadEnd, count: count, minTS: minTS, maxTS: maxTS, createdUnixNano: created}, nil
 }
 
 func (sf *segmentFile) appendRecord(payloadFile, indexFile *os.File, rec segmentRecord, payload []byte) error {
@@ -212,7 +213,7 @@ func openSealedSegment(path, name string, inc incarnation) (*segmentFile, error)
 	if _, err = f.ReadAt(h, 0); err != nil {
 		return nil, err
 	}
-	gotInc, first, err := decodeSegmentHeader(h)
+	gotInc, first, created, err := decodeSegmentHeader(h)
 	if err != nil || gotInc != inc {
 		return nil, errBadSegment
 	}
@@ -238,7 +239,7 @@ func openSealedSegment(path, name string, inc incarnation) (*segmentFile, error)
 	if binary.LittleEndian.Uint32(footer[48:52]) != crc32.Checksum(index, crcTable) {
 		return nil, errBadSegment
 	}
-	return &segmentFile{name: name, path: path, firstIndex: first, lastIndex: last, payloadEnd: payloadEnd, count: count, maxTS: int64(binary.LittleEndian.Uint64(footer[40:48])), sealed: true}, nil
+	return &segmentFile{name: name, path: path, firstIndex: first, lastIndex: last, payloadEnd: payloadEnd, count: count, maxTS: int64(binary.LittleEndian.Uint64(footer[40:48])), createdUnixNano: created, sealed: true}, nil
 }
 
 type segmentView struct {

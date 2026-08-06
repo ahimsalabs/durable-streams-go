@@ -65,7 +65,7 @@ func FuzzDecodeFrame(f *testing.F) {
 	f.Fuzz(func(t *testing.T, data []byte) {
 		// These decoders must reject short or malformed input rather than panic.
 		_, _ = decodeWALSegmentHeader(data)
-		_, _, _ = decodeSegmentHeader(data)
+		_, _, _, _ = decodeSegmentHeader(data)
 
 		scanner := newFrameScanner(bytes.NewReader(data), int64(len(data)))
 		maxFrames := 0

@@ -18,8 +18,7 @@ func retentionOptions(dir string) Options {
 	opts := singlePartitionOptions(dir)
 	opts.MaterializeInterval = 5 * time.Millisecond
 	opts.RetentionInterval = 5 * time.Millisecond
-	opts.StreamSegmentBytes = 400
-	opts.StreamSegmentAge = -1
+	opts.DefaultSegmentPolicy = SegmentPolicy{TargetBytes: 400}
 	return opts
 }
 
@@ -203,8 +202,7 @@ func TestRetentionStatus_ReopenResetsProcessCounters(t *testing.T) {
 func TestAgeRetention_SealsIdleActiveAndTrimsOldPrefix(t *testing.T) {
 	dir := t.TempDir()
 	opts := retentionOptions(dir)
-	opts.StreamSegmentBytes = 512
-	opts.StreamSegmentAge = 50 * time.Millisecond
+	opts.DefaultSegmentPolicy = SegmentPolicy{TargetBytes: 512, MaxOpenAge: 50 * time.Millisecond}
 	s := openTest(t, opts)
 	if _, err := s.Create(context.Background(), "s", durablestream.StreamConfig{}); err != nil {
 		t.Fatal(err)
@@ -376,7 +374,9 @@ func TestTrimReplay_IsIdempotentWhenCheckpointIncludesTrim(t *testing.T) {
 	if err := s.SetRetention(context.Background(), "s", Retention{MaxBytes: 300}); err != nil {
 		t.Fatal(err)
 	}
-	s.retentionSweep(s.parts[0])
+	if err := s.retentionSweep(s.parts[0]); err != nil {
+		t.Fatal(err)
+	}
 	floor := streamFloor(s, "s")
 	if floor == 0 {
 		t.Fatal("manual retention sweep did not trim")
@@ -399,7 +399,7 @@ func TestMaterialization_CompletesReplayedTrimWhenSweepsDisabled(t *testing.T) {
 	opts.MaterializeInterval = -1
 	opts.RetentionInterval = -1
 	opts.WALSegmentBytes = 8192
-	opts.StreamSegmentBytes = 1500
+	opts.DefaultSegmentPolicy = SegmentPolicy{TargetBytes: 1500}
 	s := openTest(t, opts)
 	if _, err := s.Create(context.Background(), "s", durablestream.StreamConfig{}); err != nil {
 		t.Fatal(err)

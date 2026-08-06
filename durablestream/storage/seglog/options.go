@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"log/slog"
 	"time"
+
+	"github.com/ahimsalabs/durable-streams-go/durablestream"
 )
 
 // Defaults for Options fields left at their zero values.
@@ -27,11 +29,11 @@ const (
 	DefaultMaterializeInterval = DefaultMaterializeMaxAge
 	DefaultCheckpointInterval  = DefaultCheckpointMaxAge
 	DefaultRetentionInterval   = 30 * time.Second
-	DefaultStreamSegmentBytes  = 128 << 20
+	DefaultSegmentTargetBytes  = 128 << 20
 	// One hour avoids surprising segment churn for low-traffic streams while
 	// still giving age retention a bounded opportunity to seal an idle tail.
-	DefaultStreamSegmentAge = time.Hour
-	DefaultFDCacheSize      = 384
+	DefaultSegmentMaxOpenAge = time.Hour
+	DefaultFDCacheSize       = 384
 )
 
 // Retention limits the history retained for one stream. Zero values mean
@@ -40,6 +42,18 @@ type Retention struct {
 	MaxBytes int64
 	MaxAge   time.Duration
 }
+
+// SegmentPolicy is the immutable rollover policy stored with each stream.
+// TargetBytes counts payload bytes only. MaxOpenAge is wall-clock time from
+// creation of a non-empty active segment. Zero MaxOpenAge disables age rollover.
+type SegmentPolicy struct {
+	TargetBytes int64
+	MaxOpenAge  time.Duration
+}
+
+// SegmentPolicySelector can override the default policy at stream creation.
+// Returning nil selects Options.DefaultSegmentPolicy. Recovery never calls it.
+type SegmentPolicySelector func(streamID string, config durablestream.StreamConfig) *SegmentPolicy
 
 // SyncWrites selects whether acknowledged writes are fdatasync'd.
 //
@@ -118,7 +132,8 @@ type Options struct {
 	// MaterializeBytes and MaterializeMaxAge bound the unmaterialized WAL
 	// frontier. A partition materializes when either limit is reached. Their
 	// zero values select DefaultMaterializeBytes and DefaultMaterializeMaxAge.
-	// MaterializeMaxAge -1 disables the background materializer.
+	// MaterializeMaxAge -1 disables these process-level triggers. The scheduler
+	// still enforces persisted per-stream maximum open ages.
 	MaterializeBytes  int64
 	MaterializeMaxAge time.Duration
 
@@ -145,13 +160,12 @@ type Options struct {
 	// retention sweeps.
 	RetentionInterval time.Duration
 
-	// StreamSegmentBytes is the size at which a stream's active segment is
-	// sealed and a new one started.
-	StreamSegmentBytes int64
+	// DefaultSegmentPolicy is copied to each stream when it is created.
+	DefaultSegmentPolicy SegmentPolicy
 
-	// StreamSegmentAge seals a non-empty, idle active segment after this age
-	// so age retention can eventually remove it. -1 disables age sealing.
-	StreamSegmentAge time.Duration
+	// SelectSegmentPolicy optionally overrides the default for a create or
+	// fork target. The resolved value is persisted with that target.
+	SelectSegmentPolicy SegmentPolicySelector
 
 	// FDCacheSize bounds cached stream segment and sidecar descriptors. In-use
 	// descriptors may temporarily exceed this bound until their pins release.
@@ -206,11 +220,8 @@ func (o Options) withDefaults() Options {
 	if o.RetentionInterval == 0 {
 		o.RetentionInterval = DefaultRetentionInterval
 	}
-	if o.StreamSegmentBytes == 0 {
-		o.StreamSegmentBytes = DefaultStreamSegmentBytes
-	}
-	if o.StreamSegmentAge == 0 {
-		o.StreamSegmentAge = DefaultStreamSegmentAge
+	if o.DefaultSegmentPolicy == (SegmentPolicy{}) {
+		o.DefaultSegmentPolicy = SegmentPolicy{TargetBytes: DefaultSegmentTargetBytes, MaxOpenAge: DefaultSegmentMaxOpenAge}
 	}
 	if o.FDCacheSize == 0 {
 		o.FDCacheSize = DefaultFDCacheSize
@@ -270,12 +281,12 @@ func (o Options) validate() error {
 	if o.DefaultRetention.MaxAge < 0 {
 		errs = append(errs, fmt.Errorf("option DefaultRetention.MaxAge cannot be negative, got %v", o.DefaultRetention.MaxAge))
 	}
-	if o.StreamSegmentBytes < segmentHeaderSize+1 {
-		errs = append(errs, fmt.Errorf("option StreamSegmentBytes %d is below the minimum %d",
-			o.StreamSegmentBytes, segmentHeaderSize+1))
+	if o.DefaultSegmentPolicy.TargetBytes < 1 {
+		errs = append(errs, fmt.Errorf("option DefaultSegmentPolicy.TargetBytes must be positive, got %d",
+			o.DefaultSegmentPolicy.TargetBytes))
 	}
-	if o.StreamSegmentAge < 0 && o.StreamSegmentAge != -1 {
-		errs = append(errs, fmt.Errorf("option StreamSegmentAge must be positive or -1, got %v", o.StreamSegmentAge))
+	if o.DefaultSegmentPolicy.MaxOpenAge < 0 {
+		errs = append(errs, fmt.Errorf("option DefaultSegmentPolicy.MaxOpenAge cannot be negative, got %v", o.DefaultSegmentPolicy.MaxOpenAge))
 	}
 	if o.FDCacheSize < 1 {
 		errs = append(errs, fmt.Errorf("option FDCacheSize must be positive, got %d", o.FDCacheSize))

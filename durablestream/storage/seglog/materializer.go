@@ -2,6 +2,7 @@ package seglog
 
 import (
 	"bytes"
+	"container/heap"
 	"context"
 	"encoding/json"
 	"errors"
@@ -25,7 +26,7 @@ type checkpoint struct {
 }
 
 const (
-	checkpointFormatVersion = 2
+	checkpointFormatVersion = 3
 	checkpointFileName      = "checkpoint.json"
 )
 
@@ -86,6 +87,7 @@ func (s *Storage) runMaterializer(p *partition) {
 	var retryAfter time.Time
 	for {
 		now = time.Now()
+		ageDeadline, ageDue := s.segmentAgeDeadline(p, now)
 		// Check before waiting so continuous publication wakeups cannot starve
 		// retention work by repeatedly winning the select.
 		if s.opts.RetentionInterval != -1 && now.Sub(lastSweep) >= s.opts.RetentionInterval {
@@ -96,22 +98,25 @@ func (s *Storage) runMaterializer(p *partition) {
 			now = lastSweep
 		}
 		unmaterialized, oldestAge, uncheckpointed := p.stats.frontierPressure(now)
-		materializeDue := unmaterialized >= s.opts.MaterializeBytes ||
-			(unmaterialized > 0 && oldestAge >= s.opts.MaterializeMaxAge)
-		checkpointDue := uncheckpointed >= s.opts.CheckpointBytes ||
+		pending, maintenance, uncheckpointedSince := p.materializerScheduleState()
+		backgroundMaterialization := s.opts.MaterializeMaxAge != -1
+		materializeDue := backgroundMaterialization && (unmaterialized >= s.opts.MaterializeBytes ||
+			(unmaterialized > 0 && s.opts.MaterializeMaxAge != -1 && oldestAge >= s.opts.MaterializeMaxAge))
+		checkpointDue := backgroundMaterialization && (uncheckpointed >= s.opts.CheckpointBytes ||
 			(uncheckpointed > 0 && (s.opts.CheckpointMaxAge == -1 ||
-				(!p.uncheckpointedSince.IsZero() && now.Sub(p.uncheckpointedSince) >= s.opts.CheckpointMaxAge)))
-		maintenanceDue := p.hasRemovals() || len(p.cleanupPaths) > 0 || len(p.cleanupDirs) > 0 || p.walReclaimBefore > 0
-		workDue := materializeDue || checkpointDue || p.pending != nil || maintenanceDue
+				(!uncheckpointedSince.IsZero() && now.Sub(uncheckpointedSince) >= s.opts.CheckpointMaxAge))))
+		maintenanceDue := backgroundMaterialization && maintenance
+		workDue := materializeDue || checkpointDue || ageDue || pending || maintenanceDue
 		if workDue && !now.Before(retryAfter) {
-			s.materializeRound(p)
+			roundErr := s.materializeRoundResult(p)
 			// Back off only when due work remains after an attempt. Successful
 			// progress can immediately expose another batched frontier.
 			unmaterialized, oldestAge, uncheckpointed = p.stats.frontierPressure(time.Now())
-			stillDue := unmaterialized >= s.opts.MaterializeBytes ||
-				(unmaterialized > 0 && oldestAge >= s.opts.MaterializeMaxAge) ||
-				uncheckpointed >= s.opts.CheckpointBytes || p.pending != nil || p.hasRemovals() ||
-				len(p.cleanupPaths) > 0 || len(p.cleanupDirs) > 0 || p.walReclaimBefore > 0
+			pending, maintenance, _ = p.materializerScheduleState()
+			_, _ = s.segmentAgeDeadline(p, time.Now())
+			stillDue := roundErr != nil || backgroundMaterialization && (unmaterialized >= s.opts.MaterializeBytes ||
+				(unmaterialized > 0 && s.opts.MaterializeMaxAge != -1 && oldestAge >= s.opts.MaterializeMaxAge) ||
+				uncheckpointed >= s.opts.CheckpointBytes || pending || maintenance)
 			if stillDue {
 				retryAfter = time.Now().Add(100 * time.Millisecond)
 			} else {
@@ -121,11 +126,14 @@ func (s *Storage) runMaterializer(p *partition) {
 		}
 
 		deadline := time.Time{}
-		if unmaterialized > 0 {
+		if unmaterialized > 0 && s.opts.MaterializeMaxAge != -1 {
 			deadline = now.Add(s.opts.MaterializeMaxAge - oldestAge)
 		}
-		if uncheckpointed > 0 && s.opts.CheckpointMaxAge != -1 {
-			deadline = earlier(deadline, p.uncheckpointedSince.Add(s.opts.CheckpointMaxAge))
+		if !ageDeadline.IsZero() {
+			deadline = earlier(deadline, ageDeadline)
+		}
+		if backgroundMaterialization && uncheckpointed > 0 && s.opts.CheckpointMaxAge != -1 {
+			deadline = earlier(deadline, uncheckpointedSince.Add(s.opts.CheckpointMaxAge))
 		}
 		if s.opts.RetentionInterval != -1 {
 			deadline = earlier(deadline, lastSweep.Add(s.opts.RetentionInterval))
@@ -151,6 +159,56 @@ func (s *Storage) runMaterializer(p *partition) {
 	}
 }
 
+func (p *partition) materializerScheduleState() (pending, maintenance bool, uncheckpointedSince time.Time) {
+	p.materializerMu.Lock()
+	pending = p.pending != nil
+	maintenance = p.hasRemovals() || len(p.cleanupPaths) > 0 || len(p.cleanupDirs) > 0 || p.walReclaimBefore > 0
+	uncheckpointedSince = p.uncheckpointedSince
+	p.materializerMu.Unlock()
+	return pending, maintenance, uncheckpointedSince
+}
+
+// segmentAgeDeadline examines only the earliest registered generation. Stale
+// entries are removed lazily. A due valid entry stays in the heap until
+// publication replaces or removes that active generation, including on error.
+func (s *Storage) segmentAgeDeadline(p *partition, now time.Time) (time.Time, bool) {
+	for {
+		p.ageMu.Lock()
+		if len(p.ageDeadlines) == 0 {
+			p.ageMu.Unlock()
+			return time.Time{}, false
+		}
+		entry := p.ageDeadlines[0]
+		st := entry.st
+		st.mu.Lock()
+		valid := !st.deleted && st.policy.MaxOpenAge > 0 && st.activeSeg != nil &&
+			st.activeSeg.count > 0 && st.activeSeg.createdUnixNano == entry.createdUnixNano &&
+			p.ageEntries[st] == entry
+		if !valid {
+			st.mu.Unlock()
+			heap.Pop(&p.ageDeadlines)
+			if p.ageEntries[st] == entry {
+				delete(p.ageEntries, st)
+			}
+			p.ageMu.Unlock()
+			continue
+		}
+		if entry.deadline.After(now) {
+			st.mu.Unlock()
+			p.ageMu.Unlock()
+			return entry.deadline, false
+		}
+		markDirty := !st.forceSeal
+		st.forceSeal = true
+		st.mu.Unlock()
+		p.ageMu.Unlock()
+		if markDirty {
+			p.markDirty(st)
+		}
+		return entry.deadline, true
+	}
+}
+
 func earlier(a, b time.Time) time.Time {
 	if a.IsZero() || b.Before(a) {
 		return b
@@ -159,11 +217,17 @@ func earlier(a, b time.Time) time.Time {
 }
 
 func (s *Storage) materializeRound(p *partition) {
+	_ = s.materializeRoundResult(p)
+}
+
+func (s *Storage) materializeRoundResult(p *partition) error {
 	p.materializerMu.Lock()
 	defer p.materializerMu.Unlock()
-	if err := s.materializeRoundLocked(p); err != nil {
+	err := s.materializeRoundLocked(p)
+	if err != nil {
 		s.opts.SLogger.Error("seglog: materialization failed", "partition", p.id, "error", err)
 	}
+	return err
 }
 
 func (s *Storage) materializeRoundLocked(p *partition) error {
@@ -696,7 +760,7 @@ func (s *Storage) materializeStream(p *partition, st *streamState) (*preparedStr
 		if err != nil {
 			return draft, fmt.Errorf("read WAL payload for %s index %d: %w", st.id, idx, err)
 		}
-		if draft.active != nil && draft.active.payloadEnd >= s.opts.StreamSegmentBytes {
+		if draft.active != nil && draft.active.payloadEnd-segmentHeaderSize >= snap.policy.TargetBytes {
 			payloadPin, indexPin, err := s.pinDraftActive(draft)
 			if err != nil {
 				return draft, err
@@ -740,7 +804,8 @@ func (s *Storage) materializeStream(p *partition, st *streamState) (*preparedStr
 		draft.touched[draft.active.path] = struct{}{}
 		draft.touched[draft.active.indexPath] = struct{}{}
 	}
-	if st.forceSeal && draft.active != nil && draft.active.lastIndex >= draft.active.firstIndex {
+	if snap.forceSeal && draft.active != nil && draft.active.createdUnixNano == snap.activeCreated &&
+		draft.active.lastIndex >= draft.active.firstIndex {
 		payloadPin, indexPin, err := s.pinDraftActive(draft)
 		if err != nil {
 			return draft, err
@@ -811,6 +876,11 @@ func (s *Storage) publishPrepared(draft *preparedStream) {
 		st.walTail, st.firstLive = st.walTail[k:], draft.through+1
 	}
 	st.mu.Unlock()
+	created, count := int64(0), int64(0)
+	if draft.active != nil {
+		created, count = draft.active.createdUnixNano, draft.active.count
+	}
+	s.parts[st.partition].registerActiveDeadline(st, created, draft.snap.policy.MaxOpenAge, count > 0)
 	if draft.snap.floor > 0 && len(draft.snap.walTail) > 0 {
 		s.parts[st.partition].markDirty(st)
 	}
@@ -845,7 +915,7 @@ func (s *Storage) unlinkPrepared(p *partition, draft *preparedStream) error {
 }
 
 func buildCheckpointEntry(st *streamState, snap readSnapshot, sealed []*segmentFile, active *segmentFile, through int64) streamCheckpointEntry {
-	e := streamCheckpointEntry{IncarnationID: snap.inc.String(), ContentType: snap.cfg.ContentType, TTLNanos: int64(snap.cfg.TTL), ExpiresAt: snap.cfg.ExpiresAt, IsPrivate: snap.cfg.IsPrivate, Closed: snap.closed, LastSeq: snap.lastSeq, LastSeqOffset: snap.lastSeqOffset, Retention: retentionCheckpointEntry(snap.retention), FloorIndex: snap.floor, SoftDeleted: snap.softDeleted, MaterializedThrough: through}
+	e := streamCheckpointEntry{IncarnationID: snap.inc.String(), ContentType: snap.cfg.ContentType, TTLNanos: int64(snap.cfg.TTL), ExpiresAt: snap.cfg.ExpiresAt, IsPrivate: snap.cfg.IsPrivate, Closed: snap.closed, LastSeq: snap.lastSeq, LastSeqOffset: snap.lastSeqOffset, Retention: retentionCheckpointEntry(snap.retention), SegmentPolicy: *policyMeta(snap.policy), FloorIndex: snap.floor, SoftDeleted: snap.softDeleted, MaterializedThrough: through}
 	if snap.parent != nil {
 		e.Parent = &checkpointParent{StreamID: snap.parent.id, IncarnationID: snap.parent.inc.String(), Fork: *st.fork}
 	}
@@ -891,14 +961,6 @@ func (s *Storage) sweepStreamRetention(p *partition, st *streamState, now time.T
 	snap := st.snapshot()
 	if snap.deleted || snap.cfg.IsExpired() {
 		return nil
-	}
-	if s.opts.StreamSegmentAge != -1 && st.activeSeg != nil && st.activeSeg.lastIndex == snap.through && st.activeSeg.maxTS > 0 && now.Sub(time.Unix(0, st.activeSeg.maxTS)) > s.opts.StreamSegmentAge {
-		st.forceSeal = true
-		p.markDirty(st)
-		if err := s.materializeRoundLocked(p); err != nil {
-			return err
-		}
-		snap = st.snapshot()
 	}
 	sealed, maxDrop := snap.sealed, len(snap.sealed)
 	if snap.activeView.path == "" && len(snap.walTail) == 0 && maxDrop > 0 {

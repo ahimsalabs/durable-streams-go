@@ -83,13 +83,29 @@ therefore does not consume 256 MiB only because it has an active WAL segment.
 The engine creates WAL segments lazily, so an unused partition has no active
 segment.
 
-Each stream has a sequence of **stream segments**. The default rollover target
-is 128 MiB. This target applies to the current payload offset, which includes a
-64-byte header. The materializer tests the size before it copies the next
-message. Therefore, the message that crosses the target stays in the old
-segment. With the default 10 MiB maximum message size, the payload area can be
-almost 10 MiB above the target. The sealed file also contains a 16-byte index
-entry for each message and a 56-byte footer.
+Each stream has a sequence of **stream segments**. Its persisted segment policy
+has a payload target and a maximum open age. The default payload target is 128
+MiB. Header, index, and footer bytes do not count toward this target. The
+materializer tests the payload size before it copies the next message. It never
+splits a message. Thus, the message that crosses the target stays in the old
+segment, and at most that one message can take the payload area above the
+target. A message larger than the target gets a segment of its own when a later
+message arrives.
+
+The engine resolves the policy once when it creates a stream and writes the
+resolved value to the create WAL frame. A selector can choose different values
+for different stream names or configurations. For example, an application can
+use 128 MiB and one hour for RAW streams, but 8 MiB and five minutes for META
+streams. A fork target is a new stream: the selector resolves its policy from
+the target name and configuration, not from its parent. A retry is idempotent
+only when its newly resolved policy equals the stored policy.
+
+Checkpoints contain the same policy for every live stream. Recovery requires a
+valid policy in either the checkpoint or the create or fork WAL metadata. It
+does not use the current default or call the current selector. Changing process
+options therefore affects only later creations. This schema change uses root
+format `seglog-format-v4` and checkpoint format 3. WAL and stream-segment
+envelopes keep their versions because their binary layouts did not change.
 
 These values are configuration options. They are defaults, not protocol
 limits:
@@ -197,9 +213,11 @@ copying the payload through user-space memory. The materializer removes the old
 `.idx` sidecar only after a durable checkpoint names the sealed `.seg` file.
 
 Size is not the only seal condition. By default, the engine also seals a
-non-empty active segment after one hour without a newer message. This gives age
-retention a whole immutable segment that it can eventually remove. Applications
-can disable this age rule or configure a different duration.
+non-empty active segment one hour after the creation time in its segment
+header. This is wall-clock open age, not idle age: continuous writes do not
+restart it, and restart preserves it. The adaptive materializer schedules the
+nearest deadline, so this works without retention and without polling every
+stream at a fixed interval. A zero maximum open age disables age rollover.
 
 ### A checkpoint is a durable recovery statement
 

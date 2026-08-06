@@ -125,11 +125,11 @@ type serverConfig struct {
 
 func parseFlags(args []string) (serverConfig, error) {
 	cfg := serverConfig{seglog: seglog.Options{
-		Partitions:          seglog.DefaultPartitions,
-		WALSegmentBytes:     seglog.DefaultWALSegmentBytes,
-		StreamSegmentBytes:  seglog.DefaultStreamSegmentBytes,
-		MaterializeInterval: seglog.DefaultMaterializeInterval,
-		CheckpointInterval:  seglog.DefaultCheckpointInterval,
+		Partitions:           seglog.DefaultPartitions,
+		WALSegmentBytes:      seglog.DefaultWALSegmentBytes,
+		DefaultSegmentPolicy: seglog.SegmentPolicy{TargetBytes: seglog.DefaultSegmentTargetBytes, MaxOpenAge: seglog.DefaultSegmentMaxOpenAge},
+		MaterializeInterval:  seglog.DefaultMaterializeInterval,
+		CheckpointInterval:   seglog.DefaultCheckpointInterval,
 	}}
 	fs := flag.NewFlagSet("testserver", flag.ContinueOnError)
 	fs.StringVar(&cfg.host, "host", "127.0.0.1", "host to listen on")
@@ -138,7 +138,7 @@ func parseFlags(args []string) (serverConfig, error) {
 	fs.StringVar(&cfg.dataDir, "data-dir", "", "data directory for disk-backed storage (default: a temp dir removed on exit)")
 	fs.IntVar(&cfg.seglog.Partitions, "seglog-partitions", cfg.seglog.Partitions, "seglog WAL partitions")
 	fs.Var(byteSizeValue{target: &cfg.seglog.WALSegmentBytes}, "seglog-wal-segment-bytes", "seglog logical WAL segment size (default 256MiB)")
-	fs.Var(byteSizeValue{target: &cfg.seglog.StreamSegmentBytes}, "seglog-stream-segment-bytes", "seglog stream segment size (default 128MiB)")
+	fs.Var(byteSizeValue{target: &cfg.seglog.DefaultSegmentPolicy.TargetBytes}, "seglog-stream-segment-bytes", "default per-stream payload segment target (default 128MiB)")
 	fs.DurationVar(&cfg.seglog.MaterializeInterval, "seglog-materialize-interval", cfg.seglog.MaterializeInterval, "seglog materialization interval")
 	fs.DurationVar(&cfg.seglog.CheckpointInterval, "seglog-checkpoint-interval", cfg.seglog.CheckpointInterval, "seglog checkpoint interval")
 	fs.DurationVar(&cfg.debugStatsInterval, "debug-stats-interval", 0, "interval for seglog delta statistics (default off)")

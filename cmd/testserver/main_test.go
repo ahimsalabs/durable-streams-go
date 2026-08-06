@@ -42,7 +42,7 @@ func TestParseFlags_DefaultsAndSeglogOverrides(t *testing.T) {
 	}
 	if defaults.seglog.Partitions != seglog.DefaultPartitions ||
 		defaults.seglog.WALSegmentBytes != seglog.DefaultWALSegmentBytes ||
-		defaults.seglog.StreamSegmentBytes != seglog.DefaultStreamSegmentBytes ||
+		defaults.seglog.DefaultSegmentPolicy.TargetBytes != seglog.DefaultSegmentTargetBytes ||
 		defaults.seglog.MaterializeInterval != seglog.DefaultMaterializeInterval ||
 		defaults.seglog.CheckpointInterval != seglog.DefaultCheckpointInterval {
 		t.Errorf("seglog defaults = %+v", defaults.seglog)
@@ -53,7 +53,7 @@ func TestParseFlags_DefaultsAndSeglogOverrides(t *testing.T) {
 		t.Fatal(err)
 	}
 	if cfg.seglog.Partitions != 4 || cfg.seglog.WALSegmentBytes != 64<<20 ||
-		cfg.seglog.StreamSegmentBytes != 32<<20 || cfg.seglog.MaterializeInterval != 50*time.Millisecond ||
+		cfg.seglog.DefaultSegmentPolicy.TargetBytes != 32<<20 || cfg.seglog.MaterializeInterval != 50*time.Millisecond ||
 		cfg.seglog.CheckpointInterval != 2*time.Second || cfg.debugStatsInterval != time.Second {
 		t.Errorf("seglog overrides = %+v", cfg.seglog)
 	}

@@ -29,10 +29,11 @@ func openTest(t *testing.T, opts Options) *Storage {
 
 func singlePartitionOptions(dir string) Options {
 	return Options{
-		Dir:             dir,
-		Partitions:      1,
-		MaxMessageSize:  2048,
-		WALSegmentBytes: 1 << 20,
+		Dir:                  dir,
+		Partitions:           1,
+		MaxMessageSize:       2048,
+		WALSegmentBytes:      1 << 20,
+		DefaultSegmentPolicy: SegmentPolicy{TargetBytes: DefaultSegmentTargetBytes},
 	}
 }
 

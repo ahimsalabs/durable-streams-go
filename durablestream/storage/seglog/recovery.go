@@ -79,6 +79,8 @@ func (s *Storage) recoverAll() (retErr error) {
 	// past replayed mutations until their derived state is durable.
 	s.streams.Range(func(_ string, st *streamState) bool {
 		s.parts[st.partition].markDirty(st)
+		snap := st.snapshot()
+		s.parts[st.partition].registerActiveDeadline(st, snap.activeCreated, snap.policy.MaxOpenAge, snap.activeView.count > 0)
 		return true
 	})
 	return nil
@@ -191,6 +193,10 @@ func (s *Storage) stateFromCheckpointEntry(streamID, dir string, m streamCheckpo
 	st.lastSeq = m.LastSeq
 	st.lastSeqOffset = m.LastSeqOffset
 	st.retention = m.Retention.retention()
+	if m.SegmentPolicy.TargetBytes < 1 || m.SegmentPolicy.MaxOpenAgeNanos < 0 {
+		return nil, fmt.Errorf("%w: checkpoint entry for %s has invalid or missing segment policy", errCorrupt, streamID)
+	}
+	st.policy = SegmentPolicy{TargetBytes: m.SegmentPolicy.TargetBytes, MaxOpenAge: time.Duration(m.SegmentPolicy.MaxOpenAgeNanos)}
 	st.floor = m.FloorIndex
 	st.softDeleted = m.SoftDeleted
 	if m.Parent != nil {
@@ -610,6 +616,9 @@ func (s *Storage) applyRecovered(p *partition, scan *recoveryScan, segSeq uint64
 		if err := json.Unmarshal(frame.meta, &m); err != nil {
 			return fmt.Errorf("%w: undecodable create meta for stream %q: %v", errCorrupt, frame.streamID, err)
 		}
+		if m.Policy == nil || m.Policy.TargetBytes < 1 || m.Policy.MaxOpenAgeNanos < 0 {
+			return fmt.Errorf("%w: invalid or missing create segment policy for stream %q", errCorrupt, frame.streamID)
+		}
 		st := newStreamState(frame.streamID, frame.inc, p.id, durablestream.StreamConfig{
 			ContentType: m.ContentType,
 			TTL:         time.Duration(m.TTLNanos),
@@ -618,6 +627,7 @@ func (s *Storage) applyRecovered(p *partition, scan *recoveryScan, segSeq uint64
 			Closed:      m.Closed,
 		})
 		st.retention = s.opts.DefaultRetention
+		st.policy = SegmentPolicy{TargetBytes: m.Policy.TargetBytes, MaxOpenAge: time.Duration(m.Policy.MaxOpenAgeNanos)}
 		if m.Retention != nil {
 			if m.Retention.MaxBytes < 0 || m.Retention.MaxAgeNanos < 0 {
 				return fmt.Errorf("%w: negative create retention for stream %q", errCorrupt, frame.streamID)
@@ -652,6 +662,7 @@ func (s *Storage) applyRecovered(p *partition, scan *recoveryScan, segSeq uint64
 		}
 		cfg := durablestream.StreamConfig{ContentType: m.Create.ContentType, TTL: time.Duration(m.Create.TTLNanos), ExpiresAt: m.Create.ExpiresAt, IsPrivate: m.Create.IsPrivate, Closed: m.Create.Closed}
 		st := newStreamState(frame.streamID, frame.inc, p.id, cfg)
+		st.policy = SegmentPolicy{TargetBytes: m.Create.Policy.TargetBytes, MaxOpenAge: time.Duration(m.Create.Policy.MaxOpenAgeNanos)}
 		st.fork = &m.Fork
 		st.parentBoundary, st.floor, st.materializedThrough, st.firstLive = m.Fork.Boundary, 0, m.Fork.Boundary, m.Fork.Boundary+1
 		st.nextIndex = frame.firstIndex + int64(len(frame.payloads))
@@ -761,8 +772,9 @@ func (s *Storage) applyRecovered(p *partition, scan *recoveryScan, segSeq uint64
 func validateRecoveredFork(frame walFrame, m forkFrameMeta) error {
 	if m.Fork.SourceID == "" || m.Fork.SourceIncarnationID == "" || m.Fork.Boundary < 0 ||
 		m.Fork.PrefixCount < 0 || m.Fork.PrefixCount > int64(len(frame.payloads)) ||
-		frame.firstIndex != m.Fork.Boundary+1 || m.Create.Retention == nil ||
+		frame.firstIndex != m.Fork.Boundary+1 || m.Create.Retention == nil || m.Create.Policy == nil ||
 		m.Create.Retention.MaxBytes < 0 || m.Create.Retention.MaxAgeNanos < 0 ||
+		m.Create.Policy.TargetBytes < 1 || m.Create.Policy.MaxOpenAgeNanos < 0 ||
 		m.Fork.Request.SourceStreamID != m.Fork.SourceID {
 		return fmt.Errorf("%w: invalid fork geometry or metadata for %q", errCorrupt, frame.streamID)
 	}

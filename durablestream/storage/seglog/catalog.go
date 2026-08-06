@@ -64,6 +64,7 @@ type streamState struct {
 
 	cfg         durablestream.StreamConfig
 	retention   Retention
+	policy      SegmentPolicy
 	floor       int64 // highest trimmed index; messages at or below it are gone
 	lastSweep   time.Time
 	closed      bool // permanent EOF (protocol closure, not Storage.Close)
@@ -163,16 +164,19 @@ type readSnapshot struct {
 	lastSeq        string
 	lastSeqOffset  durablestream.Offset
 	retention      Retention
+	policy         SegmentPolicy
 	floor          int64
 	lastSweep      time.Time
 	tail           int64
 	firstLive      int64
 	walTail        []walLoc // shared read-only prefix; never mutated in place
 
-	sealed      []*segmentFile // immutable once sealed
-	activeView  segmentView
-	activeMinTS int64
-	through     int64 // materializedThrough
+	sealed        []*segmentFile // immutable once sealed
+	activeView    segmentView
+	activeMinTS   int64
+	activeCreated int64
+	forceSeal     bool
+	through       int64 // materializedThrough
 }
 
 func (st *streamState) snapshot() readSnapshot {
@@ -189,6 +193,7 @@ func (st *streamState) snapshot() readSnapshot {
 		lastSeq:        st.lastSeq,
 		lastSeqOffset:  st.lastSeqOffset,
 		retention:      st.retention,
+		policy:         st.policy,
 		floor:          st.floor,
 		lastSweep:      st.lastSweep,
 		tail:           st.nextIndex - 1,
@@ -197,9 +202,11 @@ func (st *streamState) snapshot() readSnapshot {
 		sealed:         st.sealed,
 		activeView:     st.activeView,
 		through:        st.materializedThrough,
+		forceSeal:      st.forceSeal,
 	}
 	if st.activeSeg != nil {
 		snap.activeMinTS = st.activeSeg.minTS
+		snap.activeCreated = st.activeSeg.createdUnixNano
 	}
 	return snap
 }

@@ -1,6 +1,7 @@
 package seglog
 
 import (
+	"container/heap"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -19,6 +20,7 @@ type request struct {
 	streamID     string
 	returnInfo   bool                       // opTouch: return the pre-renewal Head result
 	cfg          durablestream.StreamConfig // opCreate
+	policy       SegmentPolicy
 	messages     [][]byte
 	seq          string
 	hasSeq       bool
@@ -110,6 +112,12 @@ type partition struct {
 	// materializeWake is a coalescing doorbell. Publication never blocks when
 	// the materializer is already awake or a signal is pending.
 	materializeWake chan struct{}
+	// ageMu protects the scheduler's deadline heap. Publication registers a
+	// generation after it releases the stream lock. ageEntries keeps at most
+	// one heap entry for each stream and removes replaced generations eagerly.
+	ageMu        sync.Mutex
+	ageDeadlines activeDeadlineHeap
+	ageEntries   map[*streamState]*activeDeadline
 
 	// Materializer-owned: the last durably written checkpoint position.
 	ckptSeq   uint64
@@ -149,6 +157,7 @@ func newPartition(id uint32, st *Storage, wal *walWriter) *partition {
 		stop:                make(chan struct{}),
 		pendingSpace:        make(chan struct{}, 1),
 		materializeWake:     make(chan struct{}, 1),
+		ageEntries:          make(map[*streamState]*activeDeadline),
 		nextTxnID:           1,
 		dirty:               make(map[*streamState]struct{}),
 		materializedEntries: make(map[string]streamCheckpointEntry),
@@ -159,6 +168,72 @@ func newPartition(id uint32, st *Storage, wal *walWriter) *partition {
 		cleanupPaths:        make(map[string]struct{}),
 		cleanupDirs:         make(map[string]struct{}),
 	}
+}
+
+type activeDeadline struct {
+	st              *streamState
+	createdUnixNano int64
+	deadline        time.Time
+	index           int
+}
+
+type activeDeadlineHeap []*activeDeadline
+
+func (h activeDeadlineHeap) Len() int           { return len(h) }
+func (h activeDeadlineHeap) Less(i, j int) bool { return h[i].deadline.Before(h[j].deadline) }
+func (h activeDeadlineHeap) Swap(i, j int) {
+	h[i], h[j] = h[j], h[i]
+	h[i].index = i
+	h[j].index = j
+}
+
+func (h *activeDeadlineHeap) Push(x any) {
+	entry := x.(*activeDeadline)
+	entry.index = len(*h)
+	*h = append(*h, entry)
+}
+
+func (h *activeDeadlineHeap) Pop() any {
+	old := *h
+	n := len(old)
+	x := old[n-1]
+	old[n-1] = nil
+	x.index = -1
+	*h = old[:n-1]
+	return x
+}
+
+func (p *partition) registerActiveDeadline(st *streamState, created int64, maxAge time.Duration, nonempty bool) {
+	p.ageMu.Lock()
+	current := p.ageEntries[st]
+	if created == 0 || maxAge == 0 || !nonempty {
+		if current != nil {
+			heap.Remove(&p.ageDeadlines, current.index)
+			delete(p.ageEntries, st)
+		}
+		p.ageMu.Unlock()
+		return
+	}
+	deadline := time.Unix(0, created).Add(maxAge)
+	if current == nil || current.createdUnixNano != created || current.deadline != deadline {
+		if current != nil {
+			heap.Remove(&p.ageDeadlines, current.index)
+		}
+		entry := &activeDeadline{st: st, createdUnixNano: created, deadline: deadline}
+		p.ageEntries[st] = entry
+		heap.Push(&p.ageDeadlines, entry)
+	}
+	p.ageMu.Unlock()
+	p.wakeMaterializer()
+}
+
+func (p *partition) unregisterActiveDeadline(st *streamState) {
+	p.ageMu.Lock()
+	if current := p.ageEntries[st]; current != nil {
+		heap.Remove(&p.ageDeadlines, current.index)
+		delete(p.ageEntries, st)
+	}
+	p.ageMu.Unlock()
 }
 
 // markDirty records that a stream's state changed since the materializer's
@@ -172,6 +247,7 @@ func (p *partition) markDirty(st *streamState) {
 
 // markRemoval queues a dead incarnation's directory for removal.
 func (p *partition) markRemoval(st *streamState) {
+	p.unregisterActiveDeadline(st)
 	p.dirtyMu.Lock()
 	p.removals = append(p.removals, st)
 	p.dirtyMu.Unlock()
@@ -421,7 +497,11 @@ func (p *partition) hasPending() bool {
 // Guaranteed upper bounds on encoded JSON meta documents. createMetaBound
 // covers every fixed field (timestamps in RFC 3339 with nanoseconds); the
 // content type is bounded separately at 6x for worst-case \uXXXX escaping.
-const createMetaBound = 288
+const (
+	segmentPolicyMetaJSONBound = `,"segmentPolicy":{"targetBytes":-9223372036854775808,"maxOpenAgeNanos":9223372036854775807}`
+	segmentPolicyMetaBound     = len(segmentPolicyMetaJSONBound)
+	createMetaBound            = 288 + segmentPolicyMetaBound
+)
 
 // metaBoundForCreate bounds an opCreate frame's meta document.
 func metaBoundForCreate(contentType string) int {
@@ -971,12 +1051,22 @@ func (p *partition) stage(req *request, pending, inflight map[string]*pendingStr
 
 // createMeta is the JSON meta document of an opCreate frame.
 type createMeta struct {
-	ContentType string         `json:"contentType,omitempty"`
-	TTLNanos    int64          `json:"ttlNanos,omitempty"`
-	ExpiresAt   time.Time      `json:"expiresAt,omitzero"`
-	IsPrivate   bool           `json:"isPrivate,omitempty"`
-	Closed      bool           `json:"closed,omitempty"`
-	Retention   *retentionMeta `json:"retention,omitempty"`
+	ContentType string             `json:"contentType,omitempty"`
+	TTLNanos    int64              `json:"ttlNanos,omitempty"`
+	ExpiresAt   time.Time          `json:"expiresAt,omitzero"`
+	IsPrivate   bool               `json:"isPrivate,omitempty"`
+	Closed      bool               `json:"closed,omitempty"`
+	Retention   *retentionMeta     `json:"retention,omitempty"`
+	Policy      *segmentPolicyMeta `json:"segmentPolicy"`
+}
+
+type segmentPolicyMeta struct {
+	TargetBytes     int64 `json:"targetBytes"`
+	MaxOpenAgeNanos int64 `json:"maxOpenAgeNanos"`
+}
+
+func policyMeta(p SegmentPolicy) *segmentPolicyMeta {
+	return &segmentPolicyMeta{TargetBytes: p.TargetBytes, MaxOpenAgeNanos: int64(p.MaxOpenAge)}
 }
 
 // touchMeta is the JSON meta document of an opTouch frame.
@@ -995,7 +1085,7 @@ type trimMeta struct {
 
 func (p *partition) stageCreate(op *stagedOp, req *request, ps *pendingStream, expired bool, now time.Time, ts int64) frameSpec {
 	if ps.exists && !expired {
-		if ps.cfg.Matches(req.cfg) {
+		if ps.cfg.Matches(req.cfg) && ps.state.policy == req.policy {
 			op.res = result{created: false, offset: storage.FormatSimpleOffset(ps.nextIndex - 1)}
 		} else {
 			op.res = result{err: fmt.Errorf("seglog: stream %q exists with different config: %w", req.streamID, durablestream.ErrConflict)}
@@ -1023,6 +1113,7 @@ func (p *partition) stageCreate(op *stagedOp, req *request, ps *pendingStream, e
 			MaxBytes:    defaultRetention.MaxBytes,
 			MaxAgeNanos: int64(defaultRetention.MaxAge),
 		},
+		Policy: policyMeta(req.policy),
 	})
 	if err != nil {
 		op.res = result{err: fmt.Errorf("seglog: encode create meta: %w", err)}
@@ -1040,6 +1131,7 @@ func (p *partition) stageCreate(op *stagedOp, req *request, ps *pendingStream, e
 
 	newState := newStreamState(req.streamID, inc, p.id, cfg)
 	newState.retention = defaultRetention
+	newState.policy = req.policy
 	newState.closed = cfg.Closed
 	newState.nextIndex = 1 + int64(len(req.messages))
 
