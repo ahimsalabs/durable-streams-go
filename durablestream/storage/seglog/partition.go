@@ -53,12 +53,13 @@ type result struct {
 
 	// Barrier results: the WAL position and txnID with every prior frame
 	// committed and published.
-	walSeq   uint64
-	walOff   int64
-	nextTxn  uint64
-	dirty    map[*streamState]struct{}
-	removals []*streamState
-	frontier statsFrontier
+	walSeq         uint64
+	walOff         int64
+	nextTxn        uint64
+	dirty          map[*streamState]struct{}
+	dirtySnapshots map[*streamState]readSnapshot
+	removals       []*streamState
+	frontier       statsFrontier
 }
 
 // opBarrier is a queue-only operation (never a WAL frame): its result carries
@@ -144,12 +145,14 @@ type partition struct {
 	// sealedSidecars become removable only after a checkpoint durably names
 	// their payload files as sealed. Delayed-checkpoint rounds accumulate them
 	// here until that checkpoint commits.
-	sealedSidecars      map[string]struct{}
-	cleanupPaths        map[string]struct{}
-	cleanupDirs         map[string]struct{}
-	walReclaimBefore    uint64
-	checkpointWriteHook func() error // one-shot test seam; guarded by checkpointHookMu
-	checkpointHookMu    sync.Mutex
+	sealedSidecars             map[string]struct{}
+	cleanupPaths               map[string]struct{}
+	cleanupDirs                map[string]struct{}
+	walReclaimBefore           uint64
+	checkpointWriteHook        func() error // one-shot test seam; guarded by checkpointHookMu
+	checkpointHookMu           sync.Mutex
+	materializationBarrierHook func() // one-shot test seam; guarded by barrierHookMu
+	barrierHookMu              sync.Mutex
 }
 
 func newPartition(id uint32, st *Storage, wal *walWriter) *partition {
@@ -277,6 +280,14 @@ func (p *partition) takeCheckpointWriteHook() func() error {
 	defer p.checkpointHookMu.Unlock()
 	hook := p.checkpointWriteHook
 	p.checkpointWriteHook = nil
+	return hook
+}
+
+func (p *partition) takeMaterializationBarrierHook() func() {
+	p.barrierHookMu.Lock()
+	defer p.barrierHookMu.Unlock()
+	hook := p.materializationBarrierHook
+	p.materializationBarrierHook = nil
 	return hook
 }
 
@@ -947,6 +958,10 @@ func (p *partition) commitRecord(record *stagedRecord, syncErr error) bool {
 	if record.op != nil && record.op.barrier && record.op.req.captureDirty {
 		record.op.res.frontier = p.stats.captureMaterializationFrontier()
 		record.op.res.dirty, record.op.res.removals = p.swapDirty()
+		record.op.res.dirtySnapshots = make(map[*streamState]readSnapshot, len(record.op.res.dirty))
+		for st := range record.op.res.dirty {
+			record.op.res.dirtySnapshots[st] = st.materializationSnapshot()
+		}
 	}
 	p.publishedSeq = record.endSeq
 	p.publishedOff = record.endOff

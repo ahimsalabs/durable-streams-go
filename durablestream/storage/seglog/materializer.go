@@ -244,6 +244,9 @@ func (s *Storage) materializeRoundLocked(p *partition) error {
 	if barrier.err != nil {
 		return barrier.err
 	}
+	if hook := p.takeMaterializationBarrierHook(); hook != nil {
+		hook()
+	}
 	dirty, removals := barrier.dirty, barrier.removals
 	fail := func() {
 		p.stats.cancelMaterializationFrontier(barrier.frontier)
@@ -256,8 +259,8 @@ func (s *Storage) materializeRoundLocked(p *partition) error {
 	}
 
 	prepared := make(map[*streamState]*preparedStream, len(dirty))
-	for st := range dirty {
-		draft, err := s.materializeStream(p, st)
+	for st, snap := range barrier.dirtySnapshots {
+		draft, err := s.materializeStream(p, st, snap)
 		s.releaseDraftPins(draft)
 		if err != nil {
 			if draft != nil {
@@ -316,7 +319,7 @@ func (s *Storage) finalMaterialize(p *partition) error {
 	frontier := p.stats.captureMaterializationFrontier()
 	prepared := make(map[*streamState]*preparedStream, len(dirty))
 	for st := range dirty {
-		draft, err := s.materializeStream(p, st)
+		draft, err := s.materializeStream(p, st, st.materializationSnapshot())
 		s.releaseDraftPins(draft)
 		if err != nil {
 			if draft != nil {
@@ -679,12 +682,14 @@ func cloneCheckpointEntries(src map[string]streamCheckpointEntry) map[string]str
 func (s *Storage) checkpointEntries(base map[string]streamCheckpointEntry, prepared map[*streamState]*preparedStream, removals []*streamState) map[string]streamCheckpointEntry {
 	entries := cloneCheckpointEntries(base)
 	for st, draft := range prepared {
-		live, ok := s.streams.Load(st.id)
-		if draft.snap.deleted || !ok || live != st {
-			delete(entries, st.id)
+		if draft.snap.deleted {
+			entry, ok := entries[st.id]
+			if ok && entry.IncarnationID == draft.snap.inc.String() {
+				delete(entries, st.id)
+			}
 			continue
 		}
-		entries[st.id] = buildCheckpointEntry(st, draft.snap, draft.sealed, draft.active, draft.through)
+		entries[st.id] = buildCheckpointEntry(draft.snap, draft.sealed, draft.active, draft.through)
 	}
 	for _, st := range removals {
 		entry, ok := entries[st.id]
@@ -728,8 +733,7 @@ func (st *streamState) closeSegments() {
 // materializeStream prepares derived state without publishing it. Its caller
 // batch-syncs every touched file and durably checkpoints the complete
 // partition image before publish.
-func (s *Storage) materializeStream(p *partition, st *streamState) (*preparedStream, error) {
-	snap := st.snapshot()
+func (s *Storage) materializeStream(p *partition, st *streamState, snap readSnapshot) (*preparedStream, error) {
 	draft := &preparedStream{st: st, snap: snap, sealed: slices.Clone(snap.sealed), through: snap.through, touched: make(map[string]struct{}), touchedDirs: make(map[string]struct{}), touchedParents: make(map[string]struct{})}
 	writes := &p.segmentWrites
 	writes.reset()
@@ -751,8 +755,8 @@ func (s *Storage) materializeStream(p *partition, st *streamState) (*preparedStr
 	if snap.deleted {
 		return draft, nil
 	}
-	if st.activeSeg != nil {
-		copy := *st.activeSeg
+	if snap.activeSeg != nil {
+		copy := *snap.activeSeg
 		draft.active = &copy
 	}
 	dir := streamDir(s.dir, st.id, st.inc)
@@ -951,10 +955,10 @@ func (s *Storage) unlinkPrepared(p *partition, draft *preparedStream) error {
 	return first
 }
 
-func buildCheckpointEntry(st *streamState, snap readSnapshot, sealed []*segmentFile, active *segmentFile, through int64) streamCheckpointEntry {
+func buildCheckpointEntry(snap readSnapshot, sealed []*segmentFile, active *segmentFile, through int64) streamCheckpointEntry {
 	e := streamCheckpointEntry{IncarnationID: snap.inc.String(), ContentType: snap.cfg.ContentType, TTLNanos: int64(snap.cfg.TTL), ExpiresAt: snap.cfg.ExpiresAt, IsPrivate: snap.cfg.IsPrivate, Closed: snap.closed, LastSeq: snap.lastSeq, LastSeqOffset: snap.lastSeqOffset, Retention: retentionCheckpointEntry(snap.retention), SegmentPolicy: *policyMeta(snap.policy), FloorIndex: snap.floor, SoftDeleted: snap.softDeleted, MaterializedThrough: through}
 	if snap.parent != nil {
-		e.Parent = &checkpointParent{StreamID: snap.parent.id, IncarnationID: snap.parent.inc.String(), Fork: *st.fork}
+		e.Parent = &checkpointParent{StreamID: snap.parent.id, IncarnationID: snap.parent.inc.String(), Fork: *snap.fork}
 	}
 	for _, sf := range sealed {
 		e.Sealed = append(e.Sealed, checkpointSegment{File: sf.name, FirstIndex: sf.firstIndex, LastIndex: sf.lastIndex, PayloadEnd: sf.payloadEnd, Count: sf.count, MinTS: sf.minTS, MaxTS: sf.maxTS})

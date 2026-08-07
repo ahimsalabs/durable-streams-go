@@ -222,8 +222,8 @@ func TestCrashOrdering_CommitMaterializeCheckpointThenReclaim(t *testing.T) {
 			barrier := p.submit(&request{op: opBarrier, captureDirty: true, done: make(chan result, 1)})
 			prepared := make(map[*streamState]*preparedStream)
 			if prefix >= 2 {
-				for st := range barrier.dirty {
-					draft, err := s.materializeStream(p, st)
+				for st, snap := range barrier.dirtySnapshots {
+					draft, err := s.materializeStream(p, st, snap)
 					if err != nil {
 						t.Fatal(err)
 					}
@@ -284,7 +284,7 @@ func TestCrashOrdering_SealThenCheckpoint(t *testing.T) {
 			st.forceSeal = true
 			s.parts[0].markDirty(st)
 			barrier := s.parts[0].submit(&request{op: opBarrier, captureDirty: true, done: make(chan result, 1)})
-			draft, err := s.materializeStream(s.parts[0], st)
+			draft, err := s.materializeStream(s.parts[0], st, barrier.dirtySnapshots[st])
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -343,7 +343,7 @@ func TestCrashOrdering_TrimFrameCheckpointThenUnlink(t *testing.T) {
 			if prefix >= 2 {
 				retained := append([]*segmentFile(nil), trimmedSnap.sealed[1:]...)
 				entries := s.checkpointEntries(s.parts[0].materializedEntries, nil, nil)
-				entries["s"] = buildCheckpointEntry(st, trimmedSnap, retained, st.activeSeg, trimmedSnap.through)
+				entries["s"] = buildCheckpointEntry(trimmedSnap, retained, st.activeSeg, trimmedSnap.through)
 				barrier := s.parts[0].submit(&request{op: opBarrier, done: make(chan result, 1)})
 				if err := s.advanceCheckpoint(s.parts[0], barrier, entries); err != nil {
 					t.Fatal(err)

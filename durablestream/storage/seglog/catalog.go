@@ -4,6 +4,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"fmt"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -173,15 +174,21 @@ type readSnapshot struct {
 
 	sealed        []*segmentFile // immutable once sealed
 	activeView    segmentView
+	activeSeg     *segmentFile
 	activeMinTS   int64
 	activeCreated int64
 	forceSeal     bool
 	through       int64 // materializedThrough
+	fork          *forkMeta
 }
 
 func (st *streamState) snapshot() readSnapshot {
 	st.mu.RLock()
 	defer st.mu.RUnlock()
+	return st.snapshotLocked()
+}
+
+func (st *streamState) snapshotLocked() readSnapshot {
 	snap := readSnapshot{
 		inc:            st.inc,
 		cfg:            st.cfg,
@@ -207,6 +214,25 @@ func (st *streamState) snapshot() readSnapshot {
 	if st.activeSeg != nil {
 		snap.activeMinTS = st.activeSeg.minTS
 		snap.activeCreated = st.activeSeg.createdUnixNano
+	}
+	return snap
+}
+
+// materializationSnapshot owns every mutable slice and descriptor needed to
+// prepare a checkpoint after the publisher advances beyond its WAL barrier.
+func (st *streamState) materializationSnapshot() readSnapshot {
+	st.mu.RLock()
+	defer st.mu.RUnlock()
+	snap := st.snapshotLocked()
+	snap.walTail = slices.Clone(snap.walTail)
+	snap.sealed = slices.Clone(snap.sealed)
+	if st.activeSeg != nil {
+		active := *st.activeSeg
+		snap.activeSeg = &active
+	}
+	if st.fork != nil {
+		fork := *st.fork
+		snap.fork = &fork
 	}
 	return snap
 }

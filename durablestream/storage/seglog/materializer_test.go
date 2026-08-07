@@ -218,7 +218,7 @@ func TestCrashAfterBatchSyncBeforeCheckpoint(t *testing.T) {
 
 	// Prepare and sync segment bytes, but do not checkpoint or publish.
 	st, _ := s.streams.Load("s")
-	draft, err := s.materializeStream(s.parts[0], st)
+	draft, err := s.materializeStream(s.parts[0], st, st.materializationSnapshot())
 	if err != nil {
 		t.Fatal(err)
 	}

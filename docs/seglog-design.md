@@ -11,6 +11,8 @@ Three decisions carry most of the design's weight:
    written records from records confirmed durable.
 3. Group commit runs across partitions. Flush completion sets its main pace,
    with a short adaptive boarding window between contended waves.
+4. Materialization and checkpoints use measured byte and age pressure. They do
+   not use a fast fixed polling interval.
 
 None of the pieces are novel. The log is a conventional WAL with per-record
 checksums and torn-tail truncation. The watermark follows the WAL of the
@@ -142,11 +144,23 @@ stream B: ┌──────────────┐  ┌─────�
 ### Materialization is an incremental copy between files
 
 The engine does not hold 128 MiB in memory and then write a stream segment.
-By default, a materializer runs every 25 milliseconds. It reads each newly
-committed payload from the partition WAL and appends that payload to the
-active file for its stream. It also appends one 16-byte entry to the active
-index sidecar. The copy uses a message-sized memory buffer. The active stream
-segment grows a little at a time.
+The materializer reads newly committed payloads from the partition WAL. It
+appends each payload to the active file for its stream. It also appends one
+16-byte entry to the active index sidecar. The active stream segment grows a
+little at a time.
+
+The default materialization limits are 4 MiB of unmaterialized WAL data or an
+age of 250 milliseconds for the oldest unmaterialized record. The first limit
+that is reached starts a materialization round. A capacity-one wake channel
+notifies the materializer about new pressure. An idle partition does not poll
+all streams.
+
+The materializer combines consecutive writes. It keeps one reusable 1 MiB
+payload buffer and one reusable 64 KiB index buffer for each active partition.
+A normal chunk needs one payload `WriteAt` call and one index `WriteAt` call.
+An individual message that is larger than 1 MiB bypasses the retained buffer.
+This rule keeps memory bounded. It does not change payload bytes, per-message
+checksums, batch boundaries, or segment rollover rules.
 
 For one message, the normal path is:
 
@@ -221,10 +235,10 @@ stream at a fixed interval. A zero maximum open age disables age rollover.
 
 ### A checkpoint is a durable recovery statement
 
-A checkpoint is per partition. By default, the engine materializes every 25
-milliseconds and writes an ordinary checkpoint no more often than every 250
-milliseconds. A WAL roll, retention work, or shutdown can require an earlier
-checkpoint.
+A checkpoint is per partition. By default, a partition requests a checkpoint
+after 32 MiB of materialized data or after three seconds. The first limit that
+is reached starts the checkpoint. A WAL roll, retention work, recovery work,
+or shutdown can require an earlier checkpoint.
 
 The checkpoint describes a point in two views of the same history:
 
@@ -237,6 +251,32 @@ The checkpoint can name any durable active prefix. A stream segment does not
 need to be full or sealed. One checkpoint can name a 128 MiB sealed segment for
 stream A, a 4 MiB active segment for stream B, and a 20 KiB active segment for
 stream C.
+
+The checkpoint replay position and the stream image use the same FIFO barrier.
+At the barrier, the partition publisher captures an owned snapshot of each
+dirty stream. The snapshot includes the WAL tail, segment descriptors, stream
+metadata, retention policy, and fork metadata. Materialization uses this
+snapshot. It does not read newer live stream state.
+
+A mutation that is published after the barrier stays in the new dirty set. Its
+WAL bytes stay after the checkpoint replay position. The next materialization
+round processes it. This rule also applies to append, delete, recreate, trim,
+retention, and metadata changes. A deleted incarnation can remove only its own
+checkpoint entry. It cannot remove a new incarnation that has the same stream
+name.
+
+```text
+publisher order
+
+pre-barrier records ──▶ [ barrier B ] ──▶ post-barrier records
+                              │
+                              ├─ capture WAL replay position B
+                              ├─ capture dirty stream snapshots
+                              └─ replace the dirty set
+
+checkpoint B contains:       state at or before B
+next materialization contains: state published after B
+```
 
 The durability order matters:
 
@@ -279,6 +319,12 @@ This ordering handles the important failures:
   can be removed later.
 - **Failure after WAL removal:** the checkpoint already names durable stream
   files, so recovery does not need the removed WAL history.
+- **Checkpoint write failure:** the engine keeps the prepared batch and its
+  barrier snapshots. It retries the same batch. Newer mutations stay dirty for
+  a later round.
+- **Age-seal checkpoint failure:** the active segment stays published until a
+  checkpoint succeeds. The scheduler retries with bounded backoff. A retry does
+  not create a duplicate sealed segment.
 
 For example, a 1 GiB stream eventually has about eight 128 MiB stream segments,
 plus index and footer overhead. During ingestion, some of the same payload also
@@ -380,6 +426,35 @@ header, payload bytes, index entries, and, when sealed, a footer. Stream
 configuration never enters these files, which keeps the payload area
 byte-identical to the wire.
 
+## Retention advances a logical floor
+
+Each stream can have a maximum retained byte count, a maximum record age, or
+both. Zero means that the limit is disabled. The engine copies the default
+retention policy when it creates a stream. A later change to the process
+default does not change an existing stream. A retention WAL record can change
+the policy for one existing stream.
+
+Retention advances a logical floor. A read below this floor returns a gone
+result. The floor is part of the checkpoint and survives restart. New appends
+continue with increasing message indexes. Retention does not renumber records.
+
+Physical removal uses whole sealed stream segments. The engine preserves the
+active segment and any sealed segment that contains records above the floor.
+Age retention can require an idle active segment to become sealed first. The
+persisted maximum-open-age policy provides this bound. Continuous appends do
+not reset the segment creation time.
+
+A fork can pin source segments. Retention can advance the source's logical
+floor while these physical files remain. The engine removes the files only
+after the last fork releases them. This can make logical retention complete
+before disk space is reclaimed.
+
+Retention and age sealing use the same checkpoint order as normal
+materialization. The engine first makes the retained stream image durable.
+Then it removes victim files. A crash before file removal leaves extra safe
+files. A crash after file removal is safe because the durable checkpoint no
+longer names those files.
+
 ## Stream segments store payload bytes verbatim
 
 A read request asks for a range of messages from one stream. In the stream
@@ -422,6 +497,30 @@ not crossed seglog's durability barrier. A machine or power failure can lose
 it. That is acceptable because the client has not received a confirmation.
 With synchronous writes enabled, seglog confirms the request only after the
 covering WAL `fdatasync` succeeds.
+
+### A producer can request one durability group
+
+The `ProducerGroup` API lets one producer add multiple append or `AppendBatch`
+mutations before it calls `Commit`. All mutations must map to one partition.
+The partition writes their ordinary WAL frames in one contiguous write. One
+covering `fdatasync` makes the valid frames durable.
+
+This group is not a multi-stream transaction. Each mutation has its own stream
+validation, sequence result, offset, and error. Valid mutations can succeed
+when another mutation has a sequence conflict or another definitive error.
+Recovery also treats each WAL frame independently. A torn write can leave a
+valid frame prefix.
+
+The group is caller-owned and single-use. It borrows payload bytes until
+`Commit` returns. Context cancellation can stop a commit only before queue
+admission. After admission, `Commit` waits for the final result. If a WAL write
+or flush fails after an attempted write, frame-bearing results contain
+`ErrDurabilityUnknown`. The error also keeps the underlying system error so a
+caller can inspect both causes.
+
+The complete producer group uses one bounded queue slot. Its encoded frames
+must fit in one WAL segment. A group cannot span partitions or WAL segments.
+These limits keep queue memory and one-write behavior bounded.
 
 The earlier version of this engine held requests back and formed them into
 groups before writing. Measurement showed this was a mistake: each request
@@ -504,6 +603,37 @@ global, so issuing it once per partition was waste - 70 filesystem-wide
 flushes per second at the default settings. Now all partitions share one
 call per round.
 
+## Frontier metrics show background pressure
+
+The engine reports the distance and age between the WAL, materialization, and
+checkpoint frontiers. Aggregate statistics add byte counts across partitions.
+Replay positions remain per partition because positions from different WALs
+cannot be compared.
+
+The main pressure metrics are:
+
+- `PendingWALBytes`: frame bytes that are written but do not yet have a final
+  flush or failure result.
+- `UnmaterializedWALBytes`: committed WAL bytes that no completed
+  materialization barrier covers.
+- `OldestUnmaterializedAge`: the age of the oldest record before that barrier.
+- `MaterializedNotCheckpointedBytes`: bytes that materialization covers but a
+  durable checkpoint does not cover.
+- `UnreclaimedWALBytes`: logical bytes in WAL segments that still exist.
+- `CurrentWALSegmentBytes`: logical bytes used in the active WAL segment.
+- `CurrentWALSegmentCapacityBytes`: the logical capacity of that segment.
+- `CurrentWALSegmentUtilization`: used bytes divided by logical capacity.
+- `CheckpointReplayPosition`: the WAL segment and byte offset from which one
+  partition will replay.
+
+These values answer different questions. A large unmaterialized distance means
+that stream files are behind the WAL. A large materialized but uncheckpointed
+distance means that derived files are ahead of the durable recovery statement.
+A large unreclaimed distance can remain after checkpoint progress because WAL
+removal uses whole segments. Segment utilization shows how much of the current
+logical rollover unit is in use; it does not show physical preallocation. WAL
+files grow physically in the configured 16 MiB extents by default.
+
 ## Write amplification
 
 Write amplification is the ratio of bytes the device writes to bytes the
@@ -523,8 +653,10 @@ fixes, and only some of them are fundamental.
    throughput trade; on this system it also controlled write amplification.
 3. **The second copy.** Materialization rewrites every payload into its
    stream file plus a 16-byte index entry. This adds one planned payload write
-   and one index entry. Each payload is materialized once, but the amount of
-   unreclaimed WAL is not bounded if materialization falls behind.
+   and one index entry. Coalesced materializer buffers reduce the number of
+   write system calls. They do not reduce the logical byte amplification. Each
+   payload is materialized once, but the amount of unreclaimed WAL is not
+   bounded if materialization falls behind.
 4. **Page granularity on stream files.** A 256-byte append to one of
    10,000 streams dirties a 4 KiB payload page and an index-sidecar page,
    and writeback usually flushes both before neighboring appends arrive to
