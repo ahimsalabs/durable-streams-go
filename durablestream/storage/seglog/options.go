@@ -11,7 +11,7 @@ import (
 
 // Defaults for Options fields left at their zero values.
 const (
-	DefaultPartitions        = 32
+	DefaultPartitions        = 1
 	DefaultMaxMessageSize    = 10 << 20 // 10 MiB
 	DefaultWALSegmentBytes   = 256 << 20
 	DefaultWALExtentBytes    = 16 << 20

@@ -7,6 +7,9 @@ import (
 
 func TestOptions_AdaptiveScheduleDefaults(t *testing.T) {
 	opts := (Options{}).withDefaults()
+	if opts.Partitions != 1 {
+		t.Errorf("Partitions = %d, want greenfield default 1", opts.Partitions)
+	}
 	if opts.MaterializeBytes != 4<<20 || opts.MaterializeMaxAge != 250*time.Millisecond {
 		t.Errorf("materialize defaults = (%d, %v), want (4 MiB, 250ms)", opts.MaterializeBytes, opts.MaterializeMaxAge)
 	}

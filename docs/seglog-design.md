@@ -1,725 +1,686 @@
-# A storage engine built around the disk's flush budget
+# seglog Storage Engine Design
 
-seglog is the storage engine behind our Go implementation of the Durable
-Streams protocol: append-only named streams over HTTP, readable from any
-offset. With synchronous writes enabled, the default, seglog confirms an
-append only after `fdatasync` succeeds for the WAL segment that contains it.
-Three decisions carry most of the design's weight:
+**Status:** Implemented design for root format `seglog-format-v4`.
 
-1. Per-stream read segments store message payload bytes verbatim.
-2. Writes reach the write-ahead log at arrival; a pending watermark separates
-   written records from records confirmed durable.
-3. Group commit runs across partitions. Flush completion sets its main pace,
-   with a short adaptive boarding window between contended waves.
-4. Materialization and checkpoints use measured byte and age pressure. They do
-   not use a fast fixed polling interval.
+seglog is a single-node storage engine for named, append-only streams. It is
+the storage engine for the Go Durable Streams server. This document defines
+its current data model, durability protocol, file formats, and operating
+limits.
 
-None of the pieces are novel. The log is a conventional WAL with per-record
-checksums and torn-tail truncation. The watermark follows the WAL of the
-Rust implementation of the same protocol. Group commit is as old as
-databases; the only unusual choice is the level where it operates. Most of
-this post is about matching the design to two measured constants of one
-NVMe device - and what it costs, in write amplification and commit latency,
-when a design ignores them.
+## 1. Scope and non-goals
 
-This is a single-node, local-filesystem durability guarantee. It protects
-against process and machine crashes when the filesystem and device honor
-`fdatasync`. It does not protect against loss of the disk or the node. The
-engine also has an explicit unsafe mode that skips `fdatasync` for throughput
-experiments; confirmed writes can be lost in that mode.
+### 1.1 Scope
 
-## Two copies of the data
+seglog provides these functions:
 
-The engine writes each message twice, to two different files, for two
-different jobs.
+- It stores independent streams on a local filesystem.
+- It appends records in stream order.
+- It reads records from a stream offset.
+- It stores stream metadata in the same write-ahead log as stream data.
+- It supports stream deletion, retention, and forks.
+- It recovers committed state after a process or machine failure.
 
-The first copy goes to a **log file**. The log is for durability and
-recovery. The engine has a fixed number of partitions (32 by default). A hash
-of the stream name assigns each stream to one partition, and each partition
-owns one sequence of log files. All writes to one partition go to the end of
-its current log file, in order.
+The default durability mode acknowledges a mutation only after `fdatasync`
+succeeds for each WAL segment that contains the mutation. This guarantee
+depends on correct filesystem and storage-device behavior.
 
-The second copy goes to a **stream file**. Each stream has its own files.
-A background task copies message data out of the log and into the stream
-files. This copy is for reads.
+The unsafe mode skips synchronous WAL flushes. This mode can lose
+acknowledged mutations after a process, kernel, machine, or power failure.
 
-This second representation is a deliberate write and space cost. A
-Kafka-style partition log can use one file sequence for durability and reads.
-That works well when the API exposes partition order and record-batch framing.
-seglog has a different boundary: many independent streams share 32 WAL
-partitions, but reads, retention, and forks operate on one stream at a time.
-The shared WALs bound the number of flush owners. The per-stream files provide
-contiguous payload ranges and independent lifecycle boundaries.
+### 1.2 Non-goals
 
-The cost is an extra payload write, a dense index, and a checkpoint invariant
-between the two representations. An LSM tree also writes a WAL and a derived
-read representation, then rewrites that representation during compaction.
-seglog writes each stream payload once during materialization. Sealing appends
-the index and footer without rewriting the payload.
+seglog does not provide these functions:
 
-## Segments, materialization, and checkpoints
+- Replication across disks or nodes.
+- Protection from permanent loss of the local storage device.
+- A transaction across streams or partitions.
+- A hard limit on total disk use.
+- Online migration from an older root, checkpoint, WAL, or stream format.
+- A global order across partitions.
 
-The words *segment*, *materialization*, and *checkpoint* describe three
-different boundaries. They are easy to confuse:
+## 2. Terminology
 
-- A **segment** is a file rollover unit.
-- **Materialization** copies committed payloads from the log into stream
-  files.
-- A **checkpoint** records which materialized bytes are durable and therefore
-  no longer need an older log segment for recovery.
+**Active stream segment:** A mutable stream segment with a payload file and an
+index sidecar.
 
-Reaching a segment size does not create a checkpoint. A checkpoint does not
-wait for a segment to reach its target size.
+**Barrier:** A position in the partition publisher's FIFO order. A
+materialization batch captures the replay position and dirty-stream snapshots
+at this position.
 
-### There are two kinds of segment
+**Checkpoint:** A durable per-partition description of stream state and the
+WAL replay position.
 
-Each partition has a sequence of **WAL segments**. A WAL segment has a default
-logical size of 256 MiB, including a 4 KiB header. A transaction frame must fit
-in one WAL segment. If the next frame does not fit in the active segment, the
-writer creates the next segment and puts the complete frame there. It never
-splits a frame between two WAL segments.
+**Commit:** The operation that gives admitted WAL frames their final durability
+result and then publishes their results in FIFO order.
 
-The 256 MiB value is a rollover limit, not an immediate allocation. A WAL file
-grows in 16 MiB extents as the writer needs space. A lightly used partition
-therefore does not consume 256 MiB only because it has an active WAL segment.
-The engine creates WAL segments lazily, so an unused partition has no active
-segment.
+**Dirty stream:** A stream with published state that a completed
+materialization barrier does not yet cover.
 
-Each stream has a sequence of **stream segments**. Its persisted segment policy
-has a payload target and a maximum open age. The default payload target is 128
-MiB. Header, index, and footer bytes do not count toward this target. The
-materializer tests the payload size before it copies the next message. It never
-splits a message. Thus, the message that crosses the target stays in the old
-segment, and at most that one message can take the payload area above the
-target. A message larger than the target gets a segment of its own when a later
-message arrives.
+**Fork:** A stream that reads a retained prefix from a source stream and then
+continues with its own records.
 
-The engine resolves the policy once when it creates a stream and writes the
-resolved value to the create WAL frame. A selector can choose different values
-for different stream names or configurations. For example, an application can
-use 128 MiB and one hour for RAW streams, but 8 MiB and five minutes for META
-streams. A fork target is a new stream: the selector resolves its policy from
-the target name and configuration, not from its parent. A retry is idempotent
-only when its newly resolved policy equals the stored policy.
+**Frame:** One checksummed WAL encoding of one mutation.
 
-Checkpoints contain the same policy for every live stream. Recovery requires a
-valid policy in either the checkpoint or the create or fork WAL metadata. It
-does not use the current default or call the current selector. Changing process
-options therefore affects only later creations. This schema change uses root
-format `seglog-format-v4` and checkpoint format 3. WAL and stream-segment
-envelopes keep their versions because their binary layouts did not change.
+**Logical byte:** A byte in a file's defined address range. Logical size does
+not imply physical block allocation.
 
-These values are configuration options. They are defaults, not protocol
-limits:
+**Materialization:** The copy of committed WAL state into per-stream files. A
+later checkpoint can make this derived state authoritative for recovery.
 
-| File type | Owner | Default rollover target | Contents |
-|---|---|---:|---|
-| WAL segment | One partition | 256 MiB | Changes for many streams |
-| Stream segment | One stream | 128 MiB | Contiguous payloads for that stream |
+**Partition:** One independently ordered WAL and its worker pipeline.
 
-The two file sequences have different axes:
+**Published:** Applied to in-memory stream state with a final commit result.
+
+**Replay position:** The WAL segment and byte offset where recovery starts.
+
+**Sealed stream segment:** An immutable stream segment with its dense index and
+footer in one `.seg` file.
+
+**Stream segment policy:** The immutable payload target and maximum open age
+selected when a stream is created.
+
+**WAL segment:** One file in a partition's write-ahead log sequence.
+
+## 3. Architecture
+
+The store has a configurable number of partitions. The default is one.
+
+The store routes a stream name with XXH64. The partition count and routing
+algorithm are persisted in `FORMAT`. Routing is stable across restart.
+
+Each partition has these ordered components:
 
 ```text
-Partition WAL, ordered by transaction number
+caller
+  │
+  ▼
+bounded admission queue
+  │
+  ▼
+stager ── write frame at arrival ──▶ partition WAL
+  │                                  │
+  │ add to pending FIFO              │ fdatasync covering snapshot
+  ▼                                  ▼
+committer ───────────────────────▶ FIFO publisher
+                                      │
+                                      ├─ result to caller
+                                      ├─ in-memory stream state
+                                      └─ dirty-stream set
+```
+
+The stager, committer, and publisher are separate pipeline stages. The queue
+and the pending list are bounded by admission and pipeline backpressure.
+
+The store has two persistent representations of record payloads:
+
+```text
+Partition WAL order
 
 ┌──────────────────┐  ┌──────────────────┐  ┌──────────────────┐
 │ WAL segment 17   │  │ WAL segment 18   │  │ WAL segment 19   │
 │ streams A, B, C  │  │ streams A, C, D  │  │ streams B, D     │
-│ up to 256 MiB    │  │ up to 256 MiB    │  │ active           │
+│ sealed           │  │ sealed           │  │ active           │
 └──────────────────┘  └──────────────────┘  └──────────────────┘
 
-Per-stream files, ordered by message index
+Per-stream record order
 
 stream A: ┌──────────────┐  ┌──────────────┐  ┌──────────────┐
           │ sealed       │  │ sealed       │  │ active       │
-          │ about 128 MiB│  │ about 128 MiB│  │ 23 MiB       │
           └──────────────┘  └──────────────┘  └──────────────┘
 
 stream B: ┌──────────────┐  ┌──────────────┐
           │ sealed       │  │ active       │
-          │ about 128 MiB│  │ 4 MiB        │
           └──────────────┘  └──────────────┘
 ```
 
-### Materialization is an incremental copy between files
+The WAL supplies commit durability and recovery history. Stream segments
+supply stream-local payload layout and lifecycle boundaries. Reads compose
+sealed segments, the active segment, and committed WAL-tail state.
 
-The engine does not hold 128 MiB in memory and then write a stream segment.
-The materializer reads newly committed payloads from the partition WAL. It
-appends each payload to the active file for its stream. It also appends one
-16-byte entry to the active index sidecar. The active stream segment grows a
-little at a time.
+## 4. Invariants
 
-The default materialization limits are 4 MiB of unmaterialized WAL data or an
-age of 250 milliseconds for the oldest unmaterialized record. The first limit
-that is reached starts a materialization round. A capacity-one wake channel
-notifies the materializer about new pressure. An idle partition does not poll
-all streams.
+1. **Stable routing.** A stream maps to one persisted partition for the life of
+   the store format.
+2. **Partition order.** WAL transaction numbers increase by one without gaps
+   within a partition.
+3. **Frame containment.** One frame or `ProducerGroup` cannot cross a WAL
+   segment boundary.
+4. **Write-before-commit.** The stager writes an admitted frame before the
+   committer can include it in a pending snapshot.
+5. **FIFO publication.** The publisher applies final results in partition WAL
+   order.
+6. **Synchronous acknowledgement.** In the default mode, a successful result
+   follows a successful covering WAL `fdatasync`.
+7. **Immutable stream policy.** Recovery uses the persisted stream segment
+   policy. It does not resolve the policy again.
+8. **Record containment.** Materialization never splits one record across
+   stream segments.
+9. **Immutable seal.** A sealed stream segment never changes.
+10. **Checkpoint barrier.** A checkpoint replay position and its owned
+    dirty-stream snapshots come from the same FIFO barrier.
+11. **Post-barrier separation.** A mutation after a barrier remains dirty and
+    remains after that barrier's replay position.
+12. **Frozen retry.** A failed checkpoint retry uses the same captured batch.
+    It does not merge later mutations into that batch.
+13. **Reclaim after checkpoint.** The engine removes required WAL or stream
+    files only after a durable checkpoint no longer depends on them.
+14. **Logical retention.** The retained floor does not decrease and survives
+    restart. Physical file removal can occur later.
+15. **Read pin safety.** The engine does not unlink a file while a read or fork
+    pin requires it.
 
-The materializer combines consecutive writes. It keeps one reusable 1 MiB
-payload buffer and one reusable 64 KiB index buffer for each active partition.
-A normal chunk needs one payload `WriteAt` call and one index `WriteAt` call.
-An individual message that is larger than 1 MiB bypasses the retained buffer.
-This rule keeps memory bounded. It does not change payload bytes, per-message
-checksums, batch boundaries, or segment rollover rules.
+## 5. Configuration and defaults
 
-For one message, the normal path is:
+| Option | Default | Meaning |
+|---|---:|---|
+| `Partitions` | 1 | Number of WAL partitions |
+| `MaxMessageSize` | 10 MiB | Maximum message payload size |
+| `WALSegmentBytes` | 256 MiB | Logical WAL segment size, including header |
+| `WALExtentBytes` | 16 MiB | Logical WAL growth extent |
+| `QueueDepth` | 256 | Bounded queue capacity per partition |
+| `SyncWrites` | true | Require a covering WAL flush before success |
+| `ShutdownTimeout` | 30 s | Maximum synchronous shutdown wait |
+| `MaterializeBytes` | 4 MiB | Unmaterialized WAL pressure threshold |
+| `MaterializeMaxAge` | 250 ms | Oldest unmaterialized-record age threshold |
+| `CheckpointBytes` | 32 MiB | Materialized WAL-frame byte threshold |
+| `CheckpointMaxAge` | 3 s | Age threshold from first successful uncheckpointed materialization |
+| `DefaultSegmentPolicy.TargetBytes` | 128 MiB | Stream segment payload target |
+| `DefaultSegmentPolicy.MaxOpenAge` | 1 h | Maximum non-empty active segment open age |
+| `RetentionInterval` | 30 s | Background retention sweep interval |
+| `FDCacheSize` | 384 | Open-file cache capacity |
+
+`Dir` selects the root directory. An empty `Dir` creates temporary storage and
+removes it on close.
+
+A selector can set a stream segment policy at stream creation. The engine
+persists the selected policy. Later default or selector changes do not change
+an existing stream.
+
+A zero segment maximum open age disables age sealing. A retention cadence of
+`-1` disables the background retention loop. A materialization maximum age of
+`-1` disables process-level byte and age triggers. It does not disable
+persisted stream age-seal deadlines. A checkpoint maximum age of `-1` forces a
+checkpoint in every materialization round.
+
+## 6. On-disk layout and formats
+
+The root layout has this form:
 
 ```text
-client
-  │
-  │ append
-  ▼
-partition WAL
-  │  1. write the transaction frame
-  │  2. flush the WAL
-  │  3. confirm the client
-  │
-  │ later: materializer copies the payload
-  ▼
-active stream segment and index sidecar
+root/
+├── FORMAT
+├── wal/
+│   ├── p0000/
+│   │   ├── checkpoint.json
+│   │   ├── wal-0000000000000011.log
+│   │   └── wal-0000000000000012.log
+│   └── p0001/
+│       └── ...
+└── streams/
+    └── <shards>/<stream-identity>/
+        ├── seg-0000000000000000.seg
+        ├── seg-0000000000000001.seg
+        └── seg-0000000000000001.idx
 ```
 
-This is a real second copy on disk. The WAL copy is in transaction order and
-is the recovery source. The stream copy is in message order and is the read
-source. Both copies remain live until a checkpoint and a WAL rollover make an
-old WAL segment eligible for removal. The current WAL segment cannot be partly
-removed. On a low-volume partition, it can remain for a long time even when a
-checkpoint points near its end.
+The stream path uses sharding and an internal stream identity. A recreated
+stream does not reuse the deleted incarnation's files.
 
-The live WAL can make the payload part of disk use approach twice the incoming
-data size for the history that it still contains. Record headers, indexes,
-checkpoints, and filesystem allocation add more space. Retention controls how
-long stream history remains. When materialization keeps up, checkpoints and
-whole-segment WAL reclamation limit duplication to the unreclaimed WAL suffix,
-including the segment that contains the replay position. There is no hard bound
-on that suffix if materialization falls behind.
+The format versions are:
 
-Ordinary materialization can publish the new stream-file prefix to readers
-before it is durable. This is safe because the durable WAL remains the recovery
-source. If the machine fails at this point, recovery ignores stream-file state
-that the last checkpoint does not name and rebuilds it from the WAL.
+| Object | Version |
+|---|---|
+| Root `FORMAT` | `seglog-format-v4` |
+| Checkpoint schema | 3 |
+| WAL | 1 |
+| Stream segment | 2 |
 
-### Sealing does not rewrite the payload
+The engine refuses older formats. It does not migrate them.
 
-While a stream segment is active, it has two files:
+`FORMAT` also stores the partition count and the XXH64 routing identifier.
+
+A WAL segment starts with a 4 KiB header. WAL frames contain operation type,
+transaction number, stream identity, metadata, payload lengths, and payloads.
+CRC32C values protect the frame header, body, each payload, and complete frame.
+A closing magic value terminates the frame.
+
+An active stream segment has this form:
 
 ```text
-active .seg:  [64-byte header][payload A][payload B][payload C]...
-active .idx:  [16-byte entry A][16-byte entry B][16-byte entry C]...
+.seg: [64-byte header][payload A][payload B][payload C]...
+.idx: [16-byte entry A][16-byte entry B][16-byte entry C]...
 ```
 
-Each index entry records the payload end offset, the payload CRC32C checksum,
-and the batch boundary. The separate sidecar lets the payload bytes remain
-contiguous while the segment grows.
-
-When the active segment has reached the 128 MiB target, the materializer seals
-it before it writes the next message. Sealing does not read and rewrite the
-payload area. It copies only the small index to the end of the existing `.seg`
-file and appends a checksummed footer:
+Each index entry stores the payload end offset, payload CRC32C, and batch
+boundary. A sealed segment has this form:
 
 ```text
-sealed .seg:  [header][unchanged payload bytes][dense index][footer]
-new .seg:     [header][new payloads...]
+.seg: [header][unchanged payload bytes][dense index][checksummed footer]
 ```
 
-The sealed file is immutable. A reader can send a payload range from it without
-copying the payload through user-space memory. The materializer removes the old
-`.idx` sidecar only after a durable checkpoint names the sealed `.seg` file.
+The checkpoint stores stream metadata, segment geometry, durable active
+prefixes, materialized record frontiers, fork metadata, and the replay
+position. It does not store record payloads.
 
-Size is not the only seal condition. By default, the engine also seals a
-non-empty active segment one hour after the creation time in its segment
-header. This is wall-clock open age, not idle age: continuous writes do not
-restart it, and restart preserves it. The adaptive materializer schedules the
-nearest deadline, so this works without retention and without polling every
-stream at a fixed interval. A zero maximum open age disables age rollover.
+## 7. Write and commit pipeline
 
-### A checkpoint is a durable recovery statement
+Admission uses one bounded queue per partition. A caller waits when the queue
+is full. Context cancellation can stop a mutation only before admission.
 
-A checkpoint is per partition. By default, a partition requests a checkpoint
-after 32 MiB of materialized data or after three seconds. The first limit that
-is reached starts the checkpoint. A WAL roll, retention work, recovery work,
-or shutdown can require an earlier checkpoint.
+After admission, the caller waits for the final result. The engine borrows the
+caller's payload memory until that result is returned. The caller must not
+modify or release the payload during this interval.
 
-The checkpoint describes a point in two views of the same history:
+The stager validates and encodes the mutation. It writes the frame at arrival.
+It then adds the frame and result handle to the pending FIFO list.
 
-- the WAL segment, byte offset, and next transaction number from which replay
-  must continue;
-- each live stream's metadata, sealed segment list, durable active-segment
-  prefix, and materialized message frontier.
+The committer snapshots the current pending prefix. The snapshot can contain
+frames in two WAL segments after rollover. The committer calls `fdatasync` on
+each distinct WAL segment in write order. A frame written after the snapshot
+remains pending for the next commit.
 
-The checkpoint can name any durable active prefix. A stream segment does not
-need to be full or sealed. One checkpoint can name a 128 MiB sealed segment for
-stream A, a 4 MiB active segment for stream B, and a 20 KiB active segment for
-stream C.
+The FIFO publisher gives each frame its final result in order. It updates
+in-memory stream state only after the commit outcome is known. Publisher
+backpressure can delay the committer.
 
-The checkpoint replay position and the stream image use the same FIFO barrier.
-At the barrier, the partition publisher captures an owned snapshot of each
-dirty stream. The snapshot includes the WAL tail, segment descriptors, stream
-metadata, retention policy, and fork metadata. Materialization uses this
-snapshot. It does not read newer live stream state.
+Committers across partitions use a shared commit-wave gate. Workers in one
+wave flush their WAL files concurrently. Workers that arrive during an active
+wave wait for the next wave. After a contended wave, the gate uses a short
+boarding window. The window is one eighth of the preceding wave duration. It
+has a minimum of 200 microseconds and a maximum of 2 ms. An idle gate releases
+a single worker without a fixed periodic timer.
 
-A mutation that is published after the barrier stays in the new dirty set. Its
-WAL bytes stay after the checkpoint replay position. The next materialization
-round processes it. This rule also applies to append, delete, recreate, trim,
-retention, and metadata changes. A deleted incarnation can remove only its own
-checkpoint entry. It cannot remove a new incarnation that has the same stream
-name.
+If `SyncWritesDisabled` is selected, the pipeline does not wait for a WAL
+durability barrier. A successful result in this mode is not crash-durable.
+
+## 8. `ProducerGroup`
+
+A `ProducerGroup` collects multiple append mutations for one partition. It is
+single-use. All stream names in the group must route to the same partition.
+
+The complete group uses one queue item. The stager encodes independent WAL
+frames and writes them with one contiguous write. One covering sync applies to
+the group. The complete encoded group must fit in one WAL segment.
+
+A `ProducerGroup` is not an atomic transaction. Each frame has independent
+validation, offset, sequence result, and final result. Recovery processes each
+valid frame independently. A torn tail can contain a valid frame prefix.
+
+The group borrows all caller payload memory until `Commit` returns. Queue depth
+does not bound the total caller memory referenced by one admitted group. The
+caller must bound group size as well as satisfy the WAL segment limit.
+
+Cancellation can stop `Commit` only before queue admission. After admission,
+`Commit` waits for every final result.
+
+A WAL write or sync error can leave frame durability unknown. Affected results
+include `ErrDurabilityUnknown` and preserve the underlying system error. The
+partition then enters fail-stop state for writes.
+
+## 9. Materialization
+
+Materialization copies published WAL payloads to active stream segments. It
+also applies metadata and lifecycle changes to owned stream snapshots.
+
+The default triggers are 4 MiB of unmaterialized WAL-frame bytes or an oldest
+age of 250 ms. Pressure or age starts work. The implementation does not scan
+all streams on a fixed polling interval.
+
+A capacity-one wake signal coalesces notifications. Each active partition
+retains a 1 MiB payload buffer and a 64 KiB index buffer. Consecutive payload
+and index writes are coalesced into these buffers. A payload larger than the
+payload buffer bypasses that retained buffer.
+
+The ordinary sequence is:
 
 ```text
-publisher order
+WAL frame
+   │ verify payload checksum
+   ▼
+active .seg payload prefix
+   │
+   ├─ append 16-byte index entry to active .idx
+   └─ publish readable materialized prefix
+```
+
+An ordinary materialized prefix can become readable before checkpoint
+durability. The WAL remains the recovery source for state after the last
+checkpoint.
+
+## 10. Stream segment rollover
+
+The default stream segment target is 128 MiB of payload. The header, index, and
+footer do not count toward this target.
+
+The engine never splits a record. It writes the record that crosses the target
+to the current segment. It seals that segment before the next record. A single
+large record can therefore make a segment larger than the target.
+
+Size sealing copies the index to the end of the `.seg` file and writes a
+footer. It does not rewrite payload bytes. The engine removes the obsolete
+`.idx` sidecar only after a durable checkpoint names the sealed form.
+
+The default maximum open age is one hour. Open age starts at the creation time
+in the segment header. Writes do not reset it. Restart preserves it. The age
+rule applies only to a non-empty active segment.
+
+Age-seal work is deadline-driven. If due work remains after a failure or
+incomplete round, the scheduler retries after a fixed 100 ms delay. It does
+not use exponential backoff.
+
+## 11. Checkpoint protocol and barrier invariant
+
+Checkpoint byte pressure counts materialized WAL-frame bytes. The default byte
+threshold is 32 MiB.
+
+Checkpoint age starts with the first successful materialization that no
+durable checkpoint covers. The default age threshold is three seconds. Idle
+time before that materialization does not count.
+
+A checkpoint is forced in these conditions:
+
+- Checkpoint byte or age pressure is due.
+- The materialized replay position advances to another WAL segment.
+- The batch contains removals or victim files.
+- `CheckpointMaxAge` is `-1`, which forces every materialization round.
+- Final shutdown materialization runs.
+
+The partition publisher creates one FIFO barrier. At this barrier it captures
+the WAL replay position and owned snapshots of all dirty streams. It replaces
+the dirty set before later publications enter it.
+
+```text
+publisher FIFO
 
 pre-barrier records ──▶ [ barrier B ] ──▶ post-barrier records
                               │
-                              ├─ capture WAL replay position B
-                              ├─ capture dirty stream snapshots
-                              └─ replace the dirty set
+                              ├─ capture replay position B
+                              ├─ capture owned dirty-stream snapshots
+                              └─ install a new dirty set
 
-checkpoint B contains:       state at or before B
-next materialization contains: state published after B
+checkpoint B: state at or before B
+next batch:   mutations after B
 ```
 
-The durability order matters:
+This gives the barrier invariant:
 
-1. Copy committed WAL payloads into the stream files.
-2. Flush every stream payload file, index sidecar, and required directory that
-   the new checkpoint will name. On Linux, one shared `syncfs` barrier does
-   this work for the filesystem.
-3. Atomically replace the partition checkpoint with the new durable image.
-4. Remove index sidecars that the checkpoint no longer needs.
-5. Remove whole WAL segments that are older than the checkpoint replay
-   segment.
+> A checkpoint replay position and all stream snapshots in that checkpoint
+> come from the same publisher FIFO barrier. Every post-barrier mutation stays
+> dirty and has WAL position after the captured replay position.
 
-```text
-                 materialize                 checkpoint
+The durability sequence is:
 
-WAL 17 ─┐                                  ┌─ durable stream A prefix
-WAL 18 ─┼─ copy payloads into stream files ├─ durable stream B prefix
-WAL 19 ─┘                                  └─ replay starts in WAL 19
-                                                │
-                                                ▼
-                                  WAL 17 and WAL 18 can be removed
+1. Materialize the frozen stream snapshots.
+2. Sync all payload files, index sidecars, and directories that the checkpoint
+   will require.
+3. Write a temporary checkpoint in the partition directory.
+4. Sync and close the temporary checkpoint.
+5. Rename it atomically to `checkpoint.json`.
+6. Sync the checkpoint directory.
+7. Remove obsolete sidecars, victim stream files, and eligible whole WAL
+   segments.
+
+On Linux, required stream-file durability uses a coalesced `syncfs` service.
+One `syncfs` call serves each request epoch. Requests that arrive during an
+active call join the next epoch. The portable path syncs the required files
+and directories individually.
+
+If checkpoint preparation or installation fails, the engine retains the
+frozen batch. A retry uses the same snapshots and replay position. Newer
+mutations remain in the next dirty set.
+
+## 12. Recovery
+
+Recovery validates `FORMAT`, partition routing, checkpoint schema, WAL headers,
+WAL sequence, and stream segment metadata. A version mismatch fails startup.
+
+Each partition loads its checkpoint and starts WAL replay at that checkpoint's
+replay position. Replay requires consecutive transaction numbers and WAL
+segment numbers.
+
+An invalid non-zero frame in the final WAL segment is a possible torn tail.
+Recovery keeps the valid prefix. It truncates and clears the invalid suffix
+before it resumes writes.
+
+An invalid frame in an older WAL segment is corruption. A transaction-number
+gap or WAL-segment gap is also corruption. These conditions fail startup.
+
+A valid frame can survive even if its caller did not receive success. The
+durability contract does not guarantee absence of unacknowledged frames.
+
+Recovery reconstructs stream metadata from the checkpoint and WAL tail. It
+uses persisted stream policies. It derives fork pin counts from live fork
+references.
+
+## 13. Reads and direct spans
+
+A read can use three state sources:
+
+1. Immutable sealed stream segments.
+2. The durable or readable prefix of an active stream segment.
+3. Committed WAL-tail records that are not yet materialized.
+
+The read path composes these sources in stream order. It verifies CRC32C for
+ordinary reads from WAL, active segments, and sealed segments.
+
+A direct span is available only for a non-fork stream when the full requested
+tail consists of immutable sealed data. A direct span pins the source files for
+the read duration. The direct path does not verify each payload checksum again.
+
+The HTTP transport can use a zero-copy kernel path for a direct span. The
+design does not guarantee use of `sendfile`, `splice`, or another specific
+system call. TLS, JSON encoding, forks, active data, or WAL-tail data require a
+copied path.
+
+## 14. Retention and forks
+
+Retention can use `MaxBytes`, maximum record age, or both. Zero disables the
+corresponding limit.
+
+`MaxBytes` is a logical payload target. It is not a disk quota. The engine
+advances retention at whole sealed-segment granularity and preserves records
+that must remain readable.
+
+Retention advances a logical floor. Reads below the floor return a gone
+result. The floor survives restart. Record indexes do not change.
+
+Physical deletion uses whole sealed stream segments. The active segment is not
+partially removed. Read pins and fork pins can delay unlink after the logical
+floor advances.
+
+A fork can retain source segments below the source stream's logical floor. The
+engine unlinks those segments only after the last fork and read pin releases
+them. Deleting a source does not invalidate an existing fork's pinned history.
+
+The default background sweep interval is 30 seconds. A value of `-1` disables
+the background sweep. Request-time validity checks and the persisted logical
+floor do not depend on the sweep.
+
+## 15. Scheduling and retries
+
+Write commits are completion-driven. The shared gate coordinates concurrent
+partition flushes. It does not impose a fixed commit interval.
+
+Materialization is pressure-driven and deadline-driven. A capacity-one wake
+prevents unbounded wake accumulation. The scheduler tracks the nearest age
+deadline instead of polling every stream.
+
+Checkpoint sync requests use epochs. A request that arrives during an active
+Linux `syncfs` call waits for the next call.
+
+Transient materialization and checkpoint failures retain due work for retry.
+The retry retains the frozen barrier batch when one exists. Age-seal due work
+uses a fixed 100 ms retry delay.
+
+A WAL write or WAL sync error is different. The partition latches its first WAL
+failure and refuses later writes. It does not retry writes on that partition.
+Other partitions can remain available.
+
+## 16. Resource bounds, admission, and disk-full behavior
+
+The queue depth bounds admitted queue items per partition. The publisher and
+committer apply backpressure through their bounded pipeline. Retained payload
+and index coalescing buffers have fixed sizes per active partition.
+
+A queue item can reference caller-owned payload memory. One `ProducerGroup`
+can contain many frames. The caller must impose an application-level bound on
+group memory.
+
+A WAL segment has a default logical limit of 256 MiB, including its 4 KiB
+header. The file grows lazily in 16 MiB logical extents. On Linux, the engine
+uses `fallocate`. It falls back to sparse truncate when the platform or
+filesystem does not support allocation. Physical allocation therefore depends
+on the filesystem and platform.
+
+The store has no global hard disk budget. It has no free-space admission
+control. `DiskUsage` is observational. Retention `MaxBytes` does not constrain
+WAL, metadata, indexes, checkpoints, filesystem overhead, or pinned files.
+
+WAL use has no hard bound when materialization, checkpointing, or reclamation
+lags or fails. Whole-segment reclamation also retains the segment that contains
+the replay position.
+
+`ENOSPC` can occur during WAL allocation, WAL writes, materialization,
+checkpoint installation, or file metadata operations. A WAL allocation, write,
+or sync failure puts that partition in fail-stop state. An attempted frame can
+return `ErrDurabilityUnknown`. Background materialization or checkpoint errors
+retain work and retry, but free space must become available for progress.
+
+## 17. Metrics
+
+`Stats` contains aggregate `PartitionStats`, `CommitWaves`, and
+`PerPartition`. Counters and histograms reset when the process starts. They are
+not persisted across restart.
+
+The complete `PartitionStats` fields are:
+
+| Field | Meaning |
+|---|---|
+| `GroupsCommitted` | Partition pending-list snapshots processed in commit waves |
+| `OpsCommitted` | Operations processed in those snapshots |
+| `WALBytesWritten` | WAL frame bytes written |
+| `CommitFdatasyncNanos` | Time spent in WAL durability calls |
+| `GroupSizeHist` | Ten-bucket histogram of operations per partition snapshot |
+| `CommitterIdleNanos` | Time the committer had no commit work |
+| `PublishNanos` | Time used to publish final results |
+| `MaterializerSyncs` | Per-file sync calls attempted by the portable checkpoint fallback |
+| `SyncfsCalls` | Actual Linux `syncfs` calls |
+| `CheckpointRounds` | Checkpoint rounds attempted, including failed attempts |
+| `PendingWALBytes` | Written frame bytes without a final publish result |
+| `UnmaterializedWALBytes` | Published frame bytes not covered by a completed materialization barrier |
+| `OldestUnmaterializedAge` | Age of the oldest frame before that barrier |
+| `MaterializedNotCheckpointedBytes` | Materialized frame bytes not covered by a durable checkpoint |
+| `UnreclaimedWALBytes` | Logical bytes in WAL segments that still exist |
+| `CurrentWALSegmentBytes` | Logical bytes used in the active WAL segment |
+| `CurrentWALSegmentCapacityBytes` | Current logical capacity of the active WAL segment |
+| `CurrentWALSegmentUtilization` | Used bytes divided by logical capacity |
+| `CheckpointReplayPosition` | Segment and byte offset where this partition replays |
+
+Aggregate byte and counter fields are sums across partitions.
+`OldestUnmaterializedAge` is the maximum age across partitions.
+`CheckpointReplayPosition` is not aggregated because partition WAL positions
+are not comparable. Use `PerPartition` for replay positions.
+
+`CommitWaves` counts process-wide commit-gate waves. `DiskUsage` reports
+observed physical allocation through its separate API. It falls back to
+logical file size on platforms that do not expose allocated block counts.
+Neither metric defines an admission limit.
+
+## 18. Shutdown and platform behavior
+
+`Close` stops new admission and drains the write pipeline. It requests final
+materialization and a final checkpoint for every partition. It then releases
+resources and removes temporary storage when applicable.
+
+The default shutdown timeout is 30 seconds. If shutdown exceeds the timeout,
+`Close` returns an error. It leaves files open and defers final teardown so
+active workers do not use closed files. A caller must treat timeout as an
+incomplete graceful shutdown.
+
+Linux uses `fdatasync` for WAL durability and `syncfs` for coalesced
+materialization durability. Linux retries interrupted sync operations. Linux
+uses `fallocate` for WAL extents when supported.
+
+The portable fallback uses full file sync where `fdatasync` is unavailable. It
+syncs required files and directories instead of using `syncfs`. Filesystem
+allocation and directory-sync guarantees vary by platform.
+
+Supported Unix platforms lock the store directory against a second process.
+Platforms without that lock implementation do not detect a second opener.
+Opening one store from multiple processes is unsupported on all platforms.
+
+The durability guarantee requires the operating system, filesystem, storage
+controller, and device to honor the selected sync operation. seglog cannot
+detect false flush completion from lower layers.
+
+## 19. Design trade-offs
+
+The partitioned WAL limits flush ownership and permits parallel staging. It
+also removes global transaction order and requires persisted routing.
+
+Per-stream segments provide contiguous stream payloads and independent
+retention boundaries. They add a second payload write, a dense index, and a
+checkpoint consistency protocol.
+
+Payload-only segment targets keep record data limits independent of index and
+footer size. Whole-record and whole-segment rules can exceed logical targets.
+
+Write-at-arrival reduces time before a frame can join a commit snapshot. It
+requires a pending FIFO and borrowed caller memory until publication.
+
+Shared commit waves and coalesced filesystem syncs coordinate costs that apply
+across partitions. They can couple latency across otherwise independent
+partitions.
+
+Frozen checkpoint batches preserve a simple recovery invariant across retries.
+They retain memory and delay reclamation while checkpoint work cannot complete.
+
+Whole-segment reclamation simplifies crash safety. It can retain substantial
+logical and physical space after the logical frontier advances.
+
+Direct spans avoid payload copying only for fully immutable requested tails.
+This restriction preserves stable file geometry and pin safety.
+
+## 20. Benchmark requirements
+
+Current throughput, write amplification, and tail-latency effects require
+measurement. This design makes no current claim that recent changes improved
+tail latency.
+
+A benchmark report must define hardware, kernel, filesystem, mount options,
+storage cache policy, process settings, workload, stream cardinality, message
+size distribution, client concurrency, test duration, warm-up, and durability
+mode. It must distinguish process-failure tests from power-loss tests.
+
+Each reported workload must include:
+
+- Throughput.
+- Latency at p50, p95, p99, and p99.9.
+- `PendingWALBytes` and its age or duration distribution.
+- `UnmaterializedWALBytes` and `OldestUnmaterializedAge`.
+- `MaterializedNotCheckpointedBytes`.
+- `UnreclaimedWALBytes` and per-partition replay positions.
+- Commit-wave, WAL sync, materializer sync, `syncfs`, and checkpoint counts.
+- Logical file bytes and physical allocated bytes.
+- Relevant write, sync, allocation, rename, and zero-copy syscall counts.
+- Block-device bytes written and resulting write amplification.
+
+The report must include steady-state and recovery behavior. It must run long
+enough to include materialization, checkpoint, rollover, retention, and file
+reclamation. Comparative results require equivalent durability and workload
+settings.
+
+The repository includes `BenchmarkAppendBackgroundScheduling`. It compares
+foreground-only work, the default background policy, and high checkpoint
+pressure. Run it on the storage device under test:
+
+```sh
+TMPDIR=/path/on/test-device GOMAXPROCS=16 \
+  go test ./durablestream/storage/seglog \
+  -run '^$' \
+  -bench '^BenchmarkAppendBackgroundScheduling$' \
+  -benchmem -benchtime=5s -count=10
 ```
 
-The engine never removes a WAL segment only because one stream reached 128
-MiB. A WAL segment usually contains records for many streams. Every record
-before the checkpoint frontier must have a durable representation in the
-checkpointed stream state. Reclamation also works only on whole WAL segments.
-The WAL segment that contains the replay position remains, even if the
-checkpoint points near its end.
-
-This ordering handles the important failures:
-
-- **Failure before stream-file flush:** the confirmed WAL record remains, so
-  recovery copies it again.
-- **Failure after stream-file flush but before checkpoint replacement:** the
-  old checkpoint remains authoritative, and recovery replays the WAL. Extra
-  stream-file bytes are not treated as committed checkpoint state.
-- **Failure after checkpoint replacement but before WAL removal:** both copies
-  remain, and recovery starts at the newer replay position. The extra WAL file
-  can be removed later.
-- **Failure after WAL removal:** the checkpoint already names durable stream
-  files, so recovery does not need the removed WAL history.
-- **Checkpoint write failure:** the engine keeps the prepared batch and its
-  barrier snapshots. It retries the same batch. Newer mutations stay dirty for
-  a later round.
-- **Age-seal checkpoint failure:** the active segment stays published until a
-  checkpoint succeeds. The scheduler retries with bounded backoff. A retry does
-  not create a duplicate sealed segment.
-
-For example, a 1 GiB stream eventually has about eight 128 MiB stream segments,
-plus index and footer overhead. During ingestion, some of the same payload also
-exists in one or more WAL segments. The amount of duplicate data depends on the
-materialization rate, checkpoint rate, WAL rollover points, and write load. It
-is not a fixed extra 256 MiB or a fixed factor of two.
-
-## The log format
-
-The log holds one record for each change: create a stream, append messages,
-delete a stream, and so on. A record has:
-
-- a header with a magic number, the operation type, lengths, a timestamp,
-  and a transaction number,
-- the stream name,
-- operation metadata,
-- the message payloads,
-- a trailer with a closing magic number.
-
-The frame header, the body containing stream identity and operation metadata,
-each payload, and the complete frame have CRC32C checksums. The transaction
-number increases by exactly one for each record in a partition, with no gaps.
-
-Recovery starts at the checkpoint replay position and requires consecutive
-transaction numbers. An invalid non-zero frame in the final WAL segment is a
-torn tail. Recovery keeps the preceding valid prefix, truncates and re-zeroes
-the remainder, and resumes writing there. An invalid frame in an earlier
-segment, a transaction-number gap, or a WAL-segment gap fails startup as
-corruption.
-
-The valid prefix can contain a complete frame whose caller did not receive a
-confirmation. Recovery can keep such a frame. The guarantee is one-way: every
-confirmed frame survives a crash covered by the durability model, but an
-unconfirmed frame can also survive.
-
-## Metadata takes the same path as messages
-
-A stream has more state than its messages: a content type, an expiry time,
-a closed flag that marks permanent end of stream, retention rules, the last
-producer sequence value, and - for a fork - a reference to its source
-stream. This post calls all of this metadata.
-
-The engine has one rule for it: **every metadata change is one log record**,
-written and flushed exactly like an append. Create carries the full stream
-configuration. Delete, close, expiry renewal, and retention changes each
-carry their complete new value. There is no separate configuration file, no
-metadata database, and no second commit path.
-
-This rule buys three things.
-
-First, metadata gets the same durability as data, at almost no extra cost. With
-synchronous writes enabled, a create or delete is confirmed only after a flush
-covers its record. An expiry renewal is one small record that rides the same
-flush round as the appends around it. The gate makes no distinction: a round
-can carry appends from one partition and a delete from another in the same
-device flush wave.
-
-Second, recovery has one source of truth. There is no moment where a
-configuration file says one thing and the log says another. Replay applies
-records in transaction order. Recovery enforces that order with consecutive
-transaction numbers. Each metadata record carries an absolute new value, not
-a difference, so applying the same record twice is idempotent. Applying
-different records out of order would not be equivalent.
-
-Third, the state that can be derived is not stored. A fork record in the
-log carries the full reference to its source stream. The engine does not
-store a count of how many forks use a source. After a crash, it derives the
-counts by scanning the streams that exist. A stored count could disagree
-with reality; a derived count cannot.
-
-The current metadata for every stream lives in one in-memory table, rebuilt
-at startup from the checkpoint plus the log tail. Appends and reads check
-it at the moment of use: does the content type match, is the stream closed,
-has the expiry time passed. An expired stream is treated as gone the moment
-a request touches it. No background timer has to fire at the right moment
-for correctness; background work only reclaims the space later.
-
-Two details follow from production use:
-
-- The last accepted producer sequence is part of the durable metadata. When
-  an append supplies a sequence, its WAL frame stores the value and the
-  checkpoint later stores the last accepted value and offset. An append
-  without a sequence does not change this state. After restart, a producer
-  that sends a non-advancing value is still rejected, and the head of the
-  stream reports where the producer can continue.
-- Delete does not always remove data. If a fork still reads from the
-  deleted stream's history, the files stay until the last such fork is
-  gone. Clients see the stream as deleted at once - the delete record is
-  durable - but the bytes wait. A stream created again with the same name
-  gets its own identity and its own files; the old and new files never mix.
-
-The checkpoint completes the picture. Its per-stream image holds the
-configuration, the closed flag, the last sequence value, the message count,
-the retention floor, the fork reference, and the file list. Recovery loads
-this image and replays only the log records after it. Payload bytes stay out
-of the checkpoint. The checkpoint stores sealed file names and geometry and
-the durable prefix of any active segment. The stream files contain a small
-header, payload bytes, index entries, and, when sealed, a footer. Stream
-configuration never enters these files, which keeps the payload area
-byte-identical to the wire.
-
-## Retention advances a logical floor
-
-Each stream can have a maximum retained byte count, a maximum record age, or
-both. Zero means that the limit is disabled. The engine copies the default
-retention policy when it creates a stream. A later change to the process
-default does not change an existing stream. A retention WAL record can change
-the policy for one existing stream.
-
-Retention advances a logical floor. A read below this floor returns a gone
-result. The floor is part of the checkpoint and survives restart. New appends
-continue with increasing message indexes. Retention does not renumber records.
-
-Physical removal uses whole sealed stream segments. The engine preserves the
-active segment and any sealed segment that contains records above the floor.
-Age retention can require an idle active segment to become sealed first. The
-persisted maximum-open-age policy provides this bound. Continuous appends do
-not reset the segment creation time.
-
-A fork can pin source segments. Retention can advance the source's logical
-floor while these physical files remain. The engine removes the files only
-after the last fork releases them. This can make logical retention complete
-before disk space is reclaimed.
-
-Retention and age sealing use the same checkpoint order as normal
-materialization. The engine first makes the retained stream image durable.
-Then it removes victim files. A crash before file removal leaves extra safe
-files. A crash after file removal is safe because the durable checkpoint no
-longer names those files.
-
-## Stream segments store payload bytes verbatim
-
-A read request asks for a range of messages from one stream. In the stream
-files, message payloads are stored next to each other, with no headers
-between them, in stream order. A separate small index stores one 16-byte
-entry per message: where the payload ends, its checksum, and its batch
-boundary.
-
-The current direct path applies to non-JSON reads of non-fork streams whose
-entire current tail is materialized in immutable sealed segments. The server
-passes pinned file ranges to the response writer. A plaintext `net/http`
-connection can promote this transfer to `sendfile` or `splice`. JSON responses,
-TLS connections, every forked stream, and any stream with an active or
-WAL-resident tail use a user-space copied path.
-
-One local test with 1,000 clients reading the same 64 MiB stream observed 5.5
-GB/s with the server at 183 MiB of memory. This is a result from that machine
-and test setup, not a general throughput guarantee.
-
-Materialization verifies each WAL payload before copying it. The ordinary
-`Read` API verifies payload CRC32C again for WAL, active-segment, and sealed-
-segment reads. Only the direct file-range path for immutable sealed segments
-skips per-read payload verification.
-
-## How a write travels
-
-An append request follows this path:
-
-1. The HTTP handler hashes the stream name and finds the partition.
-2. The request goes into that partition's queue. The queue has a fixed
-   size. When it is full, callers wait. This is the backpressure boundary.
-3. One worker per partition takes requests from the queue, one at a time.
-   It validates the request, builds the record, and writes the record to
-   the log file **immediately**.
-4. The worker adds the record to the partition's pending list and moves to
-   the next request. It does not wait for the disk.
-
-At step 3, the record has entered the operating system's page cache but has
-not crossed seglog's durability barrier. A machine or power failure can lose
-it. That is acceptable because the client has not received a confirmation.
-With synchronous writes enabled, seglog confirms the request only after the
-covering WAL `fdatasync` succeeds.
-
-### A producer can request one durability group
-
-The `ProducerGroup` API lets one producer add multiple append or `AppendBatch`
-mutations before it calls `Commit`. All mutations must map to one partition.
-The partition writes their ordinary WAL frames in one contiguous write. One
-covering `fdatasync` makes the valid frames durable.
-
-This group is not a multi-stream transaction. Each mutation has its own stream
-validation, sequence result, offset, and error. Valid mutations can succeed
-when another mutation has a sequence conflict or another definitive error.
-Recovery also treats each WAL frame independently. A torn write can leave a
-valid frame prefix.
-
-The group is caller-owned and single-use. It borrows payload bytes until
-`Commit` returns. Context cancellation can stop a commit only before queue
-admission. After admission, `Commit` waits for the final result. If a WAL write
-or flush fails after an attempted write, frame-bearing results contain
-`ErrDurabilityUnknown`. The error also keeps the underlying system error so a
-caller can inspect both causes.
-
-The complete producer group uses one bounded queue slot. Its encoded frames
-must fit in one WAL segment. A group cannot span partitions or WAL segments.
-These limits keep queue memory and one-write behavior bounded.
-
-The earlier version of this engine held requests back and formed them into
-groups before writing. Measurement showed this was a mistake: each request
-waited for its group, then the group waited for the disk, and every wait
-multiplied. Writing at arrival removes the first wait completely. The very
-next flush covers the record, whichever flush that is.
-
-## The watermark
-
-The pending list is the watermark. It holds every record that has been
-written to the log but not yet confirmed safe.
-
-A flush call (`fdatasync`) has a useful property: it covers every byte
-written to the file *before* the call started. It makes no promise about
-bytes written *during* the call.
-
-The flush worker for a partition uses this property with one strict rule:
-
-1. Take the whole pending list. Call it the snapshot.
-2. Call `fdatasync` on each distinct WAL segment represented in the snapshot,
-   in write order. A snapshot can cross a segment rollover.
-3. When every required flush returns without error, confirm the snapshot in
-   order.
-
-A record written while step 2 runs is not in the snapshot. It stays in the
-pending list and is covered by the next flush. Order is preserved: records
-enter the list in log order and leave in log order.
-
-This is the same shape as the Rust server's WAL: reserve, write, and let a
-moving mark divide what is safe from what is not.
-
-## The gate
-
-One fact from measurement drives the last part of the design. On our test
-disk, a flush that carries data takes 5 to 8 milliseconds, and the disk
-completes roughly 120 to 180 real cache-flush commands per second, no
-matter how many programs ask. When many flush calls run at the same time,
-the kernel merges them into few device commands - but each caller still
-waits in line.
-
-This creates a trap for a partitioned engine, and we walked straight into
-it. Thirty-two partitions, each flush-clocked on its own schedule, made up
-to 3,400 fdatasync calls per second. Each call returned in about a
-millisecond - the merged cost, not the real one - so every partition kept
-committing two-record groups against a device that could honor perhaps 150
-real flushes per second. The result was one quarter of the possible
-throughput, and the write amplification described in the next section.
-
-The fix is group commit at the level where the cost actually lives: the
-device flush, shared by all partitions, not the partition's own file.
-The gate is one shared object per store:
-
-- A flush worker arrives at the gate and waits.
-- The gate releases every waiting worker **together**. Each flushes its own
-  log file concurrently; the kernel merges the batch into about one device
-  command.
-- Workers arriving while that cohort runs wait for the next release.
-- When the cohort completes, the gate holds the next release open briefly -
-  an eighth of the measured cohort duration, at most two milliseconds - so
-  workers that just finished can rejoin. Without this window, a worker
-  always misses the next release by microseconds and idles a full round,
-  which structurally doubles commit latency for every client.
-- Then the next cohort releases, and the cycle repeats.
-
-No fixed periodic commit timer sets the overall cadence. Completion of one
-flush wave opens the next cycle. After a contended wave, an adaptive boarding
-timer waits for one eighth of the measured wave duration, clamped between 200
-microseconds and 2 milliseconds. A fast disk therefore produces shorter
-windows than a slow disk. When one worker arrives and nothing else is running,
-the gate releases it at once.
-
-Each partition also has a publisher. After a flush, it confirms the snapshot's
-requests to the HTTP handlers in order. A two-wave buffer normally lets
-publication overlap the next flush. If the publisher falls behind, its
-backpressure can eventually delay the committer.
-
-Checkpoints follow the same principle in one more place. On Linux, the
-engine uses `syncfs`, which flushes the whole filesystem. That call is
-global, so issuing it once per partition was waste - 70 filesystem-wide
-flushes per second at the default settings. Now all partitions share one
-call per round.
-
-## Frontier metrics show background pressure
-
-The engine reports the distance and age between the WAL, materialization, and
-checkpoint frontiers. Aggregate statistics add byte counts across partitions.
-Replay positions remain per partition because positions from different WALs
-cannot be compared.
-
-The main pressure metrics are:
-
-- `PendingWALBytes`: frame bytes that are written but do not yet have a final
-  flush or failure result.
-- `UnmaterializedWALBytes`: committed WAL bytes that no completed
-  materialization barrier covers.
-- `OldestUnmaterializedAge`: the age of the oldest record before that barrier.
-- `MaterializedNotCheckpointedBytes`: bytes that materialization covers but a
-  durable checkpoint does not cover.
-- `UnreclaimedWALBytes`: logical bytes in WAL segments that still exist.
-- `CurrentWALSegmentBytes`: logical bytes used in the active WAL segment.
-- `CurrentWALSegmentCapacityBytes`: the logical capacity of that segment.
-- `CurrentWALSegmentUtilization`: used bytes divided by logical capacity.
-- `CheckpointReplayPosition`: the WAL segment and byte offset from which one
-  partition will replay.
-
-These values answer different questions. A large unmaterialized distance means
-that stream files are behind the WAL. A large materialized but uncheckpointed
-distance means that derived files are ahead of the durable recovery statement.
-A large unreclaimed distance can remain after checkpoint progress because WAL
-removal uses whole segments. Segment utilization shows how much of the current
-logical rollover unit is in use; it does not show physical preallocation. WAL
-files grow physically in the configured 16 MiB extents by default.
-
-## Write amplification
-
-Write amplification is the ratio of bytes the device writes to bytes the
-application handed the engine. Our starting point was 244x: 354 MB/s of
-device writes carrying about 1.4 MB/s of payload. That number is worth
-decomposing, because its terms are independent, they respond to different
-fixes, and only some of them are fundamental.
-
-1. **Log framing.** A 256-byte append becomes a record of roughly 340
-   bytes: header, stream name, metadata, checksums, trailer. About 1.3x at
-   this payload size, asymptotically 1x for large payloads.
-2. **Flush granularity.** On the measured filesystem, each `fdatasync` of a
-   small change caused page and journal writes much larger than the changed
-   record. At two records per commit group, about 700 logical bytes caused
-   16-20 KiB of device writes, 3,400 times per second. This was the dominant
-   measured term. Group commit is usually presented as a latency-for-
-   throughput trade; on this system it also controlled write amplification.
-3. **The second copy.** Materialization rewrites every payload into its
-   stream file plus a 16-byte index entry. This adds one planned payload write
-   and one index entry. Coalesced materializer buffers reduce the number of
-   write system calls. They do not reduce the logical byte amplification. Each
-   payload is materialized once, but the amount of unreclaimed WAL is not
-   bounded if materialization falls behind.
-4. **Page granularity on stream files.** A 256-byte append to one of
-   10,000 streams dirties a 4 KiB payload page and an index-sidecar page,
-   and writeback usually flushes both before neighboring appends arrive to
-   share them. This was the observed cost of small messages, high stream
-   cardinality, buffered I/O, and the measured writeback schedule. A different
-   filesystem, direct-I/O strategy, or workload can produce a different cost.
-5. **Amplification by schedule.** The per-partition checkpoint barrier
-   forced the entire filesystem's dirty pages out 70 times per second,
-   before any page could accumulate a second write. Same bytes, worse
-   timing. Coalescing the barrier removed this measured source of extra writes.
-
-The ladder as the fixes landed, measured at 256 clients:
-
-| Change | Device writes | Amplification |
-|---|---:|---:|
-| Baseline (terms 2 + 5 dominant) | 354 MB/s | ~244x |
-| One shared checkpoint barrier | 178 MB/s | ~120x |
-| Real commit groups | 57 MB/s | ~30x |
-| Final watermark pipeline, at 2.2x the throughput | 100 MB/s | ~24x |
-
-The remaining ~24x reflects terms 1, 3, and 4 under this workload. Messages of
-256 bytes scattered across 10,000 streams are an unfavorable case for page
-reuse. For larger messages, arithmetic predicts that the page-granularity
-term will move toward the two-representation cost, but we have not measured
-that point. For calibration, the LSM engine in the same test wrote about 25x
-during the same window. That short window did not include all later
-compaction work.
-
-The main avoidable amplification in this test came from *when* bytes were
-forced to the device, not only from their format. Two of the five measured
-terms were scheduling defects. Layout inspection alone did not expose them;
-the block-layer counters in `/sys/block/*/stat` did.
-
-## What it adds up to
-
-All numbers: one machine, NVMe with an honest cache flush, 10,000 streams,
-256-byte appends, measured on the same afternoon. seglog runs its default
-configuration (32 partitions). These are observations from one local 15-second
-benchmark window. They are not general product comparisons, and this
-repository does not yet contain a reproducible report with the raw results.
-
-| Server | 256 clients | 1,024 clients | Peak memory |
-|---|---|---|---|
-| seglog | 15,000/s, p50 16 ms, p99 37 ms | 47,600/s, p50 19 ms, p99 60 ms | ~190 MB |
-| BadgerDB engine | 15,800/s, p50 16 ms, p99 26 ms | 21,600/s, p50 48 ms, p99 66 ms | - |
-| Rust server | 9,500/s, p50 24 ms, p99 152 ms | 31,800/s, p50 25 ms, p99 202 ms | 3.4 GB |
-
-The one number the LSM engine still wins is the 256-client tail. seglog
-carries background materialization and checkpoint barriers in the same
-window; the LSM defers its reorganization to compaction, which this
-15-second window never charges. The 1,024-client column shows the same
-machinery winning on every metric once the commit pipeline is the
-bottleneck.
-
-At the start of this work, seglog reached 5,900 appends per second on the
-256-client test. The gap to the other engines was not one defect. It was
-three: a filesystem barrier issued 32 times too often, flush calls made at
-32 times the useful rate, and a write path that made each request wait
-twice before its bytes existed anywhere. Each fix came from a measurement,
-and one of the fixes came from reading the competitor we were losing to.
-
-The durability rule held in the process-kill test used during this work:
-append, send `SIGKILL` to the server, restart it, and count survivors. Every
-confirmed message was present after restart. This test exercises process-crash
-recovery. It does not simulate power loss because `SIGKILL` does not discard
-the kernel page cache.
+Five seconds is the minimum duration for the default three-second checkpoint
+age to occur. Longer runs are necessary for rollover and reclamation tests.

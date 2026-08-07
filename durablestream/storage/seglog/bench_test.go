@@ -54,11 +54,13 @@ func reportLatencyPercentiles(b *testing.B, samples []time.Duration) {
 		return
 	}
 	sort.Slice(samples, func(i, j int) bool { return samples[i] < samples[j] })
-	percentile := func(p int) time.Duration {
-		return samples[(len(samples)*p-1)/100]
+	percentile := func(numerator, denominator int) time.Duration {
+		return samples[(len(samples)*numerator-1)/denominator]
 	}
-	b.ReportMetric(float64(percentile(50))/float64(time.Microsecond), "p50-us")
-	b.ReportMetric(float64(percentile(99))/float64(time.Microsecond), "p99-us")
+	b.ReportMetric(float64(percentile(50, 100))/float64(time.Microsecond), "p50-us")
+	b.ReportMetric(float64(percentile(95, 100))/float64(time.Microsecond), "p95-us")
+	b.ReportMetric(float64(percentile(99, 100))/float64(time.Microsecond), "p99-us")
+	b.ReportMetric(float64(percentile(999, 1000))/float64(time.Microsecond), "p99.9-us")
 }
 
 func BenchmarkAppendDurable(b *testing.B) {
@@ -112,10 +114,7 @@ func BenchmarkAppendDurableParallel(b *testing.B) {
 		latencyMu.Unlock()
 	})
 	b.StopTimer()
-	if len(latencies) > 0 {
-		sort.Slice(latencies, func(i, j int) bool { return latencies[i] < latencies[j] })
-		b.ReportMetric(float64(latencies[(len(latencies)*99-1)/100])/float64(time.Microsecond), "p99-us")
-	}
+	reportLatencyPercentiles(b, latencies)
 }
 
 func BenchmarkAppendNoSync(b *testing.B) {
