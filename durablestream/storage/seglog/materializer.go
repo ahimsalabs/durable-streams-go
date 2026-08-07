@@ -12,6 +12,8 @@ import (
 	"slices"
 	"sync"
 	"time"
+
+	"github.com/klauspost/compress/zstd"
 )
 
 type checkpoint struct {
@@ -62,6 +64,7 @@ type preparedStream struct {
 	pins           []*fdPin
 	payloadPin     *fdPin
 	indexPin       *fdPin
+	blockPin       *fdPin
 	sealedSidecars []string
 	locked         bool
 }
@@ -99,9 +102,10 @@ func (s *Storage) runMaterializer(p *partition) {
 		}
 		unmaterialized, oldestAge, uncheckpointed := p.stats.frontierPressure(now)
 		pending, maintenance, uncheckpointedSince := p.materializerScheduleState()
-		backgroundMaterialization := s.opts.MaterializeMaxAge != -1
+		materializeMaxAge := s.materializeMaxAge()
+		backgroundMaterialization := materializeMaxAge != -1
 		materializeDue := backgroundMaterialization && (unmaterialized >= s.opts.MaterializeBytes ||
-			(unmaterialized > 0 && s.opts.MaterializeMaxAge != -1 && oldestAge >= s.opts.MaterializeMaxAge))
+			(unmaterialized > 0 && oldestAge >= materializeMaxAge))
 		checkpointDue := backgroundMaterialization && (uncheckpointed >= s.opts.CheckpointBytes ||
 			(uncheckpointed > 0 && (s.opts.CheckpointMaxAge == -1 ||
 				(!uncheckpointedSince.IsZero() && now.Sub(uncheckpointedSince) >= s.opts.CheckpointMaxAge))))
@@ -115,7 +119,7 @@ func (s *Storage) runMaterializer(p *partition) {
 			pending, maintenance, _ = p.materializerScheduleState()
 			_, _ = s.segmentAgeDeadline(p, time.Now())
 			stillDue := roundErr != nil || backgroundMaterialization && (unmaterialized >= s.opts.MaterializeBytes ||
-				(unmaterialized > 0 && s.opts.MaterializeMaxAge != -1 && oldestAge >= s.opts.MaterializeMaxAge) ||
+				(unmaterialized > 0 && oldestAge >= materializeMaxAge) ||
 				uncheckpointed >= s.opts.CheckpointBytes || pending || maintenance)
 			if stillDue {
 				retryAfter = time.Now().Add(100 * time.Millisecond)
@@ -126,8 +130,8 @@ func (s *Storage) runMaterializer(p *partition) {
 		}
 
 		deadline := time.Time{}
-		if unmaterialized > 0 && s.opts.MaterializeMaxAge != -1 {
-			deadline = now.Add(s.opts.MaterializeMaxAge - oldestAge)
+		if unmaterialized > 0 && materializeMaxAge != -1 {
+			deadline = now.Add(materializeMaxAge - oldestAge)
 		}
 		if !ageDeadline.IsZero() {
 			deadline = earlier(deadline, ageDeadline)
@@ -157,6 +161,16 @@ func (s *Storage) runMaterializer(p *partition) {
 		}
 		stopTimer(timer)
 	}
+}
+
+func (s *Storage) materializeMaxAge() time.Duration {
+	if s.opts.MaterializeMaxAge == -1 {
+		return -1
+	}
+	if s.opts.Compression == CompressionZstd {
+		return s.opts.CompressionMaxBlockAge
+	}
+	return s.opts.MaterializeMaxAge
 }
 
 func (p *partition) materializerScheduleState() (pending, maintenance bool, uncheckpointedSince time.Time) {
@@ -593,6 +607,7 @@ func (s *Storage) releaseDraftPins(draft *preparedStream) {
 	draft.pins = nil
 	draft.payloadPin = nil
 	draft.indexPin = nil
+	draft.blockPin = nil
 }
 
 func (s *Storage) abortPrepared(p *partition, prepared map[*streamState]*preparedStream) {
@@ -605,6 +620,11 @@ func (s *Storage) abortPrepared(p *partition, prepared map[*streamState]*prepare
 			}
 			if err := s.fdCache.unlink(sf.indexPath); err != nil {
 				p.cleanupPaths[sf.indexPath] = struct{}{}
+			}
+			if sf.blockPath != "" {
+				if err := s.fdCache.unlink(sf.blockPath); err != nil {
+					p.cleanupPaths[sf.blockPath] = struct{}{}
+				}
 			}
 			p.cleanupDirs[filepath.Dir(path)] = struct{}{}
 		}
@@ -737,19 +757,45 @@ func (s *Storage) materializeStream(p *partition, st *streamState, snap readSnap
 	draft := &preparedStream{st: st, snap: snap, sealed: slices.Clone(snap.sealed), through: snap.through, touched: make(map[string]struct{}), touchedDirs: make(map[string]struct{}), touchedParents: make(map[string]struct{})}
 	writes := &p.segmentWrites
 	writes.reset()
+	compressionBlockBytes := s.opts.CompressionBlockBytes
+	if compressionBlockBytes == 0 {
+		// A v3 active segment can survive a reopen with compression disabled.
+		// It remains v3 until rollover, so retain the normal block target.
+		compressionBlockBytes = DefaultCompressionBlockBytes
+	}
+	var encoder *zstd.Encoder
+	defer func() {
+		if encoder != nil {
+			encoder.Close()
+		}
+	}()
 	flushWrites := func() error {
 		if len(writes.index) == 0 {
 			return nil
 		}
-		payloadPin, indexPin, err := s.pinDraftActive(draft)
+		payloadPin, indexPin, blockPin, err := s.pinDraftActive(draft)
 		if err != nil {
 			return err
 		}
-		if err := writes.flush(payloadPin.file(), indexPin.file()); err != nil {
+		if draft.active.version == segmentVersionV3 {
+			if encoder == nil {
+				encoder, err = zstd.NewWriter(nil, zstd.WithEncoderConcurrency(1))
+				if err != nil {
+					return err
+				}
+			}
+			err = writes.flushCompressed(draft.active, payloadPin.file(), indexPin.file(), blockPin.file(), encoder)
+		} else {
+			err = writes.flush(payloadPin.file(), indexPin.file())
+		}
+		if err != nil {
 			return err
 		}
 		draft.touched[draft.active.path] = struct{}{}
 		draft.touched[draft.active.indexPath] = struct{}{}
+		if draft.active.blockPath != "" {
+			draft.touched[draft.active.blockPath] = struct{}{}
+		}
 		return nil
 	}
 	if snap.deleted {
@@ -785,7 +831,7 @@ func (s *Storage) materializeStream(p *partition, st *streamState, snap readSnap
 			if err := flushWrites(); err != nil {
 				return draft, err
 			}
-			payloadPin, indexPin, err := s.pinDraftActive(draft)
+			payloadPin, indexPin, _, err := s.pinDraftActive(draft)
 			if err != nil {
 				return draft, err
 			}
@@ -795,8 +841,12 @@ func (s *Storage) materializeStream(p *partition, st *streamState, snap readSnap
 			draft.touched[draft.active.path] = struct{}{}
 			draft.touched[draft.active.indexPath] = struct{}{}
 			draft.sealedSidecars = append(draft.sealedSidecars, draft.active.indexPath)
+			if draft.active.blockPath != "" {
+				draft.sealedSidecars = append(draft.sealedSidecars, draft.active.blockPath)
+			}
 			draft.sealed = append(draft.sealed, draft.active)
 			draft.active = nil
+			s.releaseDraftPins(draft)
 		}
 		if draft.active == nil {
 			_, statErr := os.Stat(dir)
@@ -822,18 +872,26 @@ func (s *Storage) materializeStream(p *partition, st *streamState, snap readSnap
 			if err := flushWrites(); err != nil {
 				return draft, err
 			}
-			payloadPin, indexPin, err := s.pinDraftActive(draft)
+			payloadPin, indexPin, _, err := s.pinDraftActive(draft)
 			if err != nil {
 				return draft, err
 			}
-			if err := draft.active.appendRecord(payloadPin.file(), indexPin.file(), rec, payload); err != nil {
+			if draft.active.version == segmentVersionV3 {
+				if err := writes.append(draft.active, rec, payload); err != nil {
+					return draft, err
+				}
+				if err := flushWrites(); err != nil {
+					return draft, err
+				}
+			} else if err := draft.active.appendRecord(payloadPin.file(), indexPin.file(), rec, payload); err != nil {
 				return draft, err
 			}
 			draft.touched[draft.active.path] = struct{}{}
 			draft.touched[draft.active.indexPath] = struct{}{}
 			continue
 		}
-		if writes.wouldExceed(len(payload)) {
+		if (draft.active.version == segmentVersionV3 && len(writes.payload) > 0 && len(writes.payload)+len(payload) > compressionBlockBytes) ||
+			(draft.active.version != segmentVersionV3 && writes.wouldExceed(len(payload))) {
 			if err := flushWrites(); err != nil {
 				return draft, err
 			}
@@ -847,7 +905,7 @@ func (s *Storage) materializeStream(p *partition, st *streamState, snap readSnap
 	}
 	if snap.forceSeal && draft.active != nil && draft.active.createdUnixNano == snap.activeCreated &&
 		draft.active.lastIndex >= draft.active.firstIndex {
-		payloadPin, indexPin, err := s.pinDraftActive(draft)
+		payloadPin, indexPin, _, err := s.pinDraftActive(draft)
 		if err != nil {
 			return draft, err
 		}
@@ -857,6 +915,9 @@ func (s *Storage) materializeStream(p *partition, st *streamState, snap readSnap
 		draft.touched[draft.active.path] = struct{}{}
 		draft.touched[draft.active.indexPath] = struct{}{}
 		draft.sealedSidecars = append(draft.sealedSidecars, draft.active.indexPath)
+		if draft.active.blockPath != "" {
+			draft.sealedSidecars = append(draft.sealedSidecars, draft.active.blockPath)
+		}
 		draft.sealed = append(draft.sealed, draft.active)
 		draft.active = nil
 	}
@@ -864,27 +925,39 @@ func (s *Storage) materializeStream(p *partition, st *streamState, snap readSnap
 	return draft, nil
 }
 
-func (s *Storage) pinDraftActive(draft *preparedStream) (*fdPin, *fdPin, error) {
+func (s *Storage) pinDraftActive(draft *preparedStream) (*fdPin, *fdPin, *fdPin, error) {
 	if draft.payloadPin != nil && draft.indexPin != nil &&
 		draft.payloadPin.e.path == draft.active.path && draft.indexPin.e.path == draft.active.indexPath {
-		return draft.payloadPin, draft.indexPin, nil
+		return draft.payloadPin, draft.indexPin, draft.blockPin, nil
 	}
 	payload, err := s.fdCache.pin(draft.active.path, true)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 	index, err := s.fdCache.pin(draft.active.indexPath, true)
 	if err != nil {
 		_ = payload.release()
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
-	draft.pins = append(draft.pins, payload, index)
+	if draft.active.blockPath != "" {
+		block, blockErr := s.fdCache.pin(draft.active.blockPath, true)
+		if blockErr != nil {
+			_ = index.release()
+			_ = payload.release()
+			draft.payloadPin, draft.indexPin, draft.blockPin = nil, nil, nil
+			return nil, nil, nil, blockErr
+		}
+		draft.pins = append(draft.pins, payload, index, block)
+		draft.blockPin = block
+	} else {
+		draft.pins = append(draft.pins, payload, index)
+	}
 	draft.payloadPin, draft.indexPin = payload, index
-	return payload, index, nil
+	return payload, index, draft.blockPin, nil
 }
 
 func (s *Storage) createDraftActiveSegment(dir string, inc incarnation, firstIndex int64) (*segmentFile, error) {
-	active, err := createActiveSegment(dir, inc, firstIndex, time.Now().UnixNano())
+	active, err := createActiveSegment(dir, inc, firstIndex, time.Now().UnixNano(), s.opts.Compression == CompressionZstd)
 	if !errors.Is(err, os.ErrExist) {
 		return active, err
 	}
@@ -897,10 +970,11 @@ func (s *Storage) createDraftActiveSegment(dir string, inc incarnation, firstInd
 	if err := s.fdCache.unlink(filepath.Join(dir, segmentIndexName(firstIndex))); err != nil {
 		return nil, fmt.Errorf("remove abandoned segment sidecar: %w", err)
 	}
+	_ = s.fdCache.unlink(filepath.Join(dir, segmentBlockName(firstIndex)))
 	if err := syncDir(dir); err != nil {
 		return nil, err
 	}
-	return createActiveSegment(dir, inc, firstIndex, time.Now().UnixNano())
+	return createActiveSegment(dir, inc, firstIndex, time.Now().UnixNano(), s.opts.Compression == CompressionZstd)
 }
 
 func (s *Storage) publishPrepared(draft *preparedStream) {
@@ -961,10 +1035,10 @@ func buildCheckpointEntry(snap readSnapshot, sealed []*segmentFile, active *segm
 		e.Parent = &checkpointParent{StreamID: snap.parent.id, IncarnationID: snap.parent.inc.String(), Fork: *snap.fork}
 	}
 	for _, sf := range sealed {
-		e.Sealed = append(e.Sealed, checkpointSegment{File: sf.name, FirstIndex: sf.firstIndex, LastIndex: sf.lastIndex, PayloadEnd: sf.payloadEnd, Count: sf.count, MinTS: sf.minTS, MaxTS: sf.maxTS})
+		e.Sealed = append(e.Sealed, checkpointSegment{File: sf.name, FirstIndex: sf.firstIndex, LastIndex: sf.lastIndex, PayloadEnd: sf.payloadEnd, LogicalEnd: sf.logicalEnd, Count: sf.count, BlockCount: sf.blockCount, MinTS: sf.minTS, MaxTS: sf.maxTS})
 	}
 	if active != nil {
-		e.Active = &checkpointActive{File: active.name, FirstIndex: active.firstIndex, PayloadEnd: active.payloadEnd, Count: active.count, MinTS: active.minTS, MaxTS: active.maxTS}
+		e.Active = &checkpointActive{File: active.name, FirstIndex: active.firstIndex, PayloadEnd: active.payloadEnd, LogicalEnd: active.logicalEnd, Count: active.count, BlockCount: active.blockCount, MinTS: active.minTS, MaxTS: active.maxTS}
 	}
 	return e
 }

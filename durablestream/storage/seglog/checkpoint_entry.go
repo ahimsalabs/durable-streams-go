@@ -59,7 +59,9 @@ type checkpointSegment struct {
 	FirstIndex int64  `json:"firstIndex"`
 	LastIndex  int64  `json:"lastIndex"`
 	PayloadEnd int64  `json:"payloadEnd"`
+	LogicalEnd int64  `json:"logicalEnd,omitempty"`
 	Count      int64  `json:"count"`
+	BlockCount int64  `json:"blockCount,omitempty"`
 	MinTS      int64  `json:"minTsUnixNano,omitempty"`
 	MaxTS      int64  `json:"maxTsUnixNano,omitempty"`
 }
@@ -68,7 +70,9 @@ type checkpointActive struct {
 	File       string `json:"file"`
 	FirstIndex int64  `json:"firstIndex"`
 	PayloadEnd int64  `json:"payloadEnd"`
+	LogicalEnd int64  `json:"logicalEnd,omitempty"`
 	Count      int64  `json:"count"`
+	BlockCount int64  `json:"blockCount,omitempty"`
 	MinTS      int64  `json:"minTsUnixNano,omitempty"`
 	MaxTS      int64  `json:"maxTsUnixNano,omitempty"`
 }

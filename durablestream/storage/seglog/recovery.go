@@ -154,10 +154,13 @@ func removeUnreferencedSegments(dir string, m streamCheckpointEntry) error {
 	removed := false
 	for _, entry := range entries {
 		name := entry.Name()
-		if entry.IsDir() || !strings.HasPrefix(name, "seg-") || (!strings.HasSuffix(name, ".seg") && !strings.HasSuffix(name, ".idx")) {
+		if entry.IsDir() || !strings.HasPrefix(name, "seg-") || (!strings.HasSuffix(name, ".seg") && !strings.HasSuffix(name, ".idx") && !strings.HasSuffix(name, ".bix")) {
 			continue
 		}
 		if strings.HasSuffix(name, ".idx") && m.Active != nil && name == strings.TrimSuffix(m.Active.File, ".seg")+".idx" {
+			continue
+		}
+		if strings.HasSuffix(name, ".bix") && m.Active != nil && name == strings.TrimSuffix(m.Active.File, ".seg")+".bix" {
 			continue
 		}
 		if _, ok := referenced[name]; ok {
@@ -225,7 +228,7 @@ func (s *Storage) stateFromCheckpointEntry(streamID, dir string, m streamCheckpo
 			return nil, fmt.Errorf("%w: %v", errCorrupt, err)
 		}
 		badStart := i == 0 && (sf.firstIndex > requiredStart || sf.firstIndex < st.parentBoundary+1)
-		if sf.firstIndex != ms.FirstIndex || sf.lastIndex != ms.LastIndex || sf.payloadEnd != ms.PayloadEnd || sf.count != ms.Count ||
+		if sf.firstIndex != ms.FirstIndex || sf.lastIndex != ms.LastIndex || sf.payloadEnd != ms.PayloadEnd || sf.logicalEnd != ms.LogicalEnd || sf.count != ms.Count || sf.blockCount != ms.BlockCount ||
 			badStart || (i > 0 && sf.firstIndex != prevLast+1) {
 			return nil, fmt.Errorf("%w: sealed segment %s disagrees with checkpoint entry for %s", errCorrupt, ms.File, streamID)
 		}
@@ -234,7 +237,7 @@ func (s *Storage) stateFromCheckpointEntry(streamID, dir string, m streamCheckpo
 		st.sealed = append(st.sealed, sf)
 	}
 	if m.Active != nil {
-		sf, err := openActiveSegment(filepath.Join(dir, m.Active.File), m.Active.File, inc, m.Active.PayloadEnd, m.Active.Count, m.Active.MinTS, m.Active.MaxTS)
+		sf, err := openActiveSegment(filepath.Join(dir, m.Active.File), m.Active.File, inc, m.Active.PayloadEnd, m.Active.LogicalEnd, m.Active.Count, m.Active.BlockCount, m.Active.MinTS, m.Active.MaxTS)
 		if err != nil {
 			return nil, fmt.Errorf("%w: %v", errCorrupt, err)
 		}

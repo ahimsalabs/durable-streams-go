@@ -20,6 +20,9 @@
 // written by a background materializer. A cumulative schema-v2 partition
 // checkpoint owns the replay position, next transaction ID, and every live
 // stream's complete derived state; recovery loads it and replays the WAL suffix.
+// Uncompressed segments retain the v2 contiguous layout. Optional v3 segments
+// contain complete independent zstd frames, a dense record index, and a block
+// index. Sealing appends both indexes and a footer without rewriting frames.
 //
 // # Invariants
 //
@@ -82,6 +85,7 @@
 //	<dir>/wal/p<NN>/checkpoint.json  cumulative partition state (schema v2)
 //	<dir>/streams/<shard>/<stream>/seg-<first>.seg  derived stream data
 //	<dir>/streams/<shard>/<stream>/seg-<first>.idx  active dense index sidecar
+//	<dir>/streams/<shard>/<stream>/seg-<first>.bix  active v3 block index sidecar
 //
 // WAL segments begin with a 4KiB header block and contain a sequence of
 // self-checking transaction frames (see walrecord.go for the byte layout).

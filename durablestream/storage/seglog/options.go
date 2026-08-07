@@ -22,26 +22,42 @@ const (
 	DefaultCheckpointBytes   = 32 << 20
 	DefaultCheckpointMaxAge  = 3 * time.Second
 	// Deprecated interval names remain aliases for source compatibility.
-	DefaultMaterializeInterval = DefaultMaterializeMaxAge
-	DefaultCheckpointInterval  = DefaultCheckpointMaxAge
-	DefaultRetentionInterval   = 30 * time.Second
-	DefaultSegmentTargetBytes  = 128 << 20
+	DefaultMaterializeInterval    = DefaultMaterializeMaxAge
+	DefaultCheckpointInterval     = DefaultCheckpointMaxAge
+	DefaultRetentionInterval      = 30 * time.Second
+	DefaultSegmentTargetBytes     = 128 << 20
+	DefaultCompressionBlockBytes  = 1 << 20
+	DefaultCompressionMaxBlockAge = 10 * time.Second
 	// One hour avoids surprising segment churn for low-traffic streams while
 	// still giving age retention a bounded opportunity to seal an idle tail.
 	DefaultSegmentMaxOpenAge = time.Hour
 	DefaultFDCacheSize       = 384
 )
 
+// Compression selects the encoding used for derived stream segments. WAL
+// records are never compressed by seglog. The zero value preserves v2 segment
+// files because applications can already supply compressed record payloads.
+type Compression uint8
+
+const (
+	CompressionDisabled Compression = iota
+	CompressionZstd
+)
+
 // Retention limits the history retained for one stream. Zero values mean
-// unlimited. Age is measured from the commit timestamp of each record.
+// unlimited. MaxBytes counts physical segment payload bytes; for compressed
+// v3 segments this is compressed frame data. Age is measured from the commit
+// timestamp of each record.
 type Retention struct {
 	MaxBytes int64
 	MaxAge   time.Duration
 }
 
 // SegmentPolicy is the immutable rollover policy stored with each stream.
-// TargetBytes counts payload bytes only. MaxOpenAge is wall-clock time from
-// creation of a non-empty active segment. Zero MaxOpenAge disables age rollover.
+// TargetBytes counts physical payload bytes only. For compressed v3 segments,
+// this is completed compressed frame data and rollover can overshoot by one
+// normal compression block. MaxOpenAge is wall-clock time from creation of a
+// non-empty active segment. Zero MaxOpenAge disables age rollover.
 type SegmentPolicy struct {
 	TargetBytes int64
 	MaxOpenAge  time.Duration
@@ -114,6 +130,18 @@ type Options struct {
 	// SyncWrites controls fdatasync on commit groups.
 	SyncWrites SyncWrites
 
+	// Compression selects optional block compression for materialized segment
+	// payloads. CompressionZstd writes v3 segments as independent zstd frames;
+	// CompressionBlockBytes is their target uncompressed size. A record is
+	// never split, and an oversized record gets one dedicated frame. Zero
+	// CompressionBlockBytes selects DefaultCompressionBlockBytes when enabled.
+	// CompressionMaxBlockAge replaces MaterializeMaxAge for compression
+	// accumulation while preserving MaterializeBytes as the WAL pressure limit.
+	// Its zero value selects DefaultCompressionMaxBlockAge.
+	Compression            Compression
+	CompressionBlockBytes  int
+	CompressionMaxBlockAge time.Duration
+
 	// ShutdownTimeout bounds how long Close waits for workers to drain.
 	ShutdownTimeout time.Duration
 
@@ -179,6 +207,12 @@ func (o Options) withDefaults() Options {
 	if o.QueueDepth == 0 {
 		o.QueueDepth = DefaultQueueDepth
 	}
+	if o.Compression == CompressionZstd && o.CompressionBlockBytes == 0 {
+		o.CompressionBlockBytes = DefaultCompressionBlockBytes
+	}
+	if o.Compression == CompressionZstd && o.CompressionMaxBlockAge == 0 {
+		o.CompressionMaxBlockAge = DefaultCompressionMaxBlockAge
+	}
 	if o.ShutdownTimeout == 0 {
 		o.ShutdownTimeout = DefaultShutdownTimeout
 	}
@@ -238,6 +272,21 @@ func (o Options) validate() error {
 	}
 	if _, err := o.SyncWrites.enabled(); err != nil {
 		errs = append(errs, err)
+	}
+	if o.Compression != CompressionDisabled && o.Compression != CompressionZstd {
+		errs = append(errs, fmt.Errorf("option Compression has invalid value %d", o.Compression))
+	}
+	if o.Compression == CompressionDisabled && o.CompressionBlockBytes != 0 {
+		errs = append(errs, errors.New("option CompressionBlockBytes requires CompressionZstd"))
+	}
+	if o.Compression == CompressionDisabled && o.CompressionMaxBlockAge != 0 {
+		errs = append(errs, errors.New("option CompressionMaxBlockAge requires CompressionZstd"))
+	}
+	if o.Compression == CompressionZstd && o.CompressionBlockBytes < 1 {
+		errs = append(errs, fmt.Errorf("option CompressionBlockBytes must be positive, got %d", o.CompressionBlockBytes))
+	}
+	if o.Compression == CompressionZstd && o.CompressionMaxBlockAge <= 0 {
+		errs = append(errs, fmt.Errorf("option CompressionMaxBlockAge must be positive, got %v", o.CompressionMaxBlockAge))
 	}
 	if o.MaterializeBytes < 1 {
 		errs = append(errs, fmt.Errorf("option MaterializeBytes must be positive, got %d", o.MaterializeBytes))

@@ -477,9 +477,19 @@ copied path.
 Retention can use `MaxBytes`, maximum record age, or both. Zero disables the
 corresponding limit.
 
-`MaxBytes` is a logical payload target. It is not a disk quota. The engine
+`MaxBytes` is a physical segment-payload target. For compressed v3 segments it
+counts compressed frame bytes (not indexes, footers, or sidecars). It is not a
+hard disk quota. The engine
 advances retention at whole sealed-segment granularity and preserves records
 that must remain readable.
+
+Compressed materialization accumulates WAL-backed records until the partition
+reaches `MaterializeBytes` or the oldest record reaches
+`CompressionMaxBlockAge` (10 seconds by default). This lets low-rate streams
+approach the 1 MiB compression target without retaining encoder state. Reads
+remain visible from the WAL during accumulation. Each materialization visit
+closes its final partial frame, so compression state does not survive the visit
+or a restart.
 
 Retention advances a logical floor. Reads below the floor return a gone
 result. The floor survives restart. Record indexes do not change.

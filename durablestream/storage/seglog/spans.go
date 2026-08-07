@@ -64,6 +64,11 @@ func (s *Storage) ReadSpans(ctx context.Context, streamID string, offset durable
 	if snap.parent != nil || through > lastSealedIndex(snap.sealed) {
 		return s.copiedSpanRead(ctx, streamID, offset, limit)
 	}
+	for _, sf := range snap.sealed {
+		if sf.version == segmentVersionV3 && sf.lastIndex > pos && sf.firstIndex <= through {
+			return s.copiedSpanRead(ctx, streamID, offset, limit)
+		}
+	}
 
 	next := pos + 1
 	total := int64(0)

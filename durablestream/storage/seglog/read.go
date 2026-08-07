@@ -241,6 +241,7 @@ func (s *Storage) readSnapshotted(ctx context.Context, state *streamState, pos i
 			if v.path == "" || v.lastIndex < from || v.firstIndex > segThrough {
 				continue
 			}
+			cache := decodedBlock{ordinal: -1}
 			err := v.readRecords(max(from, v.firstIndex), segThrough, func(rec segmentRecord, payloadOff int64) error {
 				if err := ctx.Err(); err != nil {
 					return err
@@ -248,7 +249,7 @@ func (s *Storage) readSnapshotted(ctx context.Context, state *streamState, pos i
 				if !accept(rec.length) {
 					return errStopRead
 				}
-				payload, err := v.readPayloadAt(rec, payloadOff)
+				payload, err := v.readPayloadAtCached(rec, payloadOff, &cache)
 				if err != nil {
 					return err
 				}
