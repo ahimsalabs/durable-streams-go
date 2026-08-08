@@ -88,6 +88,7 @@ func (s *Storage) runMaterializer(p *partition) {
 	now := time.Now()
 	lastSweep := now
 	var retryAfter time.Time
+	var armedDeadline time.Time
 	for {
 		now = time.Now()
 		ageDeadline, ageDue := s.segmentAgeDeadline(p, now)
@@ -146,20 +147,27 @@ func (s *Storage) runMaterializer(p *partition) {
 			deadline = earlier(deadline, retryAfter)
 		}
 		var timerC <-chan time.Time
-		if !deadline.IsZero() {
+		if !deadline.IsZero() && (armedDeadline.IsZero() || deadline.Before(armedDeadline) || !time.Now().Before(armedDeadline)) {
 			stopTimer(timer)
 			timer.Reset(max(time.Until(deadline), time.Nanosecond))
+			armedDeadline = deadline
+		}
+		if !armedDeadline.IsZero() {
 			timerC = timer.C
-		} else {
-			stopTimer(timer)
 		}
 		select {
 		case <-s.shutdownCh:
 			return
 		case <-p.materializeWake:
+			// One schedule recomputation covers all publications observed before
+			// this loop iteration starts.
+			select {
+			case <-p.materializeWake:
+			default:
+			}
 		case <-timerC:
+			armedDeadline = time.Time{}
 		}
-		stopTimer(timer)
 	}
 }
 

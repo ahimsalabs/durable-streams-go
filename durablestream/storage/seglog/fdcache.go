@@ -15,9 +15,16 @@ type fdCache struct {
 	mu       sync.Mutex
 	limit    int
 	entries  map[string]*fdEntry
+	opening  map[string]*fdOpen
 	lru      list.List
 	closed   bool
 	deferred map[string]func(int64)
+}
+
+type fdOpen struct {
+	done     chan struct{}
+	err      error
+	closeErr error
 }
 
 type fdEntry struct {
@@ -33,33 +40,87 @@ type fdPin struct {
 }
 
 func newFDCache(limit int) *fdCache {
-	return &fdCache{limit: limit, entries: make(map[string]*fdEntry), deferred: make(map[string]func(int64))}
+	return &fdCache{
+		limit:    limit,
+		entries:  make(map[string]*fdEntry),
+		opening:  make(map[string]*fdOpen),
+		deferred: make(map[string]func(int64)),
+	}
 }
 
 func (c *fdCache) pin(path string, _ bool) (*fdPin, error) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if c.closed {
-		return nil, os.ErrClosed
-	}
-	if e := c.entries[path]; e != nil {
-		e.pins++
-		c.lru.MoveToFront(e.elem)
+	for {
+		c.mu.Lock()
+		if c.closed {
+			c.mu.Unlock()
+			return nil, os.ErrClosed
+		}
+		if e := c.entries[path]; e != nil {
+			e.pins++
+			c.lru.MoveToFront(e.elem)
+			c.mu.Unlock()
+			return &fdPin{c: c, e: e}, nil
+		}
+		if opening := c.opening[path]; opening != nil {
+			done := opening.done
+			c.mu.Unlock()
+			<-done
+			if opening.err != nil {
+				return nil, opening.err
+			}
+			continue
+		}
+		opening := &fdOpen{done: make(chan struct{})}
+		c.opening[path] = opening
+		c.mu.Unlock()
+
+		// Stream files are owned by this store and opened read-write so a cold
+		// read cannot leave an active file cached with insufficient write access.
+		f, err := os.OpenFile(path, os.O_RDWR, 0)
+
+		c.mu.Lock()
+		if err != nil {
+			opening.err = err
+			delete(c.opening, path)
+			close(opening.done)
+			c.mu.Unlock()
+			return nil, err
+		}
+		if c.closed {
+			c.mu.Unlock()
+			closeErr := f.Close()
+			c.mu.Lock()
+			opening.closeErr = closeErr
+			opening.err = errors.Join(os.ErrClosed, closeErr)
+			delete(c.opening, path)
+			close(opening.done)
+			c.mu.Unlock()
+			return nil, opening.err
+		}
+		// The per-path opening entry normally makes this impossible, but keep
+		// installation safe if another cache operation supplied an entry.
+		if e := c.entries[path]; e != nil {
+			e.pins++
+			c.lru.MoveToFront(e.elem)
+			c.mu.Unlock()
+			closeErr := f.Close()
+			c.mu.Lock()
+			opening.closeErr = closeErr
+			delete(c.opening, path)
+			close(opening.done)
+			c.mu.Unlock()
+			return &fdPin{c: c, e: e}, nil
+		}
+		e := &fdEntry{path: path, f: f, pins: 1}
+		e.elem = c.lru.PushFront(e)
+		c.entries[path] = e
+		delete(c.opening, path)
+		close(opening.done)
+		victims := c.evictLocked()
+		c.mu.Unlock()
+		closeFiles(victims)
 		return &fdPin{c: c, e: e}, nil
 	}
-
-	// Stream files are owned by this store and opened read-write so a cold
-	// read cannot leave an active file cached with insufficient write access.
-	flags := os.O_RDWR
-	f, err := os.OpenFile(path, flags, 0)
-	if err != nil {
-		return nil, err
-	}
-	e := &fdEntry{path: path, f: f, pins: 1}
-	e.elem = c.lru.PushFront(e)
-	c.entries[path] = e
-	c.evict()
-	return &fdPin{c: c, e: e}, nil
 }
 
 func (p *fdPin) file() *os.File { return p.e.f }
@@ -71,8 +132,8 @@ func (p *fdPin) release() error {
 	c, e := p.c, p.e
 	p.c = nil
 	c.mu.Lock()
-	defer c.mu.Unlock()
 	if c.entries[e.path] != e {
+		c.mu.Unlock()
 		return nil
 	}
 	e.pins--
@@ -91,11 +152,16 @@ func (p *fdPin) release() error {
 			err = e.f.Close()
 		}
 	}
-	c.evict()
+	victims := c.evictLocked()
+	c.mu.Unlock()
+	closeFiles(victims)
 	return err
 }
 
-func (c *fdCache) evict() {
+// evictLocked removes cold victims from the cache and returns their files so
+// the caller can close them without holding c.mu.
+func (c *fdCache) evictLocked() []*os.File {
+	var victims []*os.File
 	for len(c.entries) > c.limit {
 		var victim *fdEntry
 		for elem := c.lru.Back(); elem != nil; elem = elem.Prev() {
@@ -106,10 +172,17 @@ func (c *fdCache) evict() {
 			}
 		}
 		if victim == nil {
-			return
+			return victims
 		}
 		c.removeEntry(victim)
-		_ = victim.f.Close()
+		victims = append(victims, victim.f)
+	}
+	return victims
+}
+
+func closeFiles(files []*os.File) {
+	for _, f := range files {
+		_ = f.Close()
 	}
 }
 
@@ -130,6 +203,12 @@ func (c *fdCache) unlink(path string) error {
 // callback are deferred until the final pin is released.
 func (c *fdCache) unlinkNotify(path string, onRemoved func(int64)) error {
 	c.mu.Lock()
+	if opening := c.opening[path]; opening != nil {
+		done := opening.done
+		c.mu.Unlock()
+		<-done
+		return c.unlinkNotify(path, onRemoved)
+	}
 	defer c.mu.Unlock()
 	if e := c.entries[path]; e != nil {
 		if e.pins != 0 {
@@ -184,20 +263,37 @@ func removeOpenFile(e *fdEntry) (int64, error) {
 
 func (c *fdCache) close() error {
 	c.mu.Lock()
-	defer c.mu.Unlock()
 	c.closed = true
-	var errs []error
+	opening := make([]*fdOpen, 0, len(c.opening))
+	for _, pending := range c.opening {
+		opening = append(opening, pending)
+	}
+	entries := make([]*fdEntry, 0, len(c.entries))
 	for _, e := range c.entries {
 		c.removeEntry(e)
+		entries = append(entries, e)
+	}
+	c.mu.Unlock()
+
+	var errs []error
+	for _, e := range entries {
 		errs = append(errs, e.f.Close())
+		c.mu.Lock()
 		if onRemoved, remove := c.deferred[e.path]; remove {
 			delete(c.deferred, e.path)
+			c.mu.Unlock()
 			bytes, removeErr := removeFileAndSize(e.path)
 			if removeErr == nil && bytes > 0 && onRemoved != nil {
 				onRemoved(bytes)
 			}
 			errs = append(errs, removeErr, syncDir(filepath.Dir(e.path)))
+		} else {
+			c.mu.Unlock()
 		}
+	}
+	for _, pending := range opening {
+		<-pending.done
+		errs = append(errs, pending.closeErr)
 	}
 	return errors.Join(errs...)
 }
