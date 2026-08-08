@@ -16,6 +16,7 @@ const (
 	DefaultWALSegmentBytes   = 256 << 20
 	DefaultWALExtentBytes    = 16 << 20
 	DefaultQueueDepth        = 256
+	DefaultSyncConcurrency   = 8
 	DefaultShutdownTimeout   = 30 * time.Second
 	DefaultMaterializeBytes  = 4 << 20
 	DefaultMaterializeMaxAge = 250 * time.Millisecond
@@ -130,6 +131,11 @@ type Options struct {
 	// SyncWrites controls fdatasync on commit groups.
 	SyncWrites SyncWrites
 
+	// SyncConcurrency is the maximum number of WAL fdatasyncs concurrently in
+	// flight across all partitions. Zero selects DefaultSyncConcurrency. Set it
+	// to one for devices that serialize concurrent flushes.
+	SyncConcurrency int
+
 	// Compression selects optional block compression for materialized segment
 	// payloads. CompressionZstd writes v3 segments as independent zstd frames;
 	// CompressionBlockBytes is their target uncompressed size. A record is
@@ -207,6 +213,9 @@ func (o Options) withDefaults() Options {
 	if o.QueueDepth == 0 {
 		o.QueueDepth = DefaultQueueDepth
 	}
+	if o.SyncConcurrency == 0 {
+		o.SyncConcurrency = DefaultSyncConcurrency
+	}
 	if o.Compression == CompressionZstd && o.CompressionBlockBytes == 0 {
 		o.CompressionBlockBytes = DefaultCompressionBlockBytes
 	}
@@ -269,6 +278,9 @@ func (o Options) validate() error {
 	}
 	if o.QueueDepth < 1 {
 		errs = append(errs, fmt.Errorf("option QueueDepth must be positive, got %d", o.QueueDepth))
+	}
+	if o.SyncConcurrency < 1 {
+		errs = append(errs, fmt.Errorf("option SyncConcurrency must be positive, got %d", o.SyncConcurrency))
 	}
 	if _, err := o.SyncWrites.enabled(); err != nil {
 		errs = append(errs, err)

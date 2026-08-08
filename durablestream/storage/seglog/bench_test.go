@@ -117,6 +117,35 @@ func BenchmarkAppendDurableParallel(b *testing.B) {
 	reportLatencyPercentiles(b, latencies)
 }
 
+// BenchmarkAppendSingleStreamParallel measures concurrent producers appending
+// 256-byte records to one stream: the single-stream throughput ceiling.
+func BenchmarkAppendSingleStreamParallel(b *testing.B) {
+	opts := benchmarkOptions(b.TempDir())
+	s := benchmarkOpen(b, opts)
+	benchmarkCreate(b, s, "stream")
+	payload := make([]byte, 256)
+	before := s.Stats()
+	start := time.Now()
+	b.ReportAllocs()
+	b.ResetTimer()
+	b.RunParallel(func(pb *testing.PB) {
+		for pb.Next() {
+			if _, err := s.Append(context.Background(), "stream", payload, ""); err != nil {
+				b.Fatal(err)
+			}
+		}
+	})
+	b.StopTimer()
+	elapsed := time.Since(start).Seconds()
+	after := s.Stats()
+	acquisitions := after.CommitWaves - before.CommitWaves
+	if acquisitions > 0 {
+		b.ReportMetric(float64(acquisitions)/elapsed, "sync-acquisitions/s")
+		b.ReportMetric(float64(b.N)/float64(acquisitions), "appends/sync-acquisition")
+	}
+	b.ReportMetric(float64(b.N)/elapsed, "appends/s")
+}
+
 func BenchmarkAppendNoSync(b *testing.B) {
 	opts := benchmarkOptions(b.TempDir())
 	opts.SyncWrites = SyncWritesDisabled

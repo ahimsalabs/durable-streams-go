@@ -66,6 +66,8 @@ type PartitionStats struct {
 // Stats is an aggregate snapshot of all seglog partitions.
 type Stats struct {
 	PartitionStats
+	// CommitWaves counts completed storage-wide sync-limiter admissions. The
+	// name is retained for source compatibility with the former wave gate.
 	CommitWaves  int64
 	PerPartition []PartitionStats
 }
@@ -101,7 +103,7 @@ type statsFrontier struct {
 func (s *Storage) Stats() Stats {
 	now := time.Now()
 	stats := Stats{
-		CommitWaves:  s.commitGate.completed.Load(),
+		CommitWaves:  s.syncLimiter.completed.Load(),
 		PerPartition: make([]PartitionStats, len(s.parts)),
 	}
 	for i, p := range s.parts {

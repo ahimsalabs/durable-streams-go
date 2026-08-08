@@ -28,12 +28,11 @@ func (h benchmarkErrorHandler) Handle(_ context.Context, record slog.Record) err
 func (h benchmarkErrorHandler) WithAttrs(_ []slog.Attr) slog.Handler { return h }
 func (h benchmarkErrorHandler) WithGroup(_ string) slog.Handler      { return h }
 
-// BenchmarkAppendPartitionSweep isolates the flush-sharing cost of partition
-// count: the same 32-way durable append workload over 10k streams, with the
-// WAL split 1/4/32 ways. On flush-honoring devices concurrent fdatasyncs
-// largely serialize, so scattering W in-flight appends across P partition
-// WALs divides the appends sharing each flush by P. Run with TMPDIR on a
-// real disk; on tmpfs every variant measures CPU only.
+// BenchmarkAppendPartitionSweep measures the partition-count tradeoff for the
+// same 32-way durable append workload over 10k streams, with the WAL split
+// 1/4/32 ways. Pipelining devices can benefit from concurrent per-partition
+// fdatasyncs; flush-serializing devices can set SyncConcurrency to 1. Run with
+// TMPDIR on a real disk; on tmpfs every variant measures CPU only.
 func BenchmarkAppendPartitionSweep(b *testing.B) {
 	const streams = 10000
 	for _, parts := range []int{1, 4, 32} {

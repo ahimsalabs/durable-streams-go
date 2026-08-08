@@ -8,11 +8,12 @@
 // partitions. Each partition has a bounded three-stage worker: one stager owns
 // validation, offset and transaction allocation, encoding, and immediate WAL
 // writes; one committer snapshots the contiguous-written pending watermark and
-// establishes durability through the storage-wide gate; and one FIFO publisher
-// updates catalog state and acknowledges requests. Writes continue during
-// fdatasync, but those later records remain pending for the next wave.
-// Independent requests can share one fdatasync, but each frame remains
-// independently replayable — requests are never atomically coupled.
+// establishes durability through a storage-wide sync-concurrency limiter; and
+// one FIFO publisher updates catalog state and acknowledges requests. Writes
+// continue during fdatasync, but those later records remain pending for the
+// next partition snapshot. Independent requests can share one fdatasync, while
+// different partitions can sync concurrently. Each frame remains independently
+// replayable — requests are never atomically coupled.
 //
 // The WAL is the sole durable commit point. Every mutation — create, append,
 // close, delete, touch, fork, retention, trim — is one transaction frame in
@@ -27,7 +28,7 @@
 // # Invariants
 //
 //	I1: A request is acknowledged only after it is in the pending watermark
-//	    snapshot taken before a commit wave's fdatasync and its segment's
+//	    snapshot taken before the partition's fdatasync and its segment's
 //	    fdatasync returns successfully. Bytes written during fdatasync are not
 //	    covered by that call. Recovery keeps the longest valid frame prefix;
 //	    anything discarded was never acknowledged.

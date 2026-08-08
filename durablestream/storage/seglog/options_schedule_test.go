@@ -30,3 +30,15 @@ func TestOptions_DeprecatedIntervalsSupplyMaximumAges(t *testing.T) {
 		t.Errorf("CheckpointMaxAge = %v, want deprecated interval 23ms", opts.CheckpointMaxAge)
 	}
 }
+
+func TestOptions_SyncConcurrencyDefaultsAndValidates(t *testing.T) {
+	if got := (Options{}).withDefaults().SyncConcurrency; got != DefaultSyncConcurrency {
+		t.Errorf("default SyncConcurrency = %d, want %d", got, DefaultSyncConcurrency)
+	}
+	if got := (Options{SyncConcurrency: 1}).withDefaults().SyncConcurrency; got != 1 {
+		t.Errorf("explicit SyncConcurrency = %d, want 1", got)
+	}
+	if _, err := New(Options{SyncConcurrency: -1}); err == nil {
+		t.Error("New accepted negative SyncConcurrency")
+	}
+}

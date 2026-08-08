@@ -456,8 +456,8 @@ func (p *partition) run() {
 	}
 
 	// Write-at-arrival: every request's frame reaches the WAL immediately, so
-	// the very next flush wave covers it. There is no group formation wait;
-	// batching is whatever accumulates in the pending list while a wave is in
+	// the very next partition sync covers it. There is no group formation wait;
+	// batching is whatever accumulates in the pending list while a sync is in
 	// flight (the watermark pipeline, after the rust server's WAL shards).
 	for {
 		req, ok := stager.nextRequest()
@@ -502,7 +502,7 @@ func (p *partition) run() {
 }
 
 // appendPending queues one written (or failed, or barrier-only) staged record
-// for the next flush wave. waitForPendingSpace enforces an explicit 4*QueueDepth
+// for the next partition sync. waitForPendingSpace enforces an explicit 4*QueueDepth
 // bound; concurrent submitters can otherwise refill the admission queue while
 // the stager drains it.
 func (p *partition) appendPending(record *stagedRecord) {
@@ -786,20 +786,20 @@ func (p *partition) stageRecord(recordID uint64, req *request, inflight map[stri
 	return record
 }
 
-// publishSet is one flush wave's records with the wave's shared sync
-// outcome, handed from the committer to the publisher.
+// publishSet is one partition snapshot's records with its shared sync outcome,
+// handed from the committer to the publisher.
 type publishSet struct {
 	batches []*stagedRecord
 	syncErr error
 }
 
-// commitWaves establishes durability for the pending list, one flush wave at
-// a time. It parks on the doorbell, boards the storage-wide gate, and at wave
-// release swaps the pending list — the watermark snapshot: every swapped
+// commitWaves establishes durability for the pending list, one partition
+// snapshot at a time. It parks on the doorbell, acquires a storage-wide sync
+// slot, and swaps the pending list — the watermark snapshot: every swapped
 // record's bytes reached the WAL before this instant, so the fdatasync that
-// follows covers all of them. Records written during the sync ride the next
-// wave. The committer owns I1's durability boundary; the publisher owns I3's
-// state transition.
+// follows covers all of them. Records written during the sync remain for the
+// next snapshot. The committer owns I1's durability boundary; the publisher
+// owns I3's state transition.
 func (p *partition) commitWaves(wakeup <-chan struct{}, publish chan<- publishSet) {
 	for {
 		idleStart := time.Now()
@@ -807,24 +807,33 @@ func (p *partition) commitWaves(wakeup <-chan struct{}, publish chan<- publishSe
 		p.stats.committerIdleNanos.Add(time.Since(idleStart).Nanoseconds())
 		if !open {
 			// Shutdown: the stager appended everything before closing the
-			// doorbell; establish one final wave for what remains.
+			// doorbell; establish one final snapshot for what remains.
+			if batches := p.takeImmediatePending(); len(batches) > 0 {
+				publish <- publishSet{batches: batches}
+				return
+			}
 			if batches := p.swapPending(); len(batches) > 0 {
-				publish <- publishSet{batches: batches, syncErr: p.syncPending(batches)}
+				admission, err := p.st.syncLimiter.admit()
+				if err == nil {
+					err = p.syncPending(batches)
+					admission.complete()
+				}
+				publish <- publishSet{batches: batches, syncErr: err}
 			}
 			return
 		}
 		if batches := p.takeImmediatePending(); len(batches) > 0 {
-			// Sync-off and marker-only snapshots publish without gate
+			// Sync-off and marker-only snapshots publish without limiter
 			// admission. Failed writes carry their own error to the publisher.
 			publish <- publishSet{batches: batches}
 			continue
 		}
 		if !p.hasPending() {
 			// A coalesced token can describe records already captured by the
-			// preceding snapshot. Do not board an empty wave.
+			// preceding snapshot. Do not acquire a slot for an empty snapshot.
 			continue
 		}
-		admission, err := p.st.commitGate.admit()
+		admission, err := p.st.syncLimiter.admit()
 		if err != nil {
 			if batches := p.swapPending(); len(batches) > 0 {
 				publish <- publishSet{batches: batches, syncErr: err}
@@ -833,8 +842,8 @@ func (p *partition) commitWaves(wakeup <-chan struct{}, publish chan<- publishSe
 		}
 		batches := p.swapPending()
 		syncErr := p.syncPending(batches)
-		// Completion is unconditional: a failed member must not prevent the
-		// next device-wide wave from being admitted.
+		// Completion is unconditional: a failed fdatasync must release its
+		// storage-wide concurrency slot.
 		admission.complete()
 		if syncErr != nil {
 			// Latch before handoff so the stager observes the failed
@@ -895,7 +904,7 @@ func (p *partition) syncPending(batches []*stagedRecord) error {
 		return nil
 	}
 	if err := p.brokenErr(); err != nil {
-		// A prior wave failure is latched; do not spend flush waves on a
+		// A prior sync failure is latched; do not issue more fdatasyncs for a
 		// partition that refuses writes.
 		return err
 	}

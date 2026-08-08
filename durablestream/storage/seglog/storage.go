@@ -33,7 +33,7 @@ type Storage struct {
 	streams           hashtriemap.HashTrieMap[string, *streamState]
 	parts             []*partition
 	fdCache           *fdCache
-	commitGate        *commitGate
+	syncLimiter       *syncLimiter
 	checkpointBarrier checkpointBarrier
 
 	// topologyMu serializes path publication, source pinning, and delete
@@ -300,7 +300,7 @@ func New(opts Options) (_ *Storage, retErr error) {
 		releaseLock: release,
 		shutdownCh:  make(chan struct{}),
 		fdCache:     newFDCache(opts.FDCacheSize),
-		commitGate:  newCommitGate(),
+		syncLimiter: newSyncLimiter(opts.SyncConcurrency),
 	}
 	s.parts = make([]*partition, opts.Partitions)
 	for i := range s.parts {
@@ -687,7 +687,7 @@ func (s *Storage) Close() error {
 		}()
 		select {
 		case <-workersDone:
-			s.commitGate.close()
+			s.syncLimiter.close()
 			finalErr := s.finalMaterializeAll()
 			s.closeErr = errors.Join(finalErr, s.releaseResources())
 		case <-time.After(s.opts.ShutdownTimeout):
@@ -696,7 +696,7 @@ func (s *Storage) Close() error {
 			s.closeErr = fmt.Errorf("seglog: shutdown timed out after %v", s.opts.ShutdownTimeout)
 			go func() {
 				<-workersDone
-				s.commitGate.close()
+				s.syncLimiter.close()
 				_ = s.finalMaterializeAll()
 				_ = s.releaseResources()
 			}()
