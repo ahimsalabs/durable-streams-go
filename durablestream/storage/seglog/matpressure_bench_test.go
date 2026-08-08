@@ -13,8 +13,6 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
-
-	"github.com/ahimsalabs/durable-streams-go/durablestream"
 )
 
 func BenchmarkMatPressure(b *testing.B) {
@@ -36,9 +34,7 @@ func BenchmarkMatPressure(b *testing.B) {
 				ids := make([]string, streams)
 				for i := range ids {
 					ids[i] = fmt.Sprintf("s-%06d", i)
-					if _, err := s.Create(ctx, ids[i], durablestream.StreamConfig{}); err != nil {
-						b.Fatal(err)
-					}
+					benchmarkCreate(b, s, ids[i])
 				}
 				payload := make([]byte, 256)
 				var counter atomic.Int64

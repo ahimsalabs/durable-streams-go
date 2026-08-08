@@ -170,20 +170,20 @@ func TestPartitionPublisher_AcksFIFOAndSyncFailureDoesNotWedge(t *testing.T) {
 	t.Cleanup(func() { closeTestGate(releaseFirstSync) })
 	p.wal.blockNextSync(firstSyncStarted, releaseFirstSync)
 	first := appendAsync(s, ids[0], "first", "")
-	awaitSignal(t, firstSyncStarted, "first publisher wave")
+	awaitSignal(t, firstSyncStarted, "first publisher snapshot")
 
 	secondSyncStarted, releaseSecondSync := make(chan struct{}), make(chan struct{})
 	t.Cleanup(func() { closeTestGate(releaseSecondSync) })
 	p.wal.blockNextSync(secondSyncStarted, releaseSecondSync)
 	second := appendAsync(s, ids[0], "second", "")
 	closeTestGate(releaseFirstSync)
-	awaitSignal(t, secondSyncStarted, "second publisher wave")
+	awaitSignal(t, secondSyncStarted, "second publisher snapshot")
 	if got := awaitAppend(t, first); got.err != nil || got.offset != storagepkg.FormatSimpleOffset(1) {
 		t.Fatalf("first append = (%q, %v), want (1, nil)", got.offset, got.err)
 	}
 	select {
 	case got := <-second:
-		t.Fatalf("second append acknowledged before its wave completed: %v", got.err)
+		t.Fatalf("second append acknowledged before its snapshot completed: %v", got.err)
 	default:
 	}
 	closeTestGate(releaseSecondSync)
@@ -203,7 +203,7 @@ func TestPartitionPublisher_AcksFIFOAndSyncFailureDoesNotWedge(t *testing.T) {
 		t.Fatalf("post-failure append error = %v, want injected error", got.err)
 	}
 	if _, err := s.Append(t.Context(), ids[1], []byte("survives"), ""); err != nil {
-		t.Fatalf("subsequent partition wave: %v", err)
+		t.Fatalf("subsequent partition snapshot: %v", err)
 	}
 	if got := readAll(t, s, ids[1]); !reflect.DeepEqual(got, []string{"survives"}) {
 		t.Fatalf("subsequent partition publish = %q, want [survives]", got)

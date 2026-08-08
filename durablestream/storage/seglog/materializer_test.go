@@ -38,7 +38,7 @@ func syncDraftTouched(t *testing.T, s *Storage, draft *preparedStream) {
 	t.Helper()
 	s.releaseDraftPins(draft)
 	for path := range draft.touched {
-		pin, err := s.fdCache.pin(path, true)
+		pin, err := s.fdCache.pin(path)
 		if err != nil {
 			t.Fatal(err)
 		}

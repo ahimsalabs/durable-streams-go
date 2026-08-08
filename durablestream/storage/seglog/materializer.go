@@ -69,6 +69,19 @@ type preparedStream struct {
 	locked         bool
 }
 
+func (draft *preparedStream) recordSealedActive() {
+	draft.touched[draft.active.path] = struct{}{}
+	draft.touched[draft.active.indexPath] = struct{}{}
+	draft.sealedSidecars = append(draft.sealedSidecars, draft.active.indexPath)
+	if draft.active.blockPath != "" {
+		draft.sealedSidecars = append(draft.sealedSidecars, draft.active.blockPath)
+	}
+	draft.sealed = append(draft.sealed, draft.active)
+	draft.active = nil
+}
+
+var streamDraftEncoders sync.Pool
+
 // materializationBatch is retained across transient sync or checkpoint
 // failures. Reusing the prepared files avoids colliding with their O_EXCL
 // names and, more importantly, avoids deleting a file after an ambiguous
@@ -83,8 +96,8 @@ type materializationBatch struct {
 
 func (s *Storage) runMaterializer(p *partition) {
 	timer := time.NewTimer(time.Hour)
-	stopTimer(timer)
-	defer stopTimer(timer)
+	timer.Stop()
+	defer timer.Stop()
 	now := time.Now()
 	lastSweep := now
 	var retryAfter time.Time
@@ -147,9 +160,8 @@ func (s *Storage) runMaterializer(p *partition) {
 			deadline = earlier(deadline, retryAfter)
 		}
 		var timerC <-chan time.Time
-		if !deadline.IsZero() && (armedDeadline.IsZero() || deadline.Before(armedDeadline) || !time.Now().Before(armedDeadline)) {
-			stopTimer(timer)
-			timer.Reset(max(time.Until(deadline), time.Nanosecond))
+		if !deadline.IsZero() && (armedDeadline.IsZero() || deadline.Before(armedDeadline) || !now.Before(armedDeadline)) {
+			timer.Reset(max(deadline.Sub(now), time.Nanosecond))
 			armedDeadline = deadline
 		}
 		if !armedDeadline.IsZero() {
@@ -521,7 +533,7 @@ func (s *Storage) syncCheckpointFiles(p *partition, batch *materializationBatch)
 }
 
 func (s *Storage) syncFileBatch(p *partition, paths map[string]struct{}) error {
-	// A checkpoint deliberately issues a broad flush wave so independent files
+	// A checkpoint deliberately issues a broad sync batch so independent files
 	// reach the block layer together instead of serializing one device cache
 	// flush per stream. Across the default 32 partitions this bounds checkpoint
 	// pins at 1024, independent of stream cardinality.
@@ -533,7 +545,7 @@ func (s *Storage) syncFileBatch(p *partition, paths map[string]struct{}) error {
 	worker := func() {
 		defer wg.Done()
 		for path := range work {
-			pin, err := s.fdCache.pin(path, true)
+			pin, err := s.fdCache.pin(path)
 			if err == nil {
 				p.stats.materializerSyncs.Add(1)
 				err = fdatasync(pin.file())
@@ -774,7 +786,7 @@ func (s *Storage) materializeStream(p *partition, st *streamState, snap readSnap
 	var encoder *zstd.Encoder
 	defer func() {
 		if encoder != nil {
-			encoder.Close()
+			streamDraftEncoders.Put(encoder)
 		}
 	}()
 	flushWrites := func() error {
@@ -787,9 +799,12 @@ func (s *Storage) materializeStream(p *partition, st *streamState, snap readSnap
 		}
 		if draft.active.version == segmentVersionV3 {
 			if encoder == nil {
-				encoder, err = zstd.NewWriter(nil, zstd.WithEncoderConcurrency(1))
-				if err != nil {
-					return err
+				encoder, _ = streamDraftEncoders.Get().(*zstd.Encoder)
+				if encoder == nil {
+					encoder, err = zstd.NewWriter(nil, zstd.WithEncoderConcurrency(1))
+					if err != nil {
+						return err
+					}
 				}
 			}
 			err = writes.flushCompressed(draft.active, payloadPin.file(), indexPin.file(), blockPin.file(), encoder)
@@ -846,14 +861,7 @@ func (s *Storage) materializeStream(p *partition, st *streamState, snap readSnap
 			if err := draft.active.seal(payloadPin.file(), indexPin.file()); err != nil {
 				return draft, err
 			}
-			draft.touched[draft.active.path] = struct{}{}
-			draft.touched[draft.active.indexPath] = struct{}{}
-			draft.sealedSidecars = append(draft.sealedSidecars, draft.active.indexPath)
-			if draft.active.blockPath != "" {
-				draft.sealedSidecars = append(draft.sealedSidecars, draft.active.blockPath)
-			}
-			draft.sealed = append(draft.sealed, draft.active)
-			draft.active = nil
+			draft.recordSealedActive()
 			s.releaseDraftPins(draft)
 		}
 		if draft.active == nil {
@@ -920,14 +928,7 @@ func (s *Storage) materializeStream(p *partition, st *streamState, snap readSnap
 		if err := draft.active.seal(payloadPin.file(), indexPin.file()); err != nil {
 			return draft, err
 		}
-		draft.touched[draft.active.path] = struct{}{}
-		draft.touched[draft.active.indexPath] = struct{}{}
-		draft.sealedSidecars = append(draft.sealedSidecars, draft.active.indexPath)
-		if draft.active.blockPath != "" {
-			draft.sealedSidecars = append(draft.sealedSidecars, draft.active.blockPath)
-		}
-		draft.sealed = append(draft.sealed, draft.active)
-		draft.active = nil
+		draft.recordSealedActive()
 	}
 	draft.through = max(snap.through, snap.firstLive+int64(len(snap.walTail))-1)
 	return draft, nil
@@ -938,17 +939,17 @@ func (s *Storage) pinDraftActive(draft *preparedStream) (*fdPin, *fdPin, *fdPin,
 		draft.payloadPin.e.path == draft.active.path && draft.indexPin.e.path == draft.active.indexPath {
 		return draft.payloadPin, draft.indexPin, draft.blockPin, nil
 	}
-	payload, err := s.fdCache.pin(draft.active.path, true)
+	payload, err := s.fdCache.pin(draft.active.path)
 	if err != nil {
 		return nil, nil, nil, err
 	}
-	index, err := s.fdCache.pin(draft.active.indexPath, true)
+	index, err := s.fdCache.pin(draft.active.indexPath)
 	if err != nil {
 		_ = payload.release()
 		return nil, nil, nil, err
 	}
 	if draft.active.blockPath != "" {
-		block, blockErr := s.fdCache.pin(draft.active.blockPath, true)
+		block, blockErr := s.fdCache.pin(draft.active.blockPath)
 		if blockErr != nil {
 			_ = index.release()
 			_ = payload.release()

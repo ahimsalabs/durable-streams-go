@@ -428,20 +428,20 @@ func (p *partition) run() {
 	p.publishedNextTx = p.nextTxnID
 	retired := make(chan retiredRecord, 1)
 	// wakeup is a coalescing doorbell: the stager rings it after appending to
-	// the pending list; the committer collects everything pending per wave.
+	// the pending list; the committer collects everything pending per snapshot.
 	wakeup := make(chan struct{}, 1)
 	// Capacity two is the bounded overlap contract: the committer may run one
-	// wave ahead of acknowledgements, then its blocking send applies
+	// snapshot ahead of acknowledgements, then its blocking send applies
 	// backpressure instead of accumulating durable-but-unpublished work.
 	publish := make(chan publishSet, 2)
 	committerDone := make(chan struct{})
 	publisherDone := make(chan struct{})
 	// run owns and joins both goroutines. The committer terminates after
 	// wakeup closes and the pending list drains, then closes publish; the
-	// publisher terminates after every synced wave has been published or
+	// publisher terminates after every synced snapshot has been published or
 	// failed.
 	go func() {
-		p.commitWaves(wakeup, publish)
+		p.commitSnapshots(wakeup, publish)
 		close(publish)
 		close(committerDone)
 	}()
@@ -514,7 +514,7 @@ func (p *partition) appendPending(record *stagedRecord) {
 	p.walPendingMu.Unlock()
 }
 
-// swapPending takes the current pending list. Called by the committer at wave
+// swapPending takes the current pending list. Called by the committer at snapshot
 // release: every swapped record's bytes were written before this instant, so
 // the fdatasync that follows covers all of them (the watermark snapshot).
 func (p *partition) swapPending() []*stagedRecord {
@@ -618,18 +618,6 @@ func (s *partitionStager) retire(ack retiredRecord) {
 			delete(s.last, streamID)
 			delete(s.inflight, streamID)
 		}
-	}
-}
-
-// stopTimer releases a timer when another event wins the select, draining the
-// fired-timer race. waiters.go also uses it for stream notification timers.
-func stopTimer(timer *time.Timer) {
-	if timer == nil || timer.Stop() {
-		return
-	}
-	select {
-	case <-timer.C:
-	default:
 	}
 }
 
@@ -793,14 +781,14 @@ type publishSet struct {
 	syncErr error
 }
 
-// commitWaves establishes durability for the pending list, one partition
+// commitSnapshots establishes durability for the pending list, one partition
 // snapshot at a time. It parks on the doorbell, acquires a storage-wide sync
 // slot, and swaps the pending list — the watermark snapshot: every swapped
 // record's bytes reached the WAL before this instant, so the fdatasync that
 // follows covers all of them. Records written during the sync remain for the
 // next snapshot. The committer owns I1's durability boundary; the publisher
 // owns I3's state transition.
-func (p *partition) commitWaves(wakeup <-chan struct{}, publish chan<- publishSet) {
+func (p *partition) commitSnapshots(wakeup <-chan struct{}, publish chan<- publishSet) {
 	for {
 		idleStart := time.Now()
 		_, open := <-wakeup
@@ -857,14 +845,14 @@ func (p *partition) commitWaves(wakeup <-chan struct{}, publish chan<- publishSe
 }
 
 // publishSets is the partition's single publisher. It fails or publishes each
-// wave's records in FIFO order and retires them to the stager, all strictly
-// after that wave's fdatasync outcome (invariant I1 rides the syncErr, not
+// snapshot's records in FIFO order and retires them to the stager, all strictly
+// after that snapshot's fdatasync outcome (invariant I1 rides the syncErr, not
 // goroutine identity).
 func (p *partition) publishSets(publish <-chan publishSet, retired chan<- retiredRecord) {
 	var priorErr error
 	for set := range publish {
 		start := time.Now()
-		var waveOps int64
+		var snapshotOps int64
 		setErr := set.syncErr
 		if setErr == nil {
 			setErr = priorErr
@@ -874,7 +862,7 @@ func (p *partition) publishSets(publish <-chan publishSet, retired chan<- retire
 			if published && record.hasFrame() {
 				for _, op := range record.stagedOps() {
 					if op.hasFrame() {
-						waveOps++
+						snapshotOps++
 					}
 				}
 				p.stats.walBytesWritten.Add(record.endOff - record.base)
@@ -888,9 +876,9 @@ func (p *partition) publishSets(publish <-chan publishSet, retired chan<- retire
 			}
 			retired <- retiredRecord{id: record.id, published: published}
 		}
-		if waveOps > 0 {
-			p.stats.opsCommitted.Add(waveOps)
-			p.stats.groupSizeHist[groupSizeBucket(waveOps)].Add(1)
+		if snapshotOps > 0 {
+			p.stats.opsCommitted.Add(snapshotOps)
+			p.stats.groupSizeHist[groupSizeBucket(snapshotOps)].Add(1)
 		}
 		p.stats.publishNanos.Add(time.Since(start).Nanoseconds())
 	}

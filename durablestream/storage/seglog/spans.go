@@ -119,7 +119,7 @@ func ownedSpanResult(ctx context.Context, result *durablestream.SpanReadResult, 
 }
 
 func (s *Storage) sealedRange(ctx context.Context, sf *segmentFile, from, through int64, limit, used int64) (durablestream.ReadSpan, int64, int64, error) {
-	pin, err := s.fdCache.pin(sf.path, false)
+	pin, err := s.fdCache.pin(sf.path)
 	if err != nil {
 		return nil, 0, 0, err
 	}

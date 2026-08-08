@@ -13,8 +13,8 @@ type WALPosition struct {
 }
 
 // PartitionStats is a snapshot of one partition's commit and materialization
-// activity. GroupsCommitted and GroupSizeHist now count partition snapshots
-// per flush wave; histogram buckets contain operations per snapshot.
+// activity. GroupsCommitted counts partition snapshots; GroupSizeHist buckets
+// contain operations per snapshot.
 type PartitionStats struct {
 	GroupsCommitted      int64
 	OpsCommitted         int64
@@ -67,7 +67,7 @@ type PartitionStats struct {
 type Stats struct {
 	PartitionStats
 	// CommitWaves counts completed storage-wide sync-limiter admissions. The
-	// name is retained for source compatibility with the former wave gate.
+	// name is retained for source compatibility with the former commit gate.
 	CommitWaves  int64
 	PerPartition []PartitionStats
 }

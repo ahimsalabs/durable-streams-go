@@ -24,7 +24,7 @@ func TestFDCache_ConcurrentPinsOfColdPathShareDescriptor(t *testing.T) {
 	for i := range workers {
 		wg.Go(func() {
 			<-start
-			pins[i], errs[i] = cache.pin(path, false)
+			pins[i], errs[i] = cache.pin(path)
 		})
 	}
 	close(start)
@@ -57,11 +57,11 @@ func TestFDCache_EvictionDoesNotClosePinnedEntry(t *testing.T) {
 	cache := newFDCache(1)
 	t.Cleanup(func() { _ = cache.close() })
 
-	first, err := cache.pin(firstPath, false)
+	first, err := cache.pin(firstPath)
 	if err != nil {
 		t.Fatal(err)
 	}
-	second, err := cache.pin(secondPath, false)
+	second, err := cache.pin(secondPath)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -82,7 +82,7 @@ func TestFDCache_PinReleaseAfterCloseSucceeds(t *testing.T) {
 		t.Fatal(err)
 	}
 	cache := newFDCache(1)
-	pin, err := cache.pin(path, false)
+	pin, err := cache.pin(path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -117,7 +117,7 @@ func TestFDCache_ConcurrentChurnBeyondCapacity(t *testing.T) {
 			<-start
 			for round := range rounds {
 				pathIndex := (worker + round) % len(paths)
-				pin, err := cache.pin(paths[pathIndex], false)
+				pin, err := cache.pin(paths[pathIndex])
 				if err != nil {
 					errs <- fmt.Errorf("pin %s: %w", paths[pathIndex], err)
 					return

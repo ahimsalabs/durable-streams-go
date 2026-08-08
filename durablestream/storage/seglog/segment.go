@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"slices"
 	"sort"
+	"sync"
 
 	"github.com/klauspost/compress/zstd"
 )
@@ -25,7 +26,6 @@ const (
 	segmentIndexMagic    uint32 = 0x44534958 // DSIX
 	segmentVersionV2     uint16 = 2
 	segmentVersionV3     uint16 = 3
-	segmentVersion              = segmentVersionV2 // legacy test fixtures
 	segmentHeaderSize           = 64
 	denseEntrySize              = 16
 	segmentFooterSize           = 56
@@ -37,6 +37,13 @@ const (
 )
 
 var errBadSegment = errors.New("seglog: invalid stream segment")
+
+type pooledZstdDecoder struct {
+	decoder     *zstd.Decoder
+	memoryLimit uint64
+}
+
+var compressedPayloadDecoders sync.Pool
 
 func checkedMul(a, b int64) (int64, bool) {
 	if a < 0 || b < 0 || (a != 0 && b > math.MaxInt64/a) {
@@ -59,11 +66,7 @@ func checkedInt(n int64) (int, bool) {
 	return int(n), true
 }
 
-func encodeSegmentHeader(inc incarnation, firstIndex, createdUnixNano int64, versions ...uint16) []byte {
-	version := uint16(segmentVersionV2)
-	if len(versions) > 0 {
-		version = versions[0]
-	}
+func encodeSegmentHeader(inc incarnation, firstIndex, createdUnixNano int64, version uint16) []byte {
 	h := make([]byte, segmentHeaderSize)
 	binary.LittleEndian.PutUint32(h[0:4], segmentMagic)
 	binary.LittleEndian.PutUint16(h[4:6], version)
@@ -72,11 +75,6 @@ func encodeSegmentHeader(inc incarnation, firstIndex, createdUnixNano int64, ver
 	binary.LittleEndian.PutUint64(h[32:40], uint64(createdUnixNano))
 	binary.LittleEndian.PutUint32(h[40:44], crc32.Checksum(h[:40], crcTable))
 	return h
-}
-
-func decodeSegmentHeader(b []byte) (inc incarnation, firstIndex, createdUnixNano int64, err error) {
-	inc, firstIndex, createdUnixNano, _, err = decodeSegmentHeaderVersion(b)
-	return
 }
 
 func decodeSegmentHeaderVersion(b []byte) (inc incarnation, firstIndex, createdUnixNano int64, version uint16, err error) {
@@ -193,8 +191,10 @@ func openActiveSegment(path, name string, inc incarnation, payloadEnd, logicalEn
 	if indexInfo.Size() < indexEnd {
 		return nil, errBadSegment
 	}
+	indexSize := indexInfo.Size()
 	blockPath := ""
 	var block *os.File
+	var blockSize int64
 	if version == segmentVersionV3 {
 		blockPath = filepath.Join(filepath.Dir(path), segmentBlockName(first))
 		var blockErr error
@@ -210,6 +210,7 @@ func openActiveSegment(path, name string, inc incarnation, payloadEnd, logicalEn
 		if blockInfo.Size() < blockEnd {
 			return nil, errBadSegment
 		}
+		blockSize = blockInfo.Size()
 		index, readErr := readBoundedAt(idx, indexEnd, 0, indexEnd)
 		if readErr != nil {
 			return nil, errBadSegment
@@ -231,6 +232,7 @@ func openActiveSegment(path, name string, inc incarnation, payloadEnd, logicalEn
 	if payloadInfo.Size() < payloadEnd {
 		return nil, errBadSegment
 	}
+	payloadSize := payloadInfo.Size()
 	last, ok := checkedAdd(first, count-1)
 	if count == 0 {
 		last, ok = first-1, first > math.MinInt64
@@ -240,21 +242,18 @@ func openActiveSegment(path, name string, inc incarnation, payloadEnd, logicalEn
 	}
 	// Validate the complete retained prefix before any destructive truncation.
 	for _, target := range []struct {
-		file *os.File
-		size int64
+		file       *os.File
+		size       int64
+		actualSize int64
 	}{
-		{f, payloadEnd},
-		{idx, indexEnd},
-		{block, blockEnd},
+		{f, payloadEnd, payloadSize},
+		{idx, indexEnd, indexSize},
+		{block, blockEnd, blockSize},
 	} {
 		if target.file == nil {
 			continue
 		}
-		info, statErr := target.file.Stat()
-		if statErr != nil {
-			return nil, statErr
-		}
-		if info.Size() != target.size {
+		if target.actualSize != target.size {
 			if err = target.file.Truncate(target.size); err != nil {
 				return nil, err
 			}
@@ -321,7 +320,12 @@ func (sf *segmentFile) appendRecord(payloadFile, indexFile writerAt, rec segment
 }
 
 func (sf *segmentFile) advance(rec segmentRecord, end int64) {
-	sf.payloadEnd, sf.count, sf.lastIndex = end, sf.count+1, rec.index
+	if sf.version == segmentVersionV3 {
+		sf.logicalEnd = end
+	} else {
+		sf.payloadEnd = end
+	}
+	sf.count, sf.lastIndex = sf.count+1, rec.index
 	if sf.count == 1 && sf.minTS == 0 {
 		sf.minTS = rec.ts
 	}
@@ -331,6 +335,7 @@ func (sf *segmentFile) advance(rec segmentRecord, end int64) {
 type segmentWriteBuffer struct {
 	payload       []byte
 	index         []byte
+	frame         []byte
 	payloadOffset int64
 	indexOffset   int64
 }
@@ -371,15 +376,7 @@ func (b *segmentWriteBuffer) append(sf *segmentFile, rec segmentRecord, payload 
 	b.index = binary.LittleEndian.AppendUint64(b.index, uint64(end))
 	b.index = binary.LittleEndian.AppendUint32(b.index, crc32.Checksum(payload, crcTable))
 	b.index = binary.LittleEndian.AppendUint32(b.index, uint32(rec.index-rec.batchFirst))
-	if sf.version == segmentVersionV3 {
-		sf.logicalEnd, sf.count, sf.lastIndex = end, sf.count+1, rec.index
-		if sf.count == 1 && sf.minTS == 0 {
-			sf.minTS = rec.ts
-		}
-		sf.maxTS = max(sf.maxTS, rec.ts)
-	} else {
-		sf.advance(rec, end)
-	}
+	sf.advance(rec, end)
 	return nil
 }
 
@@ -404,8 +401,8 @@ func (b *segmentWriteBuffer) flushCompressed(sf *segmentFile, payloadFile, index
 	if len(b.index) == 0 {
 		return nil
 	}
-	frame := enc.EncodeAll(b.payload, nil)
-	if err := writeAtFull(payloadFile, frame, sf.payloadEnd); err != nil {
+	b.frame = enc.EncodeAll(b.payload, b.frame[:0])
+	if err := writeAtFull(payloadFile, b.frame, sf.payloadEnd); err != nil {
 		return err
 	}
 	if err := writeAtFull(indexFile, b.index, b.indexOffset); err != nil {
@@ -415,12 +412,12 @@ func (b *segmentWriteBuffer) flushCompressed(sf *segmentFile, payloadFile, index
 	firstOrdinal := b.indexOffset / denseEntrySize
 	binary.LittleEndian.PutUint64(block[0:8], uint64(firstOrdinal))
 	binary.LittleEndian.PutUint64(block[8:16], uint64(sf.payloadEnd))
-	binary.LittleEndian.PutUint64(block[16:24], uint64(len(frame)))
+	binary.LittleEndian.PutUint64(block[16:24], uint64(len(b.frame)))
 	binary.LittleEndian.PutUint64(block[24:32], uint64(len(b.payload)))
 	if err := writeAtFull(blockFile, block[:], sf.blockCount*blockEntrySize); err != nil {
 		return err
 	}
-	sf.payloadEnd += int64(len(frame))
+	sf.payloadEnd += int64(len(b.frame))
 	sf.blockCount++
 	b.payload = b.payload[:0]
 	b.index = b.index[:0]
@@ -443,10 +440,12 @@ func (sf *segmentFile) seal(payloadFile, indexFile *os.File) error {
 		if err != nil {
 			return err
 		}
-		blocks := make([]byte, sf.blockCount*blockEntrySize)
-		if len(blocks) > 0 {
-			_, err = blockFile.ReadAt(blocks, 0)
+		blockBytes, ok := checkedMul(sf.blockCount, blockEntrySize)
+		if !ok {
+			_ = blockFile.Close()
+			return errBadSegment
 		}
+		blocks, err := readBoundedAt(blockFile, blockBytes, 0, blockBytes)
 		closeErr := blockFile.Close()
 		if err != nil {
 			return err
@@ -647,7 +646,7 @@ func (v segmentView) readRecords(from, through int64, visit func(segmentRecord, 
 	if v.path == "" || through < from || v.lastIndex < from {
 		return nil
 	}
-	p, err := v.cache.pin(v.path, false)
+	p, err := v.cache.pin(v.path)
 	if err != nil {
 		return err
 	}
@@ -656,7 +655,7 @@ func (v segmentView) readRecords(from, through int64, visit func(segmentRecord, 
 	var ip *fdPin
 	indexStart := v.payloadEnd
 	if !v.sealed {
-		ip, err = v.cache.pin(v.indexPath, false)
+		ip, err = v.cache.pin(v.indexPath)
 		if err != nil {
 			return err
 		}
@@ -714,7 +713,7 @@ type decodedBlock struct {
 }
 
 func (v segmentView) readPayloadAtCached(rec segmentRecord, off int64, cached *decodedBlock) ([]byte, error) {
-	p, err := v.cache.pin(v.path, false)
+	p, err := v.cache.pin(v.path)
 	if err != nil {
 		return nil, err
 	}
@@ -740,9 +739,6 @@ func (v segmentView) readPayloadAtCached(rec segmentRecord, off int64, cached *d
 }
 
 func (v segmentView) readCompressedPayload(payloadFile *os.File, rec segmentRecord, logicalOff int64, cached *decodedBlock) ([]byte, error) {
-	if cached == nil {
-		return nil, errBadSegment
-	}
 	if cached.blocks == nil {
 		if err := v.loadBlockMetadata(payloadFile, cached); err != nil {
 			return nil, err
@@ -768,12 +764,19 @@ func (v segmentView) readCompressedPayload(payloadFile *os.File, rec segmentReco
 			return nil, errBadSegment
 		}
 		memoryLimit := uint64(max(plainLen, 1<<20))
-		dec, decErr := zstd.NewReader(nil, zstd.WithDecoderConcurrency(1), zstd.WithDecodeAllCapLimit(true), zstd.WithDecoderMaxMemory(memoryLimit), zstd.WithDecoderMaxWindow(memoryLimit))
-		if decErr != nil {
-			return nil, decErr
+		pooled, _ := compressedPayloadDecoders.Get().(*pooledZstdDecoder)
+		if pooled == nil || pooled.memoryLimit != memoryLimit {
+			if pooled != nil {
+				pooled.decoder.Close()
+			}
+			dec, decErr := zstd.NewReader(nil, zstd.WithDecoderConcurrency(1), zstd.WithDecodeAllCapLimit(true), zstd.WithDecoderMaxMemory(memoryLimit), zstd.WithDecoderMaxWindow(memoryLimit))
+			if decErr != nil {
+				return nil, decErr
+			}
+			pooled = &pooledZstdDecoder{decoder: dec, memoryLimit: memoryLimit}
 		}
-		plain, err = dec.DecodeAll(frame, make([]byte, 0, plainCap))
-		dec.Close()
+		plain, err = pooled.decoder.DecodeAll(frame, make([]byte, 0, plainCap))
+		compressedPayloadDecoders.Put(pooled)
 		if err == nil && int64(len(plain)) == plainLen {
 			cached.ordinal, cached.plain = block, plain
 		}
@@ -797,7 +800,7 @@ func (v segmentView) loadBlockMetadata(payloadFile *os.File, cached *decodedBloc
 	var pin *fdPin
 	if !v.sealed {
 		var err error
-		pin, err = v.cache.pin(filepath.Join(filepath.Dir(v.path), segmentBlockName(v.firstIndex)), false)
+		pin, err = v.cache.pin(filepath.Join(filepath.Dir(v.path), segmentBlockName(v.firstIndex)))
 		if err != nil {
 			return err
 		}

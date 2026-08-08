@@ -48,7 +48,7 @@ func newFDCache(limit int) *fdCache {
 	}
 }
 
-func (c *fdCache) pin(path string, _ bool) (*fdPin, error) {
+func (c *fdCache) pin(path string) (*fdPin, error) {
 	for {
 		c.mu.Lock()
 		if c.closed {
@@ -102,10 +102,7 @@ func (c *fdCache) pin(path string, _ bool) (*fdPin, error) {
 		if e := c.entries[path]; e != nil {
 			e.pins++
 			c.lru.MoveToFront(e.elem)
-			c.mu.Unlock()
-			closeErr := f.Close()
-			c.mu.Lock()
-			opening.closeErr = closeErr
+			_ = f.Close()
 			delete(c.opening, path)
 			close(opening.done)
 			c.mu.Unlock()
@@ -202,12 +199,15 @@ func (c *fdCache) unlink(path string) error {
 // physically removed. If a reader has the file pinned, removal and the
 // callback are deferred until the final pin is released.
 func (c *fdCache) unlinkNotify(path string, onRemoved func(int64)) error {
-	c.mu.Lock()
-	if opening := c.opening[path]; opening != nil {
-		done := opening.done
-		c.mu.Unlock()
-		<-done
-		return c.unlinkNotify(path, onRemoved)
+	for {
+		c.mu.Lock()
+		if opening := c.opening[path]; opening != nil {
+			done := opening.done
+			c.mu.Unlock()
+			<-done
+			continue
+		}
+		break
 	}
 	defer c.mu.Unlock()
 	if e := c.entries[path]; e != nil {
@@ -269,26 +269,26 @@ func (c *fdCache) close() error {
 		opening = append(opening, pending)
 	}
 	entries := make([]*fdEntry, 0, len(c.entries))
+	deferred := make(map[string]func(int64), len(c.deferred))
 	for _, e := range c.entries {
 		c.removeEntry(e)
 		entries = append(entries, e)
+		if onRemoved, remove := c.deferred[e.path]; remove {
+			deferred[e.path] = onRemoved
+			delete(c.deferred, e.path)
+		}
 	}
 	c.mu.Unlock()
 
 	var errs []error
 	for _, e := range entries {
 		errs = append(errs, e.f.Close())
-		c.mu.Lock()
-		if onRemoved, remove := c.deferred[e.path]; remove {
-			delete(c.deferred, e.path)
-			c.mu.Unlock()
+		if onRemoved, remove := deferred[e.path]; remove {
 			bytes, removeErr := removeFileAndSize(e.path)
 			if removeErr == nil && bytes > 0 && onRemoved != nil {
 				onRemoved(bytes)
 			}
 			errs = append(errs, removeErr, syncDir(filepath.Dir(e.path)))
-		} else {
-			c.mu.Unlock()
 		}
 	}
 	for _, pending := range opening {

@@ -7,7 +7,7 @@ import (
 
 // syncLimiter bounds concurrent per-partition WAL fdatasyncs across a Storage.
 // Some devices pipeline concurrent syncs and lose throughput when committers
-// are aligned into device-wide waves. Flush-serializing devices can set the
+// run in device-wide lockstep. Flush-serializing devices can set the
 // limit to one, while pipelining devices can keep several syncs in flight.
 //
 // A condition variable keeps close atomic with admission: close rejects new

@@ -51,10 +51,10 @@ func FuzzDecodeFrame(f *testing.F) {
 	f.Add(make([]byte, walSegmentHeaderSize))
 
 	// Exercise the sealed-segment footer path with a valid, empty segment too.
-	segmentSeed := encodeSegmentHeader(inc, 1, 12345)
+	segmentSeed := encodeSegmentHeader(inc, 1, 12345, segmentVersionV2)
 	footer := make([]byte, segmentFooterSize)
 	binary.LittleEndian.PutUint32(footer[0:4], segmentIndexMagic)
-	binary.LittleEndian.PutUint16(footer[4:6], segmentVersion)
+	binary.LittleEndian.PutUint16(footer[4:6], segmentVersionV2)
 	binary.LittleEndian.PutUint64(footer[8:16], segmentHeaderSize)
 	binary.LittleEndian.PutUint64(footer[24:32], 1)
 	binary.LittleEndian.PutUint64(footer[32:40], 0)
@@ -65,7 +65,7 @@ func FuzzDecodeFrame(f *testing.F) {
 	f.Fuzz(func(t *testing.T, data []byte) {
 		// These decoders must reject short or malformed input rather than panic.
 		_, _ = decodeWALSegmentHeader(data)
-		_, _, _, _ = decodeSegmentHeader(data)
+		_, _, _, _, _ = decodeSegmentHeaderVersion(data)
 
 		scanner := newFrameScanner(bytes.NewReader(data), int64(len(data)))
 		maxFrames := 0

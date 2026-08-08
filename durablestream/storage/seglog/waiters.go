@@ -68,13 +68,19 @@ func (s *Storage) WaitForData(ctx context.Context, streamID string, offset durab
 
 		select {
 		case <-ctx.Done():
-			stopTimer(timer)
+			if timer != nil {
+				timer.Stop()
+			}
 			return nil, ctx.Err()
 		case <-s.shutdownCh:
-			stopTimer(timer)
+			if timer != nil {
+				timer.Stop()
+			}
 			return nil, ErrClosed
 		case <-notifyCh:
-			stopTimer(timer)
+			if timer != nil {
+				timer.Stop()
+			}
 		case <-expiryCh:
 		}
 	}
